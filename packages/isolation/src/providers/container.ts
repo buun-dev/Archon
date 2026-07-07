@@ -40,7 +40,17 @@ const DOCKER_QUERY_TIMEOUT_MS = 30 * 1000;
 
 /** Run `sandbox.sh <args>` inside the Ubuntu distro (git provisioning lives there). */
 function runSandbox(args: string[], timeout: number): Promise<{ stdout: string; stderr: string }> {
-  return execFileAsync('wsl.exe', ['-d', 'Ubuntu', '--', 'bash', SANDBOX_SH, ...args], { timeout });
+  // wsl.exe does NOT forward arbitrary Windows env into the distro — only vars
+  // named in WSLENV are translated. Forward the secrets `sandbox.sh` bakes into
+  // the container via envsubst (compose.yml.tmpl): GH_TOKEN for in-container
+  // `gh pr create` (P2 Task 10) and ANTHROPIC_API_KEY. `/u` = Windows → WSL only.
+  const wslenv = [process.env.WSLENV, 'GH_TOKEN/u', 'ANTHROPIC_API_KEY/u']
+    .filter(Boolean)
+    .join(':');
+  return execFileAsync('wsl.exe', ['-d', 'Ubuntu', '--', 'bash', SANDBOX_SH, ...args], {
+    timeout,
+    env: { ...process.env, WSLENV: wslenv },
+  });
 }
 
 export class ContainerProvider implements IIsolationProvider {
