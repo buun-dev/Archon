@@ -400,6 +400,20 @@ export interface NodeConfig {
 }
 
 /**
+ * Isolation substrate descriptor. Threaded from the CLI dispatch → executor →
+ * node commands. When `kind === 'container'` (step-5 sandbox P2), worktree-scoped
+ * spawns and the claude subprocess route through `docker compose exec` into the
+ * per-run container. Absent/`worktree` = today's host spawn (byte-identical).
+ */
+export interface IsolationDescriptor {
+  kind: 'worktree' | 'container';
+  /** Compose project (`archon-<slug>`) — set only for kind==='container'. */
+  project?: string;
+  /** In-container workdir (P1: `/work`) — set only for kind==='container'. */
+  workdir?: string;
+}
+
+/**
  * Extended options for sendQuery, adding workflow-specific context.
  * The orchestrator path uses base AgentRequestOptions fields only.
  * The workflow path additionally passes nodeConfig and assistantConfig.
@@ -409,6 +423,12 @@ export interface SendQueryOptions extends AgentRequestOptions {
   nodeConfig?: NodeConfig;
   /** Per-provider defaults from .archon/config.yaml assistants section. */
   assistantConfig?: Record<string, unknown>;
+  /**
+   * Isolation substrate — when kind==='container', the claude provider points
+   * `pathToClaudeCodeExecutable` at the docker-exec shim and injects the
+   * ARCHON_EXEC_PROJECT/WORKDIR locators (step-5 sandbox P2).
+   */
+  isolation?: IsolationDescriptor;
 }
 
 /**

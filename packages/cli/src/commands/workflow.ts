@@ -18,6 +18,7 @@ import {
   type RawTiersConfig,
 } from '@archon/workflows/model-validation';
 import { configureIsolation, getIsolationProvider } from '@archon/isolation';
+import type { IsolationDescriptor } from '@archon/providers';
 import {
   createLogger,
   getArchonHome,
@@ -777,6 +778,9 @@ export async function workflowRunCommand(
   // Handle isolation (worktree creation)
   let workingCwd = cwd;
   let isolationEnvId: string | undefined;
+  // Substrate descriptor threaded into executeWorkflow so node commands + the
+  // claude subprocess route into the container when isolation.provider=container (P2).
+  let isolationDescriptor: IsolationDescriptor | undefined;
 
   // Handle --resume: locate the prior failed run, reuse its worktree, and hand
   // the resumed-run handle to executeWorkflow below via opts. The executor no
@@ -905,6 +909,14 @@ export async function workflowRunCommand(
       getLog().info({ path: existingEnv.working_path }, 'worktree_reused');
       workingCwd = existingEnv.working_path;
       isolationEnvId = existingEnv.id;
+      // Reconstruct the substrate descriptor for the reused env (container envs
+      // carry project/workdir; worktree envs need no descriptor).
+      const reusedEnv =
+        repoIsolationKind === 'container' ? await provider.get(existingEnv.working_path) : null;
+      isolationDescriptor =
+        reusedEnv?.provider === 'container'
+          ? { kind: 'container', project: reusedEnv.project, workdir: reusedEnv.containerWorkdir }
+          : { kind: 'worktree' };
     } else {
       // Create new worktree
       getLog().info(
@@ -937,6 +949,14 @@ export async function workflowRunCommand(
 
       workingCwd = isolatedEnv.workingPath;
       isolationEnvId = envRecord.id;
+      isolationDescriptor =
+        isolatedEnv.provider === 'container'
+          ? {
+              kind: 'container',
+              project: isolatedEnv.project,
+              workdir: isolatedEnv.containerWorkdir,
+            }
+          : { kind: 'worktree' };
       getLog().info({ path: workingCwd }, 'worktree_created');
     }
   } else if (options.noWorktree) {
@@ -1125,8 +1145,19 @@ export async function workflowRunCommand(
   let result: Awaited<ReturnType<typeof executeWorkflow>>;
   try {
     const opts = prepared
-      ? { codebaseId: codebase?.id, source: workflowSource, userId: cliUserId, ...prepared }
-      : { codebaseId: codebase?.id, source: workflowSource, userId: cliUserId };
+      ? {
+          codebaseId: codebase?.id,
+          source: workflowSource,
+          userId: cliUserId,
+          isolation: isolationDescriptor,
+          ...prepared,
+        }
+      : {
+          codebaseId: codebase?.id,
+          source: workflowSource,
+          userId: cliUserId,
+          isolation: isolationDescriptor,
+        };
     result = await executeWorkflow(
       deps,
       adapter,

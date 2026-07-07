@@ -52,6 +52,8 @@ import {
   checkTriggerRule,
   substituteNodeOutputRefs,
   executeDagWorkflow,
+  runIsolatedCommand,
+  toContainerPath,
 } from './dag-executor';
 import { loadMcpConfig } from '@archon/providers/mcp/config';
 import type { DagNode, BashNode, ScriptNode, NodeOutput, WorkflowRun } from './schemas';
@@ -9578,5 +9580,83 @@ describe('executeDagWorkflow -- completion telemetry', () => {
         failedNodeType: 'prompt',
       })
     );
+  });
+});
+
+// --- step-5 sandbox P2: container command routing (Task 8) ---
+
+describe('toContainerPath', () => {
+  it('remaps a path under cwd onto the /work prefix', () => {
+    expect(
+      toContainerPath('/home/bunny/wt/slug/.archon/artifacts', '/home/bunny/wt/slug', '/work')
+    ).toBe('/work/.archon/artifacts');
+  });
+
+  it('leaves a path outside cwd unchanged', () => {
+    expect(toContainerPath('/etc/hosts', '/home/bunny/wt/slug', '/work')).toBe('/etc/hosts');
+  });
+
+  it('passes through undefined', () => {
+    expect(toContainerPath(undefined, '/x', '/work')).toBeUndefined();
+  });
+});
+
+describe('runIsolatedCommand', () => {
+  let execSpy: Mock<typeof git.execFileAsync>;
+  beforeEach(() => {
+    execSpy = spyOn(git, 'execFileAsync');
+    execSpy.mockResolvedValue({ stdout: '', stderr: '' });
+  });
+  afterEach(() => execSpy.mockRestore());
+
+  it('worktree/absent isolation is a byte-identical host spawn', async () => {
+    await runIsolatedCommand(undefined, 'bash', ['-c', 'echo hi'], {
+      cwd: '/wt',
+      timeout: 1000,
+      env: { FOO: 'bar' } as NodeJS.ProcessEnv,
+    });
+    expect(execSpy).toHaveBeenCalledWith('bash', ['-c', 'echo hi'], {
+      cwd: '/wt',
+      timeout: 1000,
+      env: { FOO: 'bar' },
+    });
+  });
+
+  it('container isolation routes through docker compose exec -T -w /work agent', async () => {
+    await runIsolatedCommand(
+      { kind: 'container', project: 'archon-slug', workdir: '/work' },
+      'bash',
+      ['-c', 'echo hi'],
+      {
+        cwd: '/home/bunny/wt/slug',
+        timeout: 1000,
+        env: { ARTIFACTS_DIR: '/home/bunny/wt/slug/.archon/a' } as NodeJS.ProcessEnv,
+      }
+    );
+    const [file, args, opts] = execSpy.mock.calls[0] as [
+      string,
+      string[],
+      { env: NodeJS.ProcessEnv },
+    ];
+    expect(file).toBe('docker');
+    expect(args.slice(0, 7)).toEqual(['compose', '-p', 'archon-slug', 'exec', '-T', '-w', '/work']);
+    expect(args.slice(-4)).toEqual(['agent', 'bash', '-c', 'echo hi']);
+    // The worktree-path env var is re-emitted via -e and remapped onto /work.
+    expect(args).toContain('ARTIFACTS_DIR');
+    expect(opts.env.ARTIFACTS_DIR).toBe('/work/.archon/a');
+  });
+
+  it('does not re-emit host-identical env vars (would clobber the container base env)', async () => {
+    const hostVal = process.env.PATH;
+    await runIsolatedCommand(
+      { kind: 'container', project: 'archon-slug', workdir: '/work' },
+      'bash',
+      ['-c', ':'],
+      { cwd: '/wt', timeout: 1000, env: { PATH: hostVal, WF_ONLY: 'x' } as NodeJS.ProcessEnv }
+    );
+    const [, args] = execSpy.mock.calls[0] as [string, string[], unknown];
+    const eKeys = args.filter((_, i) => args[i - 1] === '-e');
+    expect(eKeys).toContain('WF_ONLY'); // workflow-injected → forwarded
+    expect(eKeys).not.toContain('PATH'); // identical to host → skipped
   });
 });

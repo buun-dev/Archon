@@ -3,6 +3,7 @@ export type {
   IAgentProvider,
   AgentRequestOptions,
   SendQueryOptions,
+  IsolationDescriptor,
   NodeConfig,
   ProviderDefaults,
   ProviderDefaultsMap,

@@ -21,6 +21,7 @@ import type {
   NodeConfig,
   ProviderCapabilities,
   TokenUsage,
+  IsolationDescriptor,
 } from '@archon/providers/types';
 import {
   getProviderCapabilities,
@@ -93,6 +94,71 @@ import {
   type ResolvedAiProfile,
   type TierName,
 } from './model-validation';
+
+/**
+ * Remap a distro/host worktree path to its in-container `/work` equivalent.
+ * The node `cwd` for a container run IS the bind-mounted worktree, so any env
+ * value under it (ARTIFACTS_DIR / LOG_DIR / DOCS_DIR / …) must be re-anchored to
+ * `/work` before it reaches the containerized command. Paths outside `cwd` pass
+ * through unchanged.
+ */
+export function toContainerPath(
+  p: string | undefined,
+  cwd: string,
+  workdir: string
+): string | undefined {
+  if (!p) return p;
+  return p.startsWith(cwd) ? workdir + p.slice(cwd.length) : p;
+}
+
+/**
+ * Run a worktree-scoped subprocess. For `worktree` (or absent) isolation this is
+ * byte-identical to today's host spawn. For `container` isolation it routes
+ * through `docker compose -p <project> exec -T -w <workdir> [-e KEY…] agent <cmd>`.
+ *
+ * Only env vars the workflow *injected or overrode* (i.e. differ from the engine's
+ * own `process.env`) are re-emitted with `-e` — re-emitting the whole host env
+ * would clobber the container's Linux base env (PATH/HOME/…). Worktree-path
+ * values are remapped onto `/work` so artifacts land inside the container mount.
+ */
+export async function runIsolatedCommand(
+  iso: IsolationDescriptor | undefined,
+  cmd: string,
+  args: string[],
+  opts: { cwd: string; timeout: number; env: NodeJS.ProcessEnv }
+): Promise<{ stdout: string; stderr: string }> {
+  if (iso?.kind !== 'container' || !iso.project) {
+    return execFileAsync(cmd, args, opts); // worktree — unchanged host spawn
+  }
+  const workdir = iso.workdir ?? '/work';
+  const eflags: string[] = [];
+  const passEnv: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(opts.env)) {
+    if (v === undefined) continue;
+    // Skip untouched host vars — only the workflow's own injections/overrides
+    // cross into the container (else Windows PATH/HOME/… would break it).
+    if (process.env[k] === v) continue;
+    passEnv[k] = toContainerPath(v, opts.cwd, workdir) ?? v;
+    eflags.push('-e', k);
+  }
+  const dockerArgs = [
+    'compose',
+    '-p',
+    iso.project,
+    'exec',
+    '-T',
+    '-w',
+    workdir,
+    ...eflags,
+    'agent',
+    cmd,
+    ...args,
+  ];
+  return execFileAsync('docker', dockerArgs, {
+    timeout: opts.timeout,
+    env: { ...process.env, ...passEnv },
+  });
+}
 
 /**
  * Closed-set node type for telemetry — mirrors the DagNode discriminators.
@@ -772,7 +838,8 @@ async function executeNodeInternal(
   configuredCommandFolder?: string,
   issueContext?: string,
   resolvedModel?: string,
-  resolvedTier?: TierName
+  resolvedTier?: TierName,
+  isolation?: IsolationDescriptor
 ): Promise<NodeExecutionResult> {
   const nodeStartTime = Date.now();
   const nodeContext: SendMessageContext = { workflowId: workflowRun.id, nodeName: node.id };
@@ -893,6 +960,8 @@ async function executeNodeInternal(
     ...nodeOptions,
     abortSignal: nodeAbortController.signal,
     ...(shouldForkSession ? { forkSession: true } : {}),
+    // Route the claude subprocess through the docker-exec shim for container envs (P2).
+    ...(isolation ? { isolation } : {}),
   };
   let nodeIdleTimedOut = false;
   const effectiveIdleTimeout = node.idle_timeout ?? STEP_IDLE_TIMEOUT_MS;
@@ -1769,7 +1838,8 @@ async function executeBashNode(
   docsDir: string,
   nodeOutputs: Map<string, NodeOutput>,
   issueContext?: string,
-  envVars?: Record<string, string>
+  envVars?: Record<string, string>,
+  isolation?: IsolationDescriptor
 ): Promise<NodeOutput> {
   const nodeStartTime = Date.now();
   const nodeContext: SendMessageContext = { workflowId: workflowRun.id, nodeName: node.id };
@@ -1833,7 +1903,7 @@ async function executeBashNode(
   };
 
   try {
-    const { stdout, stderr } = await execFileAsync('bash', ['-c', finalScript], {
+    const { stdout, stderr } = await runIsolatedCommand(isolation, 'bash', ['-c', finalScript], {
       cwd,
       timeout,
       env: subprocessEnv,
@@ -1948,7 +2018,8 @@ async function executeScriptNode(
   docsDir: string,
   nodeOutputs: Map<string, NodeOutput>,
   issueContext?: string,
-  envVars?: Record<string, string>
+  envVars?: Record<string, string>,
+  isolation?: IsolationDescriptor
 ): Promise<NodeOutput> {
   const nodeStartTime = Date.now();
   const nodeContext: SendMessageContext = { workflowId: workflowRun.id, nodeName: node.id };
@@ -2102,7 +2173,7 @@ async function executeScriptNode(
       }
     }
 
-    const { stdout, stderr } = await execFileAsync(cmd, args, {
+    const { stdout, stderr } = await runIsolatedCommand(isolation, cmd, args, {
       cwd,
       timeout,
       env: subprocessEnv,
@@ -2222,7 +2293,8 @@ async function executeLoopNode(
   docsDir: string,
   nodeOutputs: Map<string, NodeOutput>,
   config: WorkflowConfig,
-  issueContext?: string
+  issueContext?: string,
+  isolation?: IsolationDescriptor
 ): Promise<NodeExecutionResult> {
   const loop = node.loop;
   const msgContext = { workflowId: workflowRun.id, nodeName: node.id };
@@ -2639,7 +2711,7 @@ async function executeLoopNode(
           true, // escapedForBash
           logDir
         );
-        await execFileAsync('bash', ['-c', substitutedBash], {
+        await runIsolatedCommand(isolation, 'bash', ['-c', substitutedBash], {
           cwd,
           timeout: SUBPROCESS_DEFAULT_TIMEOUT,
           env: {
@@ -3070,7 +3142,9 @@ export async function executeDagWorkflow(
   /** Discovery source — telemetry only (custom-vs-default + name redaction). */
   source?: WorkflowSource,
   aiProfile?: ResolvedAiProfile,
-  workflowPreset?: ModelAliasPreset
+  workflowPreset?: ModelAliasPreset,
+  /** Substrate descriptor (step-5 P2). Threaded to bash/script/loop + AI nodes. */
+  isolation?: IsolationDescriptor
 ): Promise<string | undefined> {
   const dagStartTime = Date.now();
   const workflowTier = workflow.model && isTierName(workflow.model) ? workflow.model : undefined;
@@ -3342,7 +3416,8 @@ export async function executeDagWorkflow(
               docsDir,
               nodeOutputs,
               issueContext,
-              config.envVars
+              config.envVars,
+              isolation
             );
             return { nodeId: node.id, output };
           }
@@ -3379,7 +3454,8 @@ export async function executeDagWorkflow(
               docsDir,
               nodeOutputs,
               config,
-              issueContext
+              issueContext,
+              isolation
             );
             return { nodeId: node.id, output };
           }
@@ -3457,7 +3533,8 @@ export async function executeDagWorkflow(
               docsDir,
               nodeOutputs,
               issueContext,
-              config.envVars
+              config.envVars,
+              isolation
             );
             return { nodeId: node.id, output };
           }
@@ -3597,7 +3674,8 @@ export async function executeDagWorkflow(
               configuredCommandFolder,
               issueContext,
               resolvedNodeModel,
-              resolvedTier
+              resolvedTier,
+              isolation
             );
 
             if (output.state !== 'failed') break;

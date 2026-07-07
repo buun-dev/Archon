@@ -21,6 +21,7 @@ import { formatDuration, parseDbTimestamp } from './utils/duration';
 import { keepAwake } from './utils/keep-awake';
 import { getWorkflowEventEmitter } from './event-emitter';
 import { isRegisteredProvider, getRegisteredProviders } from '@archon/providers';
+import type { IsolationDescriptor } from '@archon/providers';
 import {
   classifyError,
   toTelemetryErrorClass,
@@ -298,6 +299,11 @@ export type ExecuteWorkflowOptions = ResumePayload & {
     prBranch?: string;
   };
   /**
+   * Substrate descriptor so node executors can route commands + the claude
+   * subprocess into a container (step-5 sandbox P2). Absent = host spawn.
+   */
+  isolation?: IsolationDescriptor;
+  /**
    * Discovery source of the workflow (bundled / global / project). Used only
    * for anonymous telemetry — bundled workflows report their real name, custom
    * ones report `"custom"`. Optional: defaults to the `"custom"`/project
@@ -374,6 +380,7 @@ export async function executeWorkflow(
     codebaseId,
     issueContext,
     isolationContext,
+    isolation,
     parentConversationId,
     preCreatedRun,
     priorCompletedNodes,
@@ -893,7 +900,8 @@ export async function executeWorkflow(
       dagPriorCompletedNodes,
       source,
       aiProfile,
-      workflowPreset
+      workflowPreset,
+      isolation
     );
 
     // executeDagWorkflow throws on fatal errors; check DB status for result
