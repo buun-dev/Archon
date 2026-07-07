@@ -131,7 +131,18 @@ export interface WorktreeEnvironment extends IsolatedEnvironmentBase {
   metadata: WorktreeMetadata;
 }
 
-export type IsolatedEnvironment = WorktreeEnvironment;
+/** A per-run container (P1 sandbox: compose project `archon-<slug>`, service `agent`). */
+export interface ContainerEnvironment extends IsolatedEnvironmentBase {
+  provider: 'container';
+  branchName: BranchName;
+  /** Compose project name, e.g. `archon-<slug>` — the `docker compose -p` target. */
+  project: string;
+  /** In-container working dir the bind-mounted worktree lives at (P1: `/work`). */
+  containerWorkdir: string;
+  metadata: WorktreeMetadata;
+}
+
+export type IsolatedEnvironment = WorktreeEnvironment | ContainerEnvironment;
 
 // --- Provider Interface ---
 
