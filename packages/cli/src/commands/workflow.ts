@@ -74,6 +74,28 @@ function getLog(): ReturnType<typeof createLogger> {
 }
 
 /**
+ * Build the substrate descriptor from a stored isolation-environment row. On
+ * reuse/resume the env's own `provider` is the source of truth — re-reading
+ * `.archon/config.yaml` can flake across the fresh-vs-registered-codebase
+ * paths, and `provider.get()` depends on live `docker compose ps` parsing.
+ * Container envs route node commands + the claude subprocess through docker
+ * exec (`archon-<slug>`, `/work`); worktree envs need no descriptor.
+ */
+function isolationDescriptorFromEnv(env: {
+  provider: string;
+  working_path: string;
+}): IsolationDescriptor {
+  if (env.provider !== 'container') return { kind: 'worktree' };
+  const slug =
+    env.working_path
+      .replace(/[/\\]+$/, '')
+      .split(/[/\\]/)
+      .filter(Boolean)
+      .pop() ?? '';
+  return { kind: 'container', project: `archon-${slug}`, workdir: '/work' };
+}
+
+/**
  * Options for workflow run command
  *
  * Default: creates worktree with auto-generated branch name (isolation by default).
@@ -836,8 +858,12 @@ export async function workflowRunCommand(
     const matchingEnv = allEnvs.find(e => e.working_path === workingCwd);
     if (matchingEnv) {
       isolationEnvId = matchingEnv.id;
+      // Re-thread the substrate descriptor so post-resume nodes (e.g. an
+      // approval gate's downstream commit/PR steps) keep routing into the
+      // container instead of silently falling back to a host spawn.
+      isolationDescriptor = isolationDescriptorFromEnv(matchingEnv);
       getLog().info(
-        { envId: isolationEnvId, workingPath: workingCwd },
+        { envId: isolationEnvId, workingPath: workingCwd, isolationKind: isolationDescriptor.kind },
         'workflow.resume_env_found'
       );
     }
@@ -909,14 +935,9 @@ export async function workflowRunCommand(
       getLog().info({ path: existingEnv.working_path }, 'worktree_reused');
       workingCwd = existingEnv.working_path;
       isolationEnvId = existingEnv.id;
-      // Reconstruct the substrate descriptor for the reused env (container envs
-      // carry project/workdir; worktree envs need no descriptor).
-      const reusedEnv =
-        repoIsolationKind === 'container' ? await provider.get(existingEnv.working_path) : null;
-      isolationDescriptor =
-        reusedEnv?.provider === 'container'
-          ? { kind: 'container', project: reusedEnv.project, workdir: reusedEnv.containerWorkdir }
-          : { kind: 'worktree' };
+      // Reconstruct the substrate descriptor from the reused env's stored
+      // provider (reliable across config-resolution flakiness).
+      isolationDescriptor = isolationDescriptorFromEnv(existingEnv);
     } else {
       // Create new worktree
       getLog().info(
