@@ -16,7 +16,7 @@ mock.module('@anthropic-ai/claude-agent-sdk', () => ({
   query: mockQuery,
 }));
 
-import { ClaudeProvider, shouldPassNoEnvFile } from './provider';
+import { ClaudeProvider, shouldPassNoEnvFile, applyContainerIsolation } from './provider';
 import * as claudeModule from './provider';
 import * as binaryResolver from './binary-resolver';
 
@@ -1773,5 +1773,52 @@ describe('sendQuery decomposition behaviors', () => {
       );
       expect(warnCalls).toHaveLength(0);
     });
+  });
+});
+
+// --- step-5 sandbox P2: container AI-node routing (Task 9) ---
+
+describe('applyContainerIsolation', () => {
+  test('returns cliPath unchanged for worktree / absent isolation', () => {
+    const env: NodeJS.ProcessEnv = {};
+    expect(applyContainerIsolation('/orig/cli.js', env, undefined)).toBe('/orig/cli.js');
+    expect(applyContainerIsolation('/orig/cli.js', env, { kind: 'worktree' })).toBe('/orig/cli.js');
+    expect(env.ARCHON_EXEC_PROJECT).toBeUndefined();
+    expect(env.IS_SANDBOX).toBeUndefined();
+  });
+
+  test('container isolation swaps to the .mjs shim and injects the exec locators', () => {
+    const env: NodeJS.ProcessEnv = {};
+    const cli = applyContainerIsolation('/orig/cli.js', env, {
+      kind: 'container',
+      project: 'archon-slug',
+      workdir: '/work',
+    });
+    expect(cli).toMatch(/claude-docker-exec\.mjs$/);
+    // .mjs → the SDK auto-adds --no-env-file and spawns via bun (Gate-2 shape).
+    expect(shouldPassNoEnvFile(cli)).toBe(true);
+    expect(env.ARCHON_EXEC_PROJECT).toBe('archon-slug');
+    expect(env.ARCHON_EXEC_WORKDIR).toBe('/work');
+    expect(env.IS_SANDBOX).toBe('1');
+  });
+
+  test('defaults the in-container workdir to /work when omitted', () => {
+    const env: NodeJS.ProcessEnv = {};
+    applyContainerIsolation(undefined, env, { kind: 'container', project: 'archon-x' });
+    expect(env.ARCHON_EXEC_WORKDIR).toBe('/work');
+  });
+
+  test('ARCHON_SANDBOX_CLAUDE_SHIM overrides the default shim path', () => {
+    const env: NodeJS.ProcessEnv = {};
+    const prev = process.env.ARCHON_SANDBOX_CLAUDE_SHIM;
+    process.env.ARCHON_SANDBOX_CLAUDE_SHIM = 'D:/custom/shim.mjs';
+    try {
+      expect(
+        applyContainerIsolation('/orig', env, { kind: 'container', project: 'archon-y' })
+      ).toBe('D:/custom/shim.mjs');
+    } finally {
+      if (prev === undefined) delete process.env.ARCHON_SANDBOX_CLAUDE_SHIM;
+      else process.env.ARCHON_SANDBOX_CLAUDE_SHIM = prev;
+    }
   });
 });

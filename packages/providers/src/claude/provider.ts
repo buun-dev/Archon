@@ -41,6 +41,7 @@ import type {
   TokenUsage,
   ProviderCapabilities,
   NodeConfig,
+  IsolationDescriptor,
 } from '../types';
 import { parseClaudeConfig } from './config';
 import { CLAUDE_CAPABILITIES } from './capabilities';
@@ -515,6 +516,34 @@ export function shouldPassNoEnvFile(cliPath: string | undefined): boolean {
  * Build base Claude SDK options from cwd, request options, and assistant defaults.
  * Does not include nodeConfig translation — that is handled by applyNodeConfig.
  */
+/**
+ * Default host-accessible path to the docker-exec shim. The engine runs on
+ * Windows (step-5 B1), so this is a Windows path (forward slashes are fine for
+ * node/bun), NOT a `/mnt/c` WSL path. Override with ARCHON_SANDBOX_CLAUDE_SHIM.
+ */
+const DEFAULT_CLAUDE_SHIM = 'C:/Users/Buun/.archon/sandbox/claude-docker-exec.mjs';
+
+/**
+ * For a container isolation run (step-5 P2), point the claude executable at the
+ * docker-exec shim and inject the exec locators into `env` (mutated in place).
+ * The SDK spawns the `.mjs` via the engine runtime (bun, which accepts the
+ * auto-added `--no-env-file`) and passes `env` through, so the shim re-emits the
+ * auth keys into `docker compose exec`. Returns `cliPath` unchanged otherwise.
+ */
+export function applyContainerIsolation(
+  cliPath: string | undefined,
+  env: NodeJS.ProcessEnv,
+  isolation: IsolationDescriptor | undefined
+): string | undefined {
+  if (isolation?.kind !== 'container' || !isolation.project) return cliPath;
+  env.ARCHON_EXEC_PROJECT = isolation.project;
+  env.ARCHON_EXEC_WORKDIR = isolation.workdir ?? '/work';
+  // claude refuses bypassPermissions as UID 0 unless IS_SANDBOX=1; the container
+  // agent is uid 1000 AND sandboxed — set it so the in-container claude agrees.
+  env.IS_SANDBOX = '1';
+  return process.env.ARCHON_SANDBOX_CLAUDE_SHIM ?? DEFAULT_CLAUDE_SHIM;
+}
+
 function buildBaseClaudeOptions(
   cwd: string,
   requestOptions: SendQueryOptions | undefined,
@@ -978,6 +1007,10 @@ export class ClaudeProvider implements IAgentProvider {
     const subprocessEnv = buildSubprocessEnv();
     const env = requestOptions?.env ? { ...subprocessEnv, ...requestOptions.env } : subprocessEnv;
 
+    // Container isolation (step-5 P2): swap the claude executable for the
+    // docker-exec shim and inject the exec locators into `env`. No-op otherwise.
+    const cliForRun = applyContainerIsolation(resolvedCliPath, env, requestOptions?.isolation);
+
     // Apply nodeConfig translation once (deterministic, not retry-dependent)
     // We need a throwaway Options to extract warnings from applyNodeConfig,
     // then re-apply per attempt. But nodeConfig warnings are deterministic,
@@ -1022,7 +1055,7 @@ export class ClaudeProvider implements IAgentProvider {
         stderrLines,
         toolResultQueue,
         env,
-        resolvedCliPath
+        cliForRun
       );
 
       // 2. Apply nodeConfig translation (re-applied per attempt since options are fresh)
