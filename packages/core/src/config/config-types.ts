@@ -225,6 +225,16 @@ export interface RepoConfig {
   };
 
   /**
+   * Isolation substrate for this repo (step-5 sandbox two-way door).
+   * Absent or `worktree` = host git worktree (default, byte-identical to today).
+   * `container` opts the repo into per-run container isolation (P1 sandbox).
+   * Reverting is a one-line config change.
+   */
+  isolation?: {
+    provider?: 'worktree' | 'container';
+  };
+
+  /**
    * Documentation directory settings
    */
   docs?: {

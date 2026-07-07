@@ -13,6 +13,7 @@ export type {
   CreatedWorktreeMetadata,
   WorktreeMetadata,
   WorktreeEnvironment,
+  ContainerEnvironment,
   IsolatedEnvironment,
   DestroyOptions,
   WorktreeDestroyOptions,
@@ -47,6 +48,7 @@ export type { IsolationResolverDeps } from './resolver';
 
 // --- Provider ---
 export { WorktreeProvider } from './providers/worktree';
+export { ContainerProvider } from './providers/container';
 
 // --- PR state lookup ---
 export { getPrState } from './pr-state';

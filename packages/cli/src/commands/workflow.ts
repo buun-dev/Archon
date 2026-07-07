@@ -847,11 +847,17 @@ export async function workflowRunCommand(
     // Auto-generate branch identifier from workflow name + timestamp when --branch not provided
     const branchIdentifier = options.branchName ?? `${workflowName}-${Date.now()}`;
 
+    // Resolve the isolation substrate for this repo (step-5 two-way door):
+    // `.archon/config.yaml` isolation.provider === 'container' opts into the P1
+    // sandbox; absent/`worktree` keeps the default host git-worktree path.
+    const repoIsolationKind =
+      (await loadRepoConfig(codebase.default_cwd))?.isolation?.provider ?? 'worktree';
+
     // Configure isolation with repo config loader (same as orchestrator)
     configureIsolation(async (repoPath: string) => {
       const repoConfig = await loadRepoConfig(repoPath);
       return repoConfig?.worktree ?? null;
-    });
+    }, repoIsolationKind);
 
     const provider = getIsolationProvider();
 
@@ -922,7 +928,7 @@ export async function workflowRunCommand(
         codebase_id: codebase.id,
         workflow_type: 'task',
         workflow_id: branchIdentifier,
-        provider: 'worktree',
+        provider: isolatedEnv.provider,
         working_path: isolatedEnv.workingPath,
         branch_name: isolatedEnv.branchName,
         created_by_platform: 'cli',

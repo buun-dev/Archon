@@ -4,6 +4,10 @@ import { getIsolationProvider, resetIsolationProvider, configureIsolation } from
 describe('Isolation Provider Factory', () => {
   afterEach(() => {
     resetIsolationProvider();
+    // Reset the configured kind back to the default so a container-kind test
+    // doesn't leak into the next test (resetIsolationProvider only nulls the singleton).
+    configureIsolation(async () => null, 'worktree');
+    resetIsolationProvider();
   });
 
   test('getIsolationProvider returns same instance on repeated calls', () => {
@@ -27,6 +31,24 @@ describe('Isolation Provider Factory', () => {
   });
 
   test('provider type is worktree', () => {
+    const provider = getIsolationProvider();
+    expect(provider.providerType).toBe('worktree');
+  });
+
+  test('configureIsolation with kind "container" yields a ContainerProvider (two-way door)', () => {
+    configureIsolation(async () => null, 'container');
+    const provider = getIsolationProvider();
+    expect(provider.providerType).toBe('container');
+  });
+
+  test('configureIsolation defaults to worktree kind when kind omitted', () => {
+    configureIsolation(async () => null);
+    const provider = getIsolationProvider();
+    expect(provider.providerType).toBe('worktree');
+  });
+
+  test('configureIsolation with explicit "worktree" yields a WorktreeProvider', () => {
+    configureIsolation(async () => null, 'worktree');
     const provider = getIsolationProvider();
     expect(provider.providerType).toBe('worktree');
   });
