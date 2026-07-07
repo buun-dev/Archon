@@ -1011,6 +1011,16 @@ export class ClaudeProvider implements IAgentProvider {
     // docker-exec shim and inject the exec locators into `env`. No-op otherwise.
     const cliForRun = applyContainerIsolation(resolvedCliPath, env, requestOptions?.isolation);
 
+    // The SDK spawns the executable with `options.cwd`. For a container run the
+    // node's `cwd` is a distro path that does NOT exist on the Windows host, so
+    // `uv_spawn` ENOENTs ("executable ... exists but failed to launch"). The real
+    // workdir is /work (the shim's `-w`), so spawn from a valid host dir — the
+    // shim's own directory — instead. Host spawn cwd never reaches the container.
+    const cwdForRun =
+      requestOptions?.isolation?.kind === 'container' && cliForRun
+        ? cliForRun.replace(/[\\/][^\\/]*$/, '')
+        : cwd;
+
     // Apply nodeConfig translation once (deterministic, not retry-dependent)
     // We need a throwaway Options to extract warnings from applyNodeConfig,
     // then re-apply per attempt. But nodeConfig warnings are deterministic,
@@ -1048,7 +1058,7 @@ export class ClaudeProvider implements IAgentProvider {
 
       // 1. Build SDK options (env and cliPath pre-computed above)
       const options = buildBaseClaudeOptions(
-        cwd,
+        cwdForRun,
         requestOptions,
         assistantDefaults,
         controller,
