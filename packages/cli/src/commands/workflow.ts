@@ -803,6 +803,9 @@ export async function workflowRunCommand(
   // Substrate descriptor threaded into executeWorkflow so node commands + the
   // claude subprocess route into the container when isolation.provider=container (P2).
   let isolationDescriptor: IsolationDescriptor | undefined;
+  // Host-resolved base branch for container runs (the executor's distro cwd is
+  // unreachable from the Windows host, so it can't load config / detect it there).
+  let hostBaseBranch: string | undefined;
 
   // Handle --resume: locate the prior failed run, reuse its worktree, and hand
   // the resumed-run handle to executeWorkflow below via opts. The executor no
@@ -880,8 +883,13 @@ export async function workflowRunCommand(
     // Resolve the isolation substrate for this repo (step-5 two-way door):
     // `.archon/config.yaml` isolation.provider === 'container' opts into the P1
     // sandbox; absent/`worktree` keeps the default host git-worktree path.
-    const repoIsolationKind =
-      (await loadRepoConfig(codebase.default_cwd))?.isolation?.provider ?? 'worktree';
+    const repoConfigForRun = await loadRepoConfig(codebase.default_cwd);
+    const repoIsolationKind = repoConfigForRun?.isolation?.provider ?? 'worktree';
+    // For container runs, resolve the base branch here (host-accessible) — the
+    // executor can't read it from its distro-path cwd.
+    if (repoIsolationKind === 'container') {
+      hostBaseBranch = repoConfigForRun?.worktree?.baseBranch?.trim() || undefined;
+    }
 
     // Configure isolation with repo config loader (same as orchestrator)
     configureIsolation(async (repoPath: string) => {
@@ -1171,6 +1179,7 @@ export async function workflowRunCommand(
           source: workflowSource,
           userId: cliUserId,
           isolation: isolationDescriptor,
+          baseBranch: hostBaseBranch,
           ...prepared,
         }
       : {
@@ -1178,6 +1187,7 @@ export async function workflowRunCommand(
           source: workflowSource,
           userId: cliUserId,
           isolation: isolationDescriptor,
+          baseBranch: hostBaseBranch,
         };
     result = await executeWorkflow(
       deps,

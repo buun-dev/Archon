@@ -304,6 +304,13 @@ export type ExecuteWorkflowOptions = ResumePayload & {
    */
   isolation?: IsolationDescriptor;
   /**
+   * Host-resolved base branch. For a container run the executor's own cwd is a
+   * distro worktree path unreachable from the Windows host, so `deps.loadConfig`
+   * and `getDefaultBranch(cwd)` can't run — the caller resolves the base branch
+   * from a host-accessible config and passes it here (step-5 sandbox P2).
+   */
+  baseBranch?: string;
+  /**
    * Discovery source of the workflow (bundled / global / project). Used only
    * for anonymous telemetry — bundled workflows report their real name, custom
    * ones report `"custom"`. Optional: defaults to the `"custom"`/project
@@ -414,7 +421,10 @@ export async function executeWorkflow(
   // Auto-detect base branch when not configured. Config takes priority.
   // If detection fails, leave empty — substituteWorkflowVariables throws only if $BASE_BRANCH is referenced.
   let baseBranch: string;
-  if (config.baseBranch) {
+  if (opts.baseBranch) {
+    // Host-resolved (container runs — cwd is a distro path unreachable here).
+    baseBranch = opts.baseBranch;
+  } else if (config.baseBranch) {
     baseBranch = config.baseBranch;
   } else {
     try {
