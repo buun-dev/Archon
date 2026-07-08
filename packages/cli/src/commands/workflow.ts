@@ -865,6 +865,15 @@ export async function workflowRunCommand(
       // approval gate's downstream commit/PR steps) keep routing into the
       // container instead of silently falling back to a host spawn.
       isolationDescriptor = isolationDescriptorFromEnv(matchingEnv);
+      // Container resume: the executor can't resolve BASE_BRANCH from its distro
+      // cwd (unreachable on this host), and the fresh-dispatch block below is
+      // skipped on resume — resolve it from the host-side repo config here, or
+      // every post-resume node referencing $BASE_BRANCH fails its prompt
+      // substitution (reuse-review/pr-summary in tdd:4b9ba482).
+      if (isolationDescriptor.kind === 'container') {
+        hostBaseBranch =
+          (await loadRepoConfig(codebase.default_cwd))?.worktree?.baseBranch?.trim() || undefined;
+      }
       getLog().info(
         { envId: isolationEnvId, workingPath: workingCwd, isolationKind: isolationDescriptor.kind },
         'workflow.resume_env_found'

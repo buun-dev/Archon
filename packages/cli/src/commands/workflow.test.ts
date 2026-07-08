@@ -131,6 +131,7 @@ mock.module('@archon/core/db/codebases', () => ({
 mock.module('@archon/core/db/isolation-environments', () => ({
   findActiveByWorkflow: mock(() => Promise.resolve(null)),
   create: mock(() => Promise.resolve({ id: 'iso-123' })),
+  listByCodebase: mock(() => Promise.resolve([])),
 }));
 
 mock.module('@archon/core/db/messages', () => ({
@@ -1088,6 +1089,77 @@ describe('workflowRunCommand', () => {
       'Remove the stale workspace entry at /home/test/.archon/workspaces/acme/widget and retry'
     );
     expect(error.message).not.toContain('Not in a git repository');
+  });
+
+  it('threads host-resolved baseBranch + container descriptor into executeWorkflow on --resume', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const { executeWorkflow, hydrateResumableRun } = await import('@archon/workflows/executor');
+    const { loadRepoConfig } = await import('@archon/core');
+    const conversationDb = await import('@archon/core/db/conversations');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    const workflowDb = await import('@archon/core/db/workflows');
+    const isolationEnvDb = await import('@archon/core/db/isolation-environments');
+    const { tmpdir } = await import('node:os');
+    const { basename } = await import('node:path');
+
+    // The resume path existsSync-checks the prior working path — use a real dir.
+    // For a container run this is a distro path unreachable from the host, so the
+    // executor cannot resolve BASE_BRANCH from it; the CLI must thread the
+    // host-config value (the tdd:4b9ba482 regression: reuse-review/pr-summary
+    // failed their $BASE_BRANCH substitution after a gate resume).
+    const workingPath = tmpdir();
+    const slug = basename(workingPath);
+
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'implement', description: 'Impl' })],
+      errors: [],
+    });
+    (conversationDb.getOrCreateConversation as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'conv-resume',
+    });
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'cb-container',
+      name: 'test/repo',
+      default_cwd: '/host/repo',
+    });
+    const resumableRun = {
+      id: 'run-container-resume',
+      workflow_name: 'implement',
+      working_path: workingPath,
+      user_message: 'plan.md',
+      status: 'failed',
+      conversation_id: 'conv-resume',
+    };
+    (workflowDb.findResumableRun as ReturnType<typeof mock>).mockResolvedValueOnce(resumableRun);
+    (isolationEnvDb.listByCodebase as ReturnType<typeof mock>).mockResolvedValueOnce([
+      { id: 'iso-container', provider: 'container', working_path: workingPath },
+    ]);
+    (loadRepoConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      isolation: { provider: 'container' },
+      worktree: { baseBranch: 'master' },
+    });
+    (hydrateResumableRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      preCreatedRun: resumableRun,
+      priorCompletedNodes: new Map([['bootstrap', 'ok']]),
+    });
+    (executeWorkflow as ReturnType<typeof mock>).mockResolvedValueOnce({
+      success: true,
+      workflowRunId: 'run-container-resume',
+    });
+
+    await workflowRunCommand('/host/repo', 'implement', 'plan.md', { resume: true });
+
+    const callArgs = (executeWorkflow as ReturnType<typeof mock>).mock.calls.at(-1)!;
+    const opts = callArgs[7] as {
+      baseBranch?: string;
+      isolation?: { kind: string; project?: string; workdir?: string };
+    };
+    expect(opts.isolation).toEqual({
+      kind: 'container',
+      project: `archon-${slug}`,
+      workdir: '/work',
+    });
+    expect(opts.baseBranch).toBe('master');
   });
 
   it('falls back to generic workspace hint when registration error has an unrecognized shape', async () => {
