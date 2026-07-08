@@ -112,6 +112,32 @@ export function toContainerPath(
 }
 
 /**
+ * Where the sandbox bind-mounts the host workspace meta dir
+ * (`~/.archon/workspaces/<owner>/<repo>`) inside the container (step-5 P2).
+ */
+export const CONTAINER_META_DIR = '/archon-meta';
+
+/**
+ * Container-facing views of the run meta dirs. Host ARTIFACTS_DIR/LOG_DIR are
+ * Windows paths a containerized node can't reach (and win32 separators leak as
+ * literal junk dirs into /work — the tdd:4b9ba482 bug). The sandbox mounts the
+ * workspace meta dir at {@link CONTAINER_META_DIR}, so both sides read/write
+ * the same files: nodes get the container view, engine io keeps the host paths.
+ */
+export function isoMetaDirs(
+  iso: IsolationDescriptor | undefined,
+  runId: string,
+  artifactsDir: string,
+  logDir: string
+): { nodeArtifactsDir: string; nodeLogDir: string } {
+  if (iso?.kind !== 'container') return { nodeArtifactsDir: artifactsDir, nodeLogDir: logDir };
+  return {
+    nodeArtifactsDir: `${CONTAINER_META_DIR}/artifacts/runs/${runId}`,
+    nodeLogDir: `${CONTAINER_META_DIR}/logs`,
+  };
+}
+
+/**
  * Run a worktree-scoped subprocess. For `worktree` (or absent) isolation this is
  * byte-identical to today's host spawn. For `container` isolation it routes
  * through `docker compose -p <project> exec -T -w <workdir> [-e KEY…] agent <cmd>`.
@@ -444,14 +470,18 @@ function shellQuoteOrFile(
   value: string,
   nodeId: string,
   field: string | undefined,
-  outputFileDir: string | undefined
+  outputFileDir: string | undefined,
+  outputFileRefDir?: string
 ): string {
   if (outputFileDir && value.length > NODE_OUTPUT_FILE_THRESHOLD) {
     const filename = field ? `${nodeId}.${field}.nodeoutput` : `${nodeId}.nodeoutput`;
     const filePath = joinPath(outputFileDir, filename);
     try {
       writeFileSync(filePath, value);
-      return `$(cat ${shellQuote(filePath)})`;
+      // Container runs write host-side but the $(cat …) executes in-container —
+      // reference the bind-mounted view when it differs from the write dir.
+      const refPath = outputFileRefDir ? `${outputFileRefDir}/${filename}` : filePath;
+      return `$(cat ${shellQuote(refPath)})`;
     } catch (fileErr) {
       const err = fileErr as Error;
       getLog().error(
@@ -476,7 +506,8 @@ export function substituteNodeOutputRefs(
   prompt: string,
   nodeOutputs: Map<string, NodeOutput>,
   escapedForBash = false,
-  outputFileDir?: string
+  outputFileDir?: string,
+  outputFileRefDir?: string
 ): string {
   return prompt.replace(
     /\$([a-zA-Z_][a-zA-Z0-9_-]*)\.output(?:\.([a-zA-Z_][a-zA-Z0-9_]*))?/g,
@@ -488,7 +519,7 @@ export function substituteNodeOutputRefs(
       }
       if (!field) {
         return escapedForBash
-          ? shellQuoteOrFile(nodeOutput.output, nodeId, undefined, outputFileDir)
+          ? shellQuoteOrFile(nodeOutput.output, nodeId, undefined, outputFileDir, outputFileRefDir)
           : nodeOutput.output;
       }
       // No-silent-drop field access (resolveNodeOutputField): prefers the parsed
@@ -502,7 +533,9 @@ export function substituteNodeOutputRefs(
       if (resolution.kind === 'empty') return escapedForBash ? "''" : '';
       const value = resolution.value;
       if (typeof value === 'string')
-        return escapedForBash ? shellQuoteOrFile(value, nodeId, field, outputFileDir) : value;
+        return escapedForBash
+          ? shellQuoteOrFile(value, nodeId, field, outputFileDir, outputFileRefDir)
+          : value;
       // numbers and booleans are shell-safe without quoting: JSON disallows
       // NaN/Infinity so String(number) is digits/sign/'.', and String(boolean) is
       // 'true'/'false' — no shell metacharacters.
@@ -510,7 +543,9 @@ export function substituteNodeOutputRefs(
       // arrays and objects: JSON-stringify so downstream tools (jq, etc.) get a
       // single JSON literal argument.
       const json = JSON.stringify(value);
-      return escapedForBash ? shellQuoteOrFile(json, nodeId, field, outputFileDir) : json;
+      return escapedForBash
+        ? shellQuoteOrFile(json, nodeId, field, outputFileDir, outputFileRefDir)
+        : json;
     }
   );
 }
@@ -910,14 +945,17 @@ async function executeNodeInternal(
     rawPrompt = node.prompt;
   }
 
-  // Standard variable substitution
+  // Standard variable substitution. Container runs substitute the container-facing
+  // artifacts dir — the prompt's $ARTIFACTS_DIR paths are read/written by the
+  // in-container claude, not the engine.
+  const { nodeArtifactsDir } = isoMetaDirs(isolation, workflowRun.id, artifactsDir, logDir);
   let substitutedPrompt: string;
   try {
     substitutedPrompt = buildPromptWithContext(
       rawPrompt,
       workflowRun.id,
       workflowRun.user_message,
-      artifactsDir,
+      nodeArtifactsDir,
       baseBranch,
       docsDir,
       issueContext,
@@ -1893,12 +1931,20 @@ async function executeBashNode(
     nodeName: node.id,
   });
 
-  // Variable substitution on script
+  // Variable substitution on script. Container runs substitute + export the
+  // container-facing meta dirs (host Windows paths are unreachable in-container
+  // and their separators leak as literal junk dirs — the tdd:4b9ba482 bug).
+  const { nodeArtifactsDir, nodeLogDir } = isoMetaDirs(
+    isolation,
+    workflowRun.id,
+    artifactsDir,
+    logDir
+  );
   const { prompt: substitutedScript } = substituteWorkflowVariables(
     node.bash,
     workflowRun.id,
     workflowRun.user_message,
-    artifactsDir,
+    nodeArtifactsDir,
     baseBranch,
     docsDir,
     issueContext,
@@ -1907,13 +1953,19 @@ async function executeBashNode(
     undefined,
     { shellSafe: true }
   );
-  const finalScript = substituteNodeOutputRefs(substitutedScript, nodeOutputs, true, logDir);
+  const finalScript = substituteNodeOutputRefs(
+    substitutedScript,
+    nodeOutputs,
+    true,
+    logDir,
+    nodeLogDir === logDir ? undefined : nodeLogDir
+  );
 
   const timeout = node.timeout ?? SUBPROCESS_DEFAULT_TIMEOUT;
   const subprocessEnv: NodeJS.ProcessEnv = {
     ...process.env,
-    ARTIFACTS_DIR: artifactsDir,
-    LOG_DIR: logDir,
+    ARTIFACTS_DIR: nodeArtifactsDir,
+    LOG_DIR: nodeLogDir,
     BASE_BRANCH: baseBranch,
     USER_MESSAGE: workflowRun.user_message,
     ARGUMENTS: workflowRun.user_message,
@@ -2073,12 +2125,19 @@ async function executeScriptNode(
     nodeName: node.id,
   });
 
-  // Variable substitution on script field
+  // Variable substitution on script field. Container runs substitute + export
+  // the container-facing meta dirs (see executeBashNode).
+  const { nodeArtifactsDir, nodeLogDir } = isoMetaDirs(
+    isolation,
+    workflowRun.id,
+    artifactsDir,
+    logDir
+  );
   const { prompt: substitutedScript } = substituteWorkflowVariables(
     node.script,
     workflowRun.id,
     workflowRun.user_message,
-    artifactsDir,
+    nodeArtifactsDir,
     baseBranch,
     docsDir,
     issueContext
@@ -2088,8 +2147,8 @@ async function executeScriptNode(
   const timeout = node.timeout ?? SUBPROCESS_DEFAULT_TIMEOUT;
   const subprocessEnv: NodeJS.ProcessEnv = {
     ...process.env,
-    ARTIFACTS_DIR: artifactsDir,
-    LOG_DIR: logDir,
+    ARTIFACTS_DIR: nodeArtifactsDir,
+    LOG_DIR: nodeLogDir,
     BASE_BRANCH: baseBranch,
     ...(envVars ?? {}),
   };
@@ -2322,6 +2381,14 @@ async function executeLoopNode(
 ): Promise<NodeExecutionResult> {
   const loop = node.loop;
   const msgContext = { workflowId: workflowRun.id, nodeName: node.id };
+  // Container-facing meta dirs for everything that crosses into the container
+  // (iteration prompts + until_bash); engine io keeps the host paths.
+  const { nodeArtifactsDir, nodeLogDir } = isoMetaDirs(
+    isolation,
+    workflowRun.id,
+    artifactsDir,
+    logDir
+  );
 
   // Resolve AI client — fail fast with descriptive error
   let aiClient: ReturnType<typeof deps.getAgentProvider>;
@@ -2423,7 +2490,7 @@ async function executeLoopNode(
         loop.prompt,
         workflowRun.id,
         workflowRun.user_message,
-        artifactsDir,
+        nodeArtifactsDir,
         baseBranch,
         docsDir,
         issueContext,
@@ -2720,7 +2787,7 @@ async function executeLoopNode(
           loop.until_bash,
           workflowRun.id,
           workflowRun.user_message,
-          artifactsDir,
+          nodeArtifactsDir,
           baseBranch,
           docsDir,
           issueContext,
@@ -2733,7 +2800,8 @@ async function executeLoopNode(
           bashPrompt,
           nodeOutputs,
           true, // escapedForBash
-          logDir
+          logDir,
+          nodeLogDir === logDir ? undefined : nodeLogDir
         );
         await runIsolatedCommand(isolation, 'bash', ['-c', substitutedBash], {
           cwd,
@@ -2962,7 +3030,8 @@ async function executeApprovalNode(
   configuredCommandFolder?: string,
   issueContext?: string,
   aiProfile?: ResolvedAiProfile,
-  workflowPreset?: ModelAliasPreset
+  workflowPreset?: ModelAliasPreset,
+  isolation?: IsolationDescriptor
 ): Promise<NodeOutput> {
   const msgContext = { workflowId: workflowRun.id, nodeName: node.id };
 
@@ -3010,12 +3079,14 @@ async function executeApprovalNode(
       return { state: 'completed' as const, output: '' };
     }
 
-    // Run the on_reject prompt via AI
+    // Run the on_reject prompt via AI. Container runs substitute the
+    // container-facing artifacts dir (the rework claude runs in-container).
+    const { nodeArtifactsDir } = isoMetaDirs(isolation, workflowRun.id, artifactsDir, logDir);
     const { prompt: substitutedPrompt } = substituteWorkflowVariables(
       node.approval.on_reject.prompt,
       workflowRun.id,
       workflowRun.user_message ?? '',
-      artifactsDir,
+      nodeArtifactsDir,
       baseBranch,
       docsDir,
       issueContext,
@@ -3080,7 +3151,8 @@ async function executeApprovalNode(
       configuredCommandFolder,
       issueContext,
       resolvedNodeModel,
-      resolvedTier
+      resolvedTier,
+      isolation
     );
 
     if (output.state === 'failed') {
@@ -3505,7 +3577,8 @@ export async function executeDagWorkflow(
               configuredCommandFolder,
               issueContext,
               aiProfile,
-              workflowPreset
+              workflowPreset,
+              isolation
             );
             return { nodeId: node.id, output };
           }

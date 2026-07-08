@@ -938,6 +938,24 @@ describe('substituteNodeOutputRefs -- large output file substitution', () => {
     expect(result).not.toContain('$(cat ');
   });
 
+  it('writes the spill file to outputFileDir but references outputFileRefDir (container runs)', async () => {
+    // Container runs write host-side (engine fs) but the $(cat …) executes
+    // in-container — the reference must use the bind-mounted view.
+    const largeOutput = 'z'.repeat(33_000);
+    const outputs = new Map([['a', makeOutput('completed', largeOutput)]]);
+    const result = substituteNodeOutputRefs(
+      'echo $a.output',
+      outputs,
+      true,
+      tempDir,
+      '/archon-meta/logs'
+    );
+    expect(result).toContain("$(cat '/archon-meta/logs/a.nodeoutput')");
+    const { readFile: readFileAsync } = await import('fs/promises');
+    const written = await readFileAsync(join(tempDir, 'a.nodeoutput'), 'utf-8');
+    expect(written).toBe(largeOutput);
+  });
+
   it('falls back to shell-quoting when file write fails', () => {
     const largeOutput = 'x'.repeat(33_000);
     const outputs = new Map([['a', makeOutput('completed', largeOutput)]]);
@@ -9721,5 +9739,112 @@ describe('runIsolatedCommand', () => {
     const eKeys = args.filter((_, i) => args[i - 1] === '-e');
     expect(eKeys).toContain('WF_ONLY'); // workflow-injected → forwarded
     expect(eKeys).not.toContain('PATH'); // identical to host → skipped
+  });
+});
+
+// --- step-5 sandbox P2: container-facing run meta dirs (fix C) ---
+//
+// The host ARTIFACTS_DIR/LOG_DIR are Windows paths a containerized node can't
+// reach (the tdd:4b9ba482 junk-dir bug: win32 separators leaked into /work).
+// The sandbox bind-mounts the workspace meta dir at /archon-meta; every value
+// that crosses into the container must use that view, while engine-side io
+// keeps the host paths.
+
+describe('executeDagWorkflow -- container meta dirs (step-5 P2 fix C)', () => {
+  let testDir: string;
+  let execSpy: Mock<typeof git.execFileAsync>;
+  const containerIso = { kind: 'container', project: 'archon-slug', workdir: '/work' } as const;
+
+  beforeEach(async () => {
+    testDir = join(tmpdir(), `dag-meta-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(testDir, { recursive: true });
+    execSpy = spyOn(git, 'execFileAsync');
+    execSpy.mockResolvedValue({ stdout: '', stderr: '' });
+    mockSendQueryDag.mockClear();
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'ok' };
+      yield { type: 'result', sessionId: 'meta-session' };
+    });
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+  });
+
+  afterEach(async () => {
+    execSpy.mockRestore();
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  function runMetaDag(nodes: readonly DagNode[], isolation?: typeof containerIso) {
+    const workflowRun = makeWorkflowRun('meta-run-id', {
+      workflow_name: 'meta-wf',
+      conversation_id: 'conv-meta',
+      user_message: 'test',
+    });
+    return executeDagWorkflow(
+      createMockDeps(),
+      createMockPlatform(),
+      'conv-meta',
+      testDir,
+      { name: 'meta-wf', nodes },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      isolation
+    );
+  }
+
+  it('bash nodes get /archon-meta ARTIFACTS_DIR/LOG_DIR (env + script text) in a container', async () => {
+    await runMetaDag([{ id: 'emit', bash: 'echo "$ARTIFACTS_DIR" && ls $LOG_DIR' }], containerIso);
+
+    const dockerCall = execSpy.mock.calls.find(c => c[0] === 'docker');
+    expect(dockerCall).toBeDefined();
+    const [, args, opts] = dockerCall as unknown as [string, string[], { env: NodeJS.ProcessEnv }];
+    // Env crossing: container view, not the host Windows path.
+    expect(opts.env.ARTIFACTS_DIR).toBe('/archon-meta/artifacts/runs/meta-run-id');
+    expect(opts.env.LOG_DIR).toBe('/archon-meta/logs');
+    // Textual crossing: $ARTIFACTS_DIR is substituted into the script text;
+    // $LOG_DIR stays literal and resolves in-container via the env above.
+    const script = args[args.length - 1];
+    expect(script).toContain('/archon-meta/artifacts/runs/meta-run-id');
+    expect(script).toContain('ls $LOG_DIR');
+    expect(script).not.toContain(testDir);
+  });
+
+  it('AI node prompts substitute the /archon-meta artifacts dir in a container', async () => {
+    await runMetaDag(
+      [{ id: 'ai', prompt: 'Read $ARTIFACTS_DIR/contract.md then reply.' }],
+      containerIso
+    );
+
+    expect(mockSendQueryDag.mock.calls.length).toBeGreaterThan(0);
+    const prompt = mockSendQueryDag.mock.calls[0][0] as string;
+    expect(prompt).toContain('/archon-meta/artifacts/runs/meta-run-id/contract.md');
+    expect(prompt).not.toContain(join(testDir, 'artifacts'));
+  });
+
+  it('without isolation the host dirs are unchanged (two-way door)', async () => {
+    await runMetaDag([{ id: 'ai', prompt: 'Read $ARTIFACTS_DIR/contract.md then reply.' }]);
+
+    const prompt = mockSendQueryDag.mock.calls[0][0] as string;
+    expect(prompt).toContain(join(testDir, 'artifacts'));
+    expect(prompt).not.toContain('/archon-meta');
   });
 });
