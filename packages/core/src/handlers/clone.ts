@@ -397,6 +397,15 @@ export async function cloneRepository(repoUrl: string): Promise<RegisterResult> 
  * Register an existing local repository in the database (no git clone).
  */
 export async function registerRepository(localPath: string): Promise<RegisterResult> {
+  // Mark as a safe.directory FIRST (mirrors the clone path). On Windows a repo
+  // dir owned by Administrators trips git's dubious-ownership guard, so the
+  // rev-parse below fails ("not a git repository") even for a valid repo — and a
+  // safe.directory set only in the user's gitconfig may not be visible to a
+  // detached child. Adding it here, in this process's own config, fixes both.
+  await execFileAsync('git', ['config', '--global', '--add', 'safe.directory', localPath]).catch(
+    () => undefined
+  );
+
   // Validate path exists and is a git repo
   try {
     await execFileAsync('git', ['-C', localPath, 'rev-parse', '--git-dir']);
