@@ -1162,6 +1162,66 @@ describe('workflowRunCommand', () => {
     expect(opts.baseBranch).toBe('master');
   });
 
+  it('resumes a container run whose distro working path is invisible to the host fs', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const { executeWorkflow, hydrateResumableRun } = await import('@archon/workflows/executor');
+    const { loadRepoConfig } = await import('@archon/core');
+    const conversationDb = await import('@archon/core/db/conversations');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    const workflowDb = await import('@archon/core/db/workflows');
+    const isolationEnvDb = await import('@archon/core/db/isolation-environments');
+
+    // A container run's working path lives in the WSL distro — existsSync on the
+    // Windows host false-negatives on it (the D8 kill-test recovery regression:
+    // "Cannot resume: the working path from the run no longer exists"). The
+    // isolation-env row is the substrate's source of truth, not the host fs.
+    const workingPath = '/home/bunny/archon/worktrees/marphob-page/task-d8kill';
+
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'implement', description: 'Impl' })],
+      errors: [],
+    });
+    (conversationDb.getOrCreateConversation as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'conv-d8',
+    });
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'cb-container-d8',
+      name: 'test/repo',
+      default_cwd: '/host/repo',
+    });
+    const resumableRun = {
+      id: 'run-d8-resume',
+      workflow_name: 'implement',
+      working_path: workingPath,
+      user_message: 'plan.md',
+      status: 'paused',
+      conversation_id: 'conv-d8',
+    };
+    (workflowDb.findResumableRun as ReturnType<typeof mock>).mockResolvedValueOnce(resumableRun);
+    (isolationEnvDb.listByCodebase as ReturnType<typeof mock>).mockResolvedValueOnce([
+      { id: 'iso-d8', provider: 'container', working_path: workingPath },
+    ]);
+    (loadRepoConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      isolation: { provider: 'container' },
+      worktree: { baseBranch: 'master' },
+    });
+    (hydrateResumableRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      preCreatedRun: resumableRun,
+      priorCompletedNodes: new Map([['bootstrap', 'ok']]),
+    });
+    (executeWorkflow as ReturnType<typeof mock>).mockResolvedValueOnce({
+      success: true,
+      workflowRunId: 'run-d8-resume',
+    });
+
+    await workflowRunCommand('/host/repo', 'implement', 'plan.md', { resume: true });
+
+    const callArgs = (executeWorkflow as ReturnType<typeof mock>).mock.calls.at(-1)!;
+    expect(callArgs[3]).toBe(workingPath); // executes against the distro worktree path
+    const opts = callArgs[7] as { isolation?: { kind: string } };
+    expect(opts.isolation?.kind).toBe('container');
+  });
+
   it('falls back to generic workspace hint when registration error has an unrecognized shape', async () => {
     const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
     const { registerRepository } = await import('@archon/core');

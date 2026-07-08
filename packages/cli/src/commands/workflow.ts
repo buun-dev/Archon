@@ -844,21 +844,27 @@ export async function workflowRunCommand(
       'workflow.resume_found_resumable'
     );
 
-    // Reuse the working path from the resumable run (verify it still exists)
+    // Look up the isolation environment that owns this working path (if any).
+    // Done BEFORE the exists check: a container run's working path is a distro
+    // path the host fs can't see (existsSync false-negatives), and the env row
+    // is the substrate's source of truth there (D8 kill-test recovery).
+    const allEnvs = await isolationDb.listByCodebase(codebase.id);
+    const matchingEnv = allEnvs.find(e => e.working_path === resumable?.working_path);
+
+    // Reuse the working path from the resumable run (verify it still exists —
+    // host worktrees only; container worktrees live in the distro).
     if (resumable.working_path) {
-      const { existsSync } = await import('fs');
-      if (!existsSync(resumable.working_path)) {
-        throw new Error(
-          `Cannot resume: the working path from the run no longer exists: ${resumable.working_path}\n` +
-            'The worktree may have been cleaned up. Start a fresh run with --branch instead.'
-        );
+      if (matchingEnv?.provider !== 'container') {
+        const { existsSync } = await import('fs');
+        if (!existsSync(resumable.working_path)) {
+          throw new Error(
+            `Cannot resume: the working path from the run no longer exists: ${resumable.working_path}\n` +
+              'The worktree may have been cleaned up. Start a fresh run with --branch instead.'
+          );
+        }
       }
       workingCwd = resumable.working_path;
     }
-
-    // Look up the isolation environment that owns this working path (if any)
-    const allEnvs = await isolationDb.listByCodebase(codebase.id);
-    const matchingEnv = allEnvs.find(e => e.working_path === workingCwd);
     if (matchingEnv) {
       isolationEnvId = matchingEnv.id;
       // Re-thread the substrate descriptor so post-resume nodes (e.g. an
