@@ -14,12 +14,13 @@
 
 import { createHash } from 'crypto';
 
-import { execFileAsync, toBranchName } from '@archon/git';
+import { execFileAsync, getDefaultBranch, toBranchName } from '@archon/git';
 import type {
   DestroyResult,
   IIsolationProvider,
   IsolatedEnvironment,
   IsolationRequest,
+  RepoConfigLoader,
   WorktreeDestroyOptions,
 } from '../types';
 
@@ -39,29 +40,58 @@ const SANDBOX_DOWN_TIMEOUT_MS = 5 * 60 * 1000;
 const DOCKER_QUERY_TIMEOUT_MS = 30 * 1000;
 
 /** Run `sandbox.sh <args>` inside the Ubuntu distro (git provisioning lives there). */
-function runSandbox(args: string[], timeout: number): Promise<{ stdout: string; stderr: string }> {
+function runSandbox(
+  args: string[],
+  timeout: number,
+  extraEnv: Record<string, string> = {}
+): Promise<{ stdout: string; stderr: string }> {
   // wsl.exe does NOT forward arbitrary Windows env into the distro — only vars
   // named in WSLENV are translated. Forward the secrets `sandbox.sh` bakes into
   // the container via envsubst (compose.yml.tmpl): GH_TOKEN for in-container
   // `gh pr create` (P2 Task 10) and ANTHROPIC_API_KEY. `/u` = Windows → WSL only.
-  const wslenv = [process.env.WSLENV, 'GH_TOKEN/u', 'ANTHROPIC_API_KEY/u']
+  const forwarded = ['GH_TOKEN', 'ANTHROPIC_API_KEY', ...Object.keys(extraEnv)];
+  const wslenv = [process.env.WSLENV, ...forwarded.map(name => `${name}/u`)]
     .filter(Boolean)
     .join(':');
   return execFileAsync('wsl.exe', ['-d', 'Ubuntu', '--', 'bash', SANDBOX_SH, ...args], {
     timeout,
-    env: { ...process.env, WSLENV: wslenv },
+    env: { ...process.env, ...extraEnv, WSLENV: wslenv },
   });
+}
+
+/**
+ * The originating user's git identity, as env for `sandbox.sh`. WorktreeProvider
+ * stamps it with `git config` on the new worktree; this provider cannot — the
+ * worktree is a distro path Windows git cannot reach — so `sandbox.sh` stamps it
+ * where the filesystem is. Empty when absent (solo installs), leaving the
+ * script's own fallback identity in force.
+ */
+function identityEnv(request: IsolationRequest): Record<string, string> {
+  const identity = request.gitIdentity;
+  if (!identity?.email) return {};
+  return {
+    ARCHON_GIT_USER_EMAIL: identity.email,
+    ...(identity.name ? { ARCHON_GIT_USER_NAME: identity.name } : {}),
+  };
 }
 
 export class ContainerProvider implements IIsolationProvider {
   readonly providerType = 'container' as const;
 
+  constructor(private loadConfig: RepoConfigLoader = () => Promise.resolve(null)) {}
+
   async create(request: IsolationRequest): Promise<IsolatedEnvironment> {
     const slug = this.slugFor(request);
     const workingPath = `${WORKTREE_ROOT}/${slug}`;
+    // Resolve the start-point the way WorktreeProvider does. The worktree
+    // itself lives in the distro, so the branch has to cross the wsl.exe
+    // boundary as an argument; auto-detection runs against the host checkout,
+    // which Windows git can reach.
+    const config = await this.loadConfig(request.canonicalRepoPath);
+    const baseBranch = config?.baseBranch ?? (await getDefaultBranch(request.canonicalRepoPath));
     // Worktree-in-distro + compose up + provision. No port allocator — the
     // container owns its own 3000/8123/5432 in its private network namespace.
-    await runSandbox(['up', slug], SANDBOX_UP_TIMEOUT_MS);
+    await runSandbox(['up', slug, baseBranch], SANDBOX_UP_TIMEOUT_MS, identityEnv(request));
     return this.buildEnv(slug, workingPath, request);
   }
 

@@ -39,7 +39,7 @@ export function configureIsolation(
 export function getIsolationProvider(): IIsolationProvider {
   provider ??=
     configuredKind === 'container'
-      ? new ContainerProvider()
+      ? new ContainerProvider(configuredLoader)
       : new WorktreeProvider(configuredLoader);
   return provider;
 }

@@ -13,6 +13,7 @@ import { ContainerProvider } from './container';
 describe('ContainerProvider', () => {
   let provider: ContainerProvider;
   let execSpy: Mock<typeof git.execFileAsync>;
+  let defaultBranchSpy: Mock<typeof git.getDefaultBranch>;
 
   const issueRequest: IsolationRequest = {
     workflowType: 'issue',
@@ -25,10 +26,17 @@ describe('ContainerProvider', () => {
     provider = new ContainerProvider();
     execSpy = spyOn(git, 'execFileAsync');
     execSpy.mockResolvedValue({ stdout: '', stderr: '' });
+    // create() auto-detects the base branch when repo config omits it, and
+    // getDefaultBranch throws rather than falling back — stub it for every test.
+    defaultBranchSpy = spyOn(git, 'getDefaultBranch');
+    defaultBranchSpy.mockResolvedValue(
+      'master' as Awaited<ReturnType<typeof git.getDefaultBranch>>
+    );
   });
 
   afterEach(() => {
     execSpy.mockRestore();
+    defaultBranchSpy.mockRestore();
   });
 
   test('providerType is container', () => {
@@ -120,6 +128,70 @@ describe('ContainerProvider', () => {
     if (env?.provider !== 'container') throw new Error('expected container env');
     expect(env.project).toBe('archon-issue-42');
     expect(env.containerWorkdir).toBe('/work');
+  });
+
+  // P3-F: `sandbox.sh` cut the worktree from the base clone's HEAD because
+  // create() shelled `up <slug>` and dropped the resolved base branch. The
+  // worktree lives in the WSL distro, so the branch must cross the wsl.exe
+  // boundary as an argument — the engine cannot `git -C` a distro path.
+  test('create() passes the configured base branch to sandbox.sh up', async () => {
+    const configured = new ContainerProvider(async () => ({ baseBranch: 'develop' }));
+
+    await configured.create(issueRequest);
+
+    const argv = execSpy.mock.calls[0]![1] as string[];
+    expect(argv.slice(-3)).toEqual(['up', 'issue-42', 'develop']);
+    // A configured branch means no needless git call against the host checkout.
+    expect(defaultBranchSpy).not.toHaveBeenCalled();
+  });
+
+  test("create() falls back to the repo's default branch when config omits baseBranch", async () => {
+    const configured = new ContainerProvider(async () => null);
+
+    await configured.create(issueRequest);
+
+    const argv = execSpy.mock.calls[0]![1] as string[];
+    expect(argv.slice(-3)).toEqual(['up', 'issue-42', 'master']);
+    // Resolved against the HOST checkout, which Windows git can reach.
+    expect(defaultBranchSpy).toHaveBeenCalledWith('/repo/marphob-page');
+  });
+
+  // P3-D: create() dropped request.gitIdentity, so in-container commits fell
+  // back to whatever identity was hand-stamped on the base clone. The engine
+  // cannot `git -C` the distro worktree, so the identity crosses the wsl.exe
+  // boundary as env — WSLENV is what makes wsl.exe translate it.
+  const identityRequest: IsolationRequest = {
+    ...issueRequest,
+    gitIdentity: { email: '42+alice@users.noreply.github.com', name: 'Alice Example' },
+  };
+
+  test('create() forwards request.gitIdentity to sandbox.sh over WSLENV', async () => {
+    await provider.create(identityRequest);
+
+    const opts = execSpy.mock.calls[0]![2] as { env: Record<string, string> };
+    expect(opts.env.ARCHON_GIT_USER_EMAIL).toBe('42+alice@users.noreply.github.com');
+    expect(opts.env.ARCHON_GIT_USER_NAME).toBe('Alice Example');
+    expect(opts.env.WSLENV).toContain('ARCHON_GIT_USER_EMAIL/u');
+    expect(opts.env.WSLENV).toContain('ARCHON_GIT_USER_NAME/u');
+  });
+
+  test('create() forwards the email alone when the identity carries no name', async () => {
+    await provider.create({ ...issueRequest, gitIdentity: { email: 'bob@example.com' } });
+
+    const opts = execSpy.mock.calls[0]![2] as { env: Record<string, string> };
+    expect(opts.env.ARCHON_GIT_USER_EMAIL).toBe('bob@example.com');
+    expect(opts.env.ARCHON_GIT_USER_NAME).toBeUndefined();
+    expect(opts.env.WSLENV).not.toContain('ARCHON_GIT_USER_NAME');
+  });
+
+  test('create() omits the identity vars when gitIdentity is absent (solo install)', async () => {
+    // isPerUserGitHubEnabled() leaves gitIdentity undefined on a solo install;
+    // sandbox.sh then keeps its own fallback identity.
+    await provider.create(issueRequest);
+
+    const opts = execSpy.mock.calls[0]![2] as { env: Record<string, string> };
+    expect(opts.env.ARCHON_GIT_USER_EMAIL).toBeUndefined();
+    expect(opts.env.WSLENV).not.toContain('ARCHON_GIT_USER_EMAIL');
   });
 
   test('list() maps archon- compose projects to container envs', async () => {
