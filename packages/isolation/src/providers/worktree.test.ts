@@ -1130,6 +1130,51 @@ describe('WorktreeProvider', () => {
     });
   });
 
+  describe('git identity on worktree creation', () => {
+    const identityRequest: IsolationRequest = {
+      codebaseId: 'cb-123',
+      canonicalRepoPath: '/workspace/repo',
+      workflowType: 'issue',
+      identifier: '42',
+      gitIdentity: { email: '42+alice@users.noreply.github.com', name: 'Alice Example' },
+    };
+
+    // git config calls issued during create(), by their args array.
+    const configCalls = () =>
+      execSpy.mock.calls
+        .map((call: unknown[]) => call[1] as string[])
+        .filter(args => args.includes('config'));
+
+    test('writes user.email to the worktree-scoped config, not the shared repo config', async () => {
+      await provider.create(identityRequest);
+
+      const emailWrites = configCalls().filter(args => args.includes('user.email'));
+      expect(emailWrites).toHaveLength(1);
+      // Worktree-scoped: the identity lands in this worktree's config.worktree.
+      // A bare `git config user.email` (no --worktree) writes to the shared
+      // common config and leaks the identity into every worktree of the repo.
+      expect(emailWrites[0]).toContain('--worktree');
+      expect(emailWrites[0]).toContain('42+alice@users.noreply.github.com');
+    });
+
+    test('enables extensions.worktreeConfig so --worktree has somewhere to write', async () => {
+      await provider.create(identityRequest);
+
+      const extWrites = configCalls().filter(args => args.includes('extensions.worktreeConfig'));
+      expect(extWrites).toHaveLength(1);
+      expect(extWrites[0]).toContain('true');
+    });
+
+    test('writes user.name to the worktree-scoped config when a name is provided', async () => {
+      await provider.create(identityRequest);
+
+      const nameWrites = configCalls().filter(args => args.includes('user.name'));
+      expect(nameWrites).toHaveLength(1);
+      expect(nameWrites[0]).toContain('--worktree');
+      expect(nameWrites[0]).toContain('Alice Example');
+    });
+  });
+
   describe('destroy', () => {
     test('removes worktree', async () => {
       const worktreePath = '/workspace/worktrees/repo/issue-42';

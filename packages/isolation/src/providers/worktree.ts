@@ -774,22 +774,38 @@ export class WorktreeProvider implements IIsolationProvider {
   }
 
   /**
-   * Set worktree-local `git config user.email`/`user.name` so commits made in
-   * this worktree attribute to the originating user. Non-fatal on failure: a
-   * worktree without the override simply uses the ambient git identity.
+   * Set the originating user's `user.email`/`user.name` in this worktree's
+   * *worktree-scoped* config so commits made here attribute to them.
+   *
+   * `extensions.worktreeConfig` must be enabled first, or `git config
+   * --worktree` has nowhere to write. Without `--worktree`, a bare
+   * `git config user.email` lands in the repo's shared common config and
+   * leaks the identity into every worktree of that repo (P3-E). Non-fatal on
+   * failure: a worktree without the override falls back to the ambient git
+   * identity.
    */
   private async applyGitIdentity(
     worktreePath: string,
     identity: { email: string; name?: string }
   ): Promise<void> {
     try {
-      await execFileAsync('git', ['-C', worktreePath, 'config', 'user.email', identity.email], {
-        timeout: 5000,
-      });
+      // Repo-level flag that enables per-worktree config.worktree files.
+      await execFileAsync(
+        'git',
+        ['-C', worktreePath, 'config', 'extensions.worktreeConfig', 'true'],
+        { timeout: 5000 }
+      );
+      await execFileAsync(
+        'git',
+        ['-C', worktreePath, 'config', '--worktree', 'user.email', identity.email],
+        { timeout: 5000 }
+      );
       if (identity.name) {
-        await execFileAsync('git', ['-C', worktreePath, 'config', 'user.name', identity.name], {
-          timeout: 5000,
-        });
+        await execFileAsync(
+          'git',
+          ['-C', worktreePath, 'config', '--worktree', 'user.name', identity.name],
+          { timeout: 5000 }
+        );
       }
       getLog().debug({ worktreePath, email: identity.email }, 'isolation.git_identity_applied');
     } catch (err) {
