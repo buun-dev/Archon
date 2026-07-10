@@ -62,3 +62,12 @@ export {
   isPathWithinRoot,
 } from './worktree-copy';
 export type { CopyFileEntry } from './worktree-copy';
+
+// --- Shared pre-create resolution (provider contract) ---
+export {
+  assertRequestSupported,
+  requiredCapabilities,
+  resolveBaseBranch,
+  resolveStartPoint,
+} from './create-plan';
+export type { CapabilityKey, ProviderCapabilities } from './create-plan';

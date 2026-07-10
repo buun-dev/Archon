@@ -202,7 +202,9 @@ describe('ContainerProvider', () => {
       ]),
       stderr: '',
     });
-    const envs = await provider.list('cb1');
+    // `list` takes the canonical repo path; its basename must name the one repo
+    // this provider serves, else it throws rather than leak another repo's envs.
+    const envs = await provider.list('/repo/marphob-page');
     expect(envs).toHaveLength(1);
     expect(envs[0]?.provider).toBe('container');
     if (envs[0]?.provider !== 'container') throw new Error('expected container env');

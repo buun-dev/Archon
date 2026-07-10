@@ -27,6 +27,8 @@ import {
 import type { WorktreeBaseOverride } from '@archon/git';
 import { getArchonWorkspacesPath } from '@archon/paths';
 import type { RepoPath, WorktreeInfo } from '@archon/git';
+import { assertRequestSupported, resolveStartPoint } from '../create-plan';
+import type { ProviderCapabilities } from '../create-plan';
 import { copyWorktreeFiles } from '../worktree-copy';
 import type {
   DestroyResult,
@@ -115,6 +117,16 @@ function resolveRepoLocalOverride(
 export class WorktreeProvider implements IIsolationProvider {
   readonly providerType = 'worktree';
 
+  /**
+   * The reference implementation: honors every capability. `createNewBranch`
+   * respects `fromBranch`; `createFromPR` checks out the PR's own branch, or a
+   * fork's pinned `prSha`.
+   */
+  static readonly capabilities: ProviderCapabilities = {
+    startPointOverride: true,
+    prCheckout: true,
+  };
+
   constructor(private loadConfig: RepoConfigLoader = () => Promise.resolve(null)) {}
 
   /**
@@ -127,6 +139,11 @@ export class WorktreeProvider implements IIsolationProvider {
    * object or `null`, never a second chance to reload.
    */
   async create(request: IsolationRequest): Promise<IsolatedEnvironment> {
+    // A no-op for this provider (it declares every capability), but calling it
+    // here keeps both providers on one contract: a new optional request field
+    // adds a CapabilityKey, and every provider must then state its position.
+    assertRequestSupported(request, WorktreeProvider.capabilities, this.providerType);
+
     let repoConfig: WorktreeCreateConfig | null;
     try {
       repoConfig = await this.loadConfig(request.canonicalRepoPath);
@@ -1082,11 +1099,9 @@ export class WorktreeProvider implements IIsolationProvider {
     // Clean up any orphan directory before creating worktree
     await this.cleanOrphanDirectoryIfExists(worktreePath);
 
-    // Determine start-point: explicit fromBranch overrides base branch
-    const startPoint =
-      request.workflowType === 'task' && request.fromBranch
-        ? request.fromBranch
-        : `origin/${baseBranch}`;
+    // Determine start-point: explicit fromBranch overrides base branch.
+    // Shared with ContainerProvider so the rule cannot drift between providers.
+    const { startPoint } = resolveStartPoint(request, baseBranch);
 
     try {
       // `--no-track` keeps `branch.<name>.merge` unset; otherwise `gh pr view`

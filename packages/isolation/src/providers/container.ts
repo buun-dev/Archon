@@ -14,7 +14,10 @@
 
 import { createHash } from 'crypto';
 
-import { execFileAsync, getDefaultBranch, toBranchName } from '@archon/git';
+import { execFileAsync, toBranchName } from '@archon/git';
+
+import { assertRequestSupported, resolveBaseBranch } from '../create-plan';
+import type { ProviderCapabilities } from '../create-plan';
 import type {
   DestroyResult,
   IIsolationProvider,
@@ -33,6 +36,36 @@ const SANDBOX_SH = '/mnt/c/Users/Buun/.archon/sandbox/sandbox.sh';
 const CONTAINER_WORKDIR = '/work';
 /** Where `sandbox.sh` places the bind-mounted worktree in the distro FS. */
 const WORKTREE_ROOT = '/home/bunny/archon/worktrees/marphob-page';
+/**
+ * The one repo this provider serves. `WORKTREE_ROOT` above and `sandbox.sh`'s
+ * own `REPO_SLUG` both hardcode it, so `list()` cannot tell two repos apart —
+ * every compose project is named `archon-<slug>` with no repo component. Rather
+ * than return another repo's environments when asked about it, `list()` throws.
+ * P4 (rollout beyond marphob-page) must make this a per-repo value; this
+ * constant and `assertRepoInScope` are where that change lands.
+ */
+const SANDBOX_REPO_SLUG = 'marphob-page';
+
+/** Last path segment, tolerating POSIX and Windows separators + trailing slash. */
+function basename(p: string): string {
+  const parts = p.replace(/[\\/]+$/, '').split(/[\\/]/);
+  return parts[parts.length - 1] ?? '';
+}
+
+/**
+ * Guard the single-repo assumption. `codebaseId` is the canonical repo path
+ * (see `IIsolationProvider.list`), so its basename is the repo name.
+ */
+function assertRepoInScope(codebaseId: string): void {
+  const repo = basename(codebaseId);
+  if (repo && repo !== SANDBOX_REPO_SLUG) {
+    throw new Error(
+      `ContainerProvider is scoped to "${SANDBOX_REPO_SLUG}" but was asked about "${repo}". ` +
+        'Compose projects are named archon-<slug> with no repo component, so listing ' +
+        `would return ${SANDBOX_REPO_SLUG}'s environments as if they were ${repo}'s.`
+    );
+  }
+}
 
 /** `sandbox.sh up` provisions (uv sync + pnpm install + alembic + playwright); be generous. */
 const SANDBOX_UP_TIMEOUT_MS = 20 * 60 * 1000;
@@ -78,17 +111,35 @@ function identityEnv(request: IsolationRequest): Record<string, string> {
 export class ContainerProvider implements IIsolationProvider {
   readonly providerType = 'container' as const;
 
+  /**
+   * `sandbox.sh cmd_up` takes a slug and a base branch and nothing else, then
+   * runs `git worktree add -b sandbox/<slug> origin/<base>`. So this provider:
+   *
+   *  - cannot cut from an explicit `--from` start-point, and
+   *  - cannot check out a PR at all — it would create a fresh branch off the
+   *    base and review `origin/<base>` while reporting on the PR.
+   *
+   * Declaring that here makes `assertRequestSupported` reject those requests
+   * instead of honoring them incorrectly and in silence.
+   */
+  static readonly capabilities: ProviderCapabilities = {
+    startPointOverride: false,
+    prCheckout: false,
+  };
+
   constructor(private loadConfig: RepoConfigLoader = () => Promise.resolve(null)) {}
 
   async create(request: IsolationRequest): Promise<IsolatedEnvironment> {
+    // Reject before provisioning anything: a dropped `--from` would cut the
+    // worktree from origin/<base>, go green, and open the PR on the wrong base.
+    assertRequestSupported(request, ContainerProvider.capabilities, this.providerType);
+
     const slug = this.slugFor(request);
     const workingPath = `${WORKTREE_ROOT}/${slug}`;
-    // Resolve the start-point the way WorktreeProvider does. The worktree
-    // itself lives in the distro, so the branch has to cross the wsl.exe
+    // The worktree lives in the distro, so the branch has to cross the wsl.exe
     // boundary as an argument; auto-detection runs against the host checkout,
     // which Windows git can reach.
-    const config = await this.loadConfig(request.canonicalRepoPath);
-    const baseBranch = config?.baseBranch ?? (await getDefaultBranch(request.canonicalRepoPath));
+    const baseBranch = await resolveBaseBranch(request, this.loadConfig);
     // Worktree-in-distro + compose up + provision. No port allocator — the
     // container owns its own 3000/8123/5432 in its private network namespace.
     await runSandbox(['up', slug, baseBranch], SANDBOX_UP_TIMEOUT_MS, identityEnv(request));
@@ -120,7 +171,8 @@ export class ContainerProvider implements IIsolationProvider {
     return this.buildEnv(slug, envId);
   }
 
-  async list(_codebaseId: string): Promise<IsolatedEnvironment[]> {
+  async list(codebaseId: string): Promise<IsolatedEnvironment[]> {
+    assertRepoInScope(codebaseId);
     let stdout = '[]';
     try {
       ({ stdout } = await execFileAsync('docker', ['compose', 'ls', '--all', '--format', 'json'], {
