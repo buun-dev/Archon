@@ -149,10 +149,9 @@ describe('ContainerProvider capability declaration', () => {
     await expect(provider.create(prRequest())).rejects.toThrow(/PR checkout/);
   });
 
-  test('list() refuses a codebase outside its single-repo scope', async () => {
-    const provider = new ContainerProvider();
-    await expect(provider.list('/repo/bunshee')).rejects.toThrow(/scoped to "marphob-page"/);
-  });
+  // list()'s repo scoping (formerly a hard single-repo refusal) is covered by
+  // container.test.ts "list() is scoped to the requested repo" since the
+  // multi-repo rollout (feat/isolation-repo-scope).
 });
 
 describe('WorktreeProvider capability declaration', () => {
