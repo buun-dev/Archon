@@ -17,7 +17,12 @@ import {
   type TierName,
   type RawTiersConfig,
 } from '@archon/workflows/model-validation';
-import { configureIsolation, getIsolationProvider } from '@archon/isolation';
+import {
+  configureIsolation,
+  getIsolationProvider,
+  composeProjectFromWorkingPath,
+  CONTAINER_WORKDIR,
+} from '@archon/isolation';
 import type { IsolationDescriptor } from '@archon/providers';
 import {
   createLogger,
@@ -79,20 +84,28 @@ function getLog(): ReturnType<typeof createLogger> {
  * `.archon/config.yaml` can flake across the fresh-vs-registered-codebase
  * paths, and `provider.get()` depends on live `docker compose ps` parsing.
  * Container envs route node commands + the claude subprocess through docker
- * exec (`archon-<slug>`, `/work`); worktree envs need no descriptor.
+ * exec (`archon-<repo>-<slug>`, `/work`); worktree envs need no descriptor.
+ *
+ * The project name is derived by `composeProjectFromWorkingPath` — the SAME rule
+ * `ContainerProvider.buildEnv` uses — and must not be re-hand-rolled here. This
+ * function previously kept its own copy that popped only the last path segment
+ * (`archon-<slug>`). When the sandbox went multi-repo the copy silently went
+ * stale, so every *resumed* run addressed a compose project that does not exist
+ * and every post-resume node died `service "agent" is not running` against a
+ * live, reachable container (run b8ec52c0: six tail nodes, no commit, no PR).
+ * Fresh dispatches read `isolatedEnv.project` straight from the provider, so
+ * they stayed green and hid the break.
  */
-function isolationDescriptorFromEnv(env: {
+export function isolationDescriptorFromEnv(env: {
   provider: string;
   working_path: string;
 }): IsolationDescriptor {
   if (env.provider !== 'container') return { kind: 'worktree' };
-  const slug =
-    env.working_path
-      .replace(/[/\\]+$/, '')
-      .split(/[/\\]/)
-      .filter(Boolean)
-      .pop() ?? '';
-  return { kind: 'container', project: `archon-${slug}`, workdir: '/work' };
+  return {
+    kind: 'container',
+    project: composeProjectFromWorkingPath(env.working_path),
+    workdir: CONTAINER_WORKDIR,
+  };
 }
 
 /**

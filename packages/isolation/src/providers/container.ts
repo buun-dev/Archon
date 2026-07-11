@@ -33,13 +33,40 @@ import type {
  * `SANDBOX_DIR` resolution (P1 FIX-G lesson).
  */
 const SANDBOX_SH = '/mnt/c/Users/Buun/.archon/sandbox/sandbox.sh';
-const CONTAINER_WORKDIR = '/work';
+/** In-container workdir (the bind-mounted worktree). Exported: the CLI re-threads it on resume. */
+export const CONTAINER_WORKDIR = '/work';
 /** Base dir under which sandbox.sh places each repo's worktrees, one subdir per repo. */
 const WORKTREE_ROOT_BASE = '/home/bunny/archon/worktrees';
 
 /** Per-repo worktree root: sandbox.sh roots each repo's worktrees at <base>/<repo>. */
 function worktreeRoot(repo: string): string {
   return `${WORKTREE_ROOT_BASE}/${repo}`;
+}
+
+/**
+ * THE compose-project naming rule — one definition, deliberately exported.
+ *
+ * `sandbox.sh` brings each stack up as `archon-<repo>-<slug>`, and **both**
+ * segments are load-bearing: two repos can carry the same slug. Anything that
+ * addresses a live stack (`docker compose -p … exec agent`) must derive the name
+ * through here.
+ *
+ * This existed as a second, hand-rolled copy in the CLI's resume/reuse path that
+ * popped only the last path segment (`archon-<slug>`). When the sandbox went
+ * multi-repo the copy was never updated, so every *resumed* run addressed a
+ * project that does not exist and compose truthfully answered
+ * `service "agent" is not running` — against a live, reachable container. Fresh
+ * runs took `IsolatedEnvironment.project` from this provider and were unaffected,
+ * which is exactly why the breakage hid behind three clean dispatches.
+ */
+export function composeProjectFor(repo: string, slug: string): string {
+  return `archon-${repo}-${slug}`;
+}
+
+/** Same rule, derived from a working path `<worktree-root>/<repo>/<slug>`. */
+export function composeProjectFromWorkingPath(workingPath: string): string {
+  const { repo, slug } = repoSlugFromWorkingPath(workingPath);
+  return composeProjectFor(repo, slug);
 }
 
 /** Last path segment, tolerating POSIX and Windows separators + trailing slash. */
@@ -204,7 +231,7 @@ export class ContainerProvider implements IIsolationProvider {
         [
           'compose',
           '-p',
-          `archon-${repo}-${slug}`,
+          composeProjectFor(repo, slug),
           'ps',
           '--status',
           'running',
@@ -230,7 +257,7 @@ export class ContainerProvider implements IIsolationProvider {
       id: workingPath,
       provider: 'container',
       workingPath,
-      project: `archon-${repo}-${slug}`,
+      project: composeProjectFor(repo, slug),
       containerWorkdir: CONTAINER_WORKDIR,
       // sandbox.sh creates the branch as `sandbox/<slug>` off the base clone.
       branchName: toBranchName(`sandbox/${slug}`),
