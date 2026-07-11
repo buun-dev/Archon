@@ -3,6 +3,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach, spyOn, mock } from 'bun:test';
 import type { WorkflowEmitterEvent } from '@archon/workflows/event-emitter';
+import { composeProjectFromWorkingPath, CONTAINER_WORKDIR } from '@archon/isolation';
 import { makeTestWorkflow, makeTestWorkflowWithSource } from '@archon/workflows/test-utils';
 import {
   workflowListCommand,
@@ -18,6 +19,7 @@ import {
   workflowResetSessionsCommand,
   buildDetachedRunCmd,
   maybePrintTierNotice,
+  isolationDescriptorFromEnv,
 } from './workflow';
 
 const mockLogger = {
@@ -1100,15 +1102,25 @@ describe('workflowRunCommand', () => {
     const workflowDb = await import('@archon/core/db/workflows');
     const isolationEnvDb = await import('@archon/core/db/isolation-environments');
     const { tmpdir } = await import('node:os');
-    const { basename } = await import('node:path');
+    const { join } = await import('node:path');
+    const { mkdirSync } = await import('node:fs');
 
     // The resume path existsSync-checks the prior working path — use a real dir.
     // For a container run this is a distro path unreachable from the host, so the
     // executor cannot resolve BASE_BRANCH from it; the CLI must thread the
     // host-config value (the tdd:4b9ba482 regression: reuse-review/pr-summary
     // failed their $BASE_BRANCH substitution after a gate resume).
-    const workingPath = tmpdir();
-    const slug = basename(workingPath);
+    //
+    // The path must have the real `<worktree-root>/<repo>/<slug>` shape, because
+    // the compose project is `archon-<repo>-<slug>` and BOTH segments matter.
+    // This previously used a bare `tmpdir()` (no repo/slug shape) and asserted
+    // `archon-${basename(path)}` — re-deriving the expectation with the same rule
+    // the implementation used. That tautology could not fail, and it is why the
+    // multi-repo rename slipped through and broke every resumed run (b8ec52c0).
+    const repo = 'bunshee';
+    const slugName = 'task-member-workspaces-p2-keys';
+    const workingPath = join(tmpdir(), repo, slugName);
+    mkdirSync(workingPath, { recursive: true });
 
     (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
       workflows: [makeTestWorkflowWithSource({ name: 'implement', description: 'Impl' })],
@@ -1154,9 +1166,10 @@ describe('workflowRunCommand', () => {
       baseBranch?: string;
       isolation?: { kind: string; project?: string; workdir?: string };
     };
+    // Asserted LITERALLY — never re-derived from the implementation's own rule.
     expect(opts.isolation).toEqual({
       kind: 'container',
-      project: `archon-${slug}`,
+      project: 'archon-bunshee-task-member-workspaces-p2-keys',
       workdir: '/work',
     });
     expect(opts.baseBranch).toBe('master');
@@ -4226,5 +4239,89 @@ describe('maybePrintTierNotice', () => {
     await maybePrintTierNotice(workflow, '/cwd', 'user-1', false);
     expect(stderrSpy).not.toHaveBeenCalled();
     expect(markTierNoticeShown).not.toHaveBeenCalled();
+  });
+});
+
+describe('isolationDescriptorFromEnv — compose project addressing', () => {
+  // Run b8ec52c0 (bunshee): the run paused at an approval gate and, on resume,
+  // ALL six tail nodes died `service "agent" is not running` while the agent
+  // container was alive and reachable by hand. Cause: this helper rebuilt the
+  // compose project from the LAST path segment only (`archon-<slug>`), while
+  // ContainerProvider.buildEnv names it `archon-<repo>-<slug>`. The engine then
+  // addressed a project that does not exist, and compose truthfully reported the
+  // service as not running. Fresh dispatches were unaffected — they take
+  // `isolatedEnv.project` straight from the provider — so only resumed/reused
+  // runs broke, which is why three prior sandbox dispatches looked clean.
+  //
+  // These assert the project name LITERALLY. The prior test derived its
+  // expectation with the same basename() rule the implementation used, over a
+  // tmpdir() path with no <repo>/<slug> shape at all — a tautology that could
+  // not fail, and which is why the repo-scoping change sailed past it.
+
+  it('worktree envs need no descriptor', () => {
+    expect(
+      isolationDescriptorFromEnv({ provider: 'worktree', working_path: 'C:/repos/x/wt' })
+    ).toEqual({ kind: 'worktree' });
+  });
+
+  it('keeps the repo segment: <root>/<repo>/<slug> → archon-<repo>-<slug>', () => {
+    expect(
+      isolationDescriptorFromEnv({
+        provider: 'container',
+        working_path: '/home/bunny/archon/worktrees/bunshee/task-member-workspaces-p2-keys',
+      })
+    ).toEqual({
+      kind: 'container',
+      project: 'archon-bunshee-task-member-workspaces-p2-keys',
+      workdir: '/work',
+    });
+  });
+
+  it('two repos sharing a slug get distinct projects', () => {
+    // Without the repo segment both collapse onto `archon-task-foo`, so a resume
+    // would exec into whichever repo's stack happened to be up — silently the
+    // wrong one.
+    const a = isolationDescriptorFromEnv({
+      provider: 'container',
+      working_path: '/home/bunny/archon/worktrees/bunshee/task-foo',
+    });
+    const b = isolationDescriptorFromEnv({
+      provider: 'container',
+      working_path: '/home/bunny/archon/worktrees/marphob-page/task-foo',
+    });
+
+    expect(a.project).toBe('archon-bunshee-task-foo');
+    expect(b.project).toBe('archon-marphob-page-task-foo');
+    expect(a.project).not.toBe(b.project);
+  });
+
+  it('tolerates a trailing separator and Windows separators', () => {
+    expect(
+      isolationDescriptorFromEnv({
+        provider: 'container',
+        working_path: '/home/bunny/archon/worktrees/cloud-clinic/issue-42/',
+      }).project
+    ).toBe('archon-cloud-clinic-issue-42');
+
+    expect(
+      isolationDescriptorFromEnv({
+        provider: 'container',
+        working_path: 'C:\\wt\\full-stack-template\\task-x',
+      }).project
+    ).toBe('archon-full-stack-template-task-x');
+  });
+
+  it('matches ContainerProvider.buildEnv — one naming rule, not two', () => {
+    // The defect was a DUPLICATED naming rule that drifted: container.ts gained
+    // the repo segment (P0 multi-repo rollout), this copy did not. Pin them to
+    // the same source of truth so the next change cannot desync them again.
+    const workingPath = '/home/bunny/archon/worktrees/bunshee/task-x';
+    expect(
+      isolationDescriptorFromEnv({ provider: 'container', working_path: workingPath })
+    ).toEqual({
+      kind: 'container',
+      project: composeProjectFromWorkingPath(workingPath),
+      workdir: CONTAINER_WORKDIR,
+    });
   });
 });

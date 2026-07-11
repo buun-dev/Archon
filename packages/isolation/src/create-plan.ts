@@ -35,9 +35,9 @@ import type { IsolationProviderType, IsolationRequest, RepoConfigLoader } from '
  *
  * Deliberately NOT covered: `codebaseName` and `codebaseId`. `WorktreeProvider`
  * reads them only to lay out `<workspaces>/<owner>/<repo>/worktrees/...`;
- * `ContainerProvider` roots every worktree under its own `WORKTREE_ROOT` by
- * design. That divergence is intentional, so it is not a capability — it is the
- * container path's single-repo scope, guarded there by `assertRepoInScope`.
+ * `ContainerProvider` roots every worktree under `<WORKTREE_ROOT_BASE>/<repo>`,
+ * deriving `<repo>` from `request.canonicalRepoPath`. That divergence is an
+ * intentional layout choice, not a capability.
  */
 export type CapabilityKey = 'startPointOverride' | 'prCheckout';
 

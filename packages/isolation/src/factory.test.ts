@@ -82,7 +82,7 @@ describe('Isolation Provider Factory', () => {
 
     expect(seenRepoPath).toBe('/repo/marphob-page');
     const argv = execSpy.mock.calls[0]![1] as string[];
-    expect(argv.slice(-3)).toEqual(['up', 'issue-42', 'develop']);
+    expect(argv.slice(-4)).toEqual(['up', 'marphob-page', 'issue-42', 'develop']);
 
     execSpy.mockRestore();
     defaultBranchSpy.mockRestore();

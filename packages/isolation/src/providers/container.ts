@@ -8,7 +8,7 @@
  * state queries run WITHOUT wsl.exe. Only the git-provisioning script
  * (`sandbox.sh`, which lives in the distro FS) is invoked through `wsl.exe`.
  *
- * Addressing (from P1 `compose.yml.tmpl`): compose project `archon-<slug>`,
+ * Addressing (from P1 `compose.yml.tmpl`): compose project `archon-<repo>-<slug>`,
  * service `agent`, in-container workdir `/work` (the bind-mounted worktree).
  */
 
@@ -33,18 +33,41 @@ import type {
  * `SANDBOX_DIR` resolution (P1 FIX-G lesson).
  */
 const SANDBOX_SH = '/mnt/c/Users/Buun/.archon/sandbox/sandbox.sh';
-const CONTAINER_WORKDIR = '/work';
-/** Where `sandbox.sh` places the bind-mounted worktree in the distro FS. */
-const WORKTREE_ROOT = '/home/bunny/archon/worktrees/marphob-page';
+/** In-container workdir (the bind-mounted worktree). Exported: the CLI re-threads it on resume. */
+export const CONTAINER_WORKDIR = '/work';
+/** Base dir under which sandbox.sh places each repo's worktrees, one subdir per repo. */
+const WORKTREE_ROOT_BASE = '/home/bunny/archon/worktrees';
+
+/** Per-repo worktree root: sandbox.sh roots each repo's worktrees at <base>/<repo>. */
+function worktreeRoot(repo: string): string {
+  return `${WORKTREE_ROOT_BASE}/${repo}`;
+}
+
 /**
- * The one repo this provider serves. `WORKTREE_ROOT` above and `sandbox.sh`'s
- * own `REPO_SLUG` both hardcode it, so `list()` cannot tell two repos apart —
- * every compose project is named `archon-<slug>` with no repo component. Rather
- * than return another repo's environments when asked about it, `list()` throws.
- * P4 (rollout beyond marphob-page) must make this a per-repo value; this
- * constant and `assertRepoInScope` are where that change lands.
+ * THE compose-project naming rule — one definition, deliberately exported.
+ *
+ * `sandbox.sh` brings each stack up as `archon-<repo>-<slug>`, and **both**
+ * segments are load-bearing: two repos can carry the same slug. Anything that
+ * addresses a live stack (`docker compose -p … exec agent`) must derive the name
+ * through here.
+ *
+ * This existed as a second, hand-rolled copy in the CLI's resume/reuse path that
+ * popped only the last path segment (`archon-<slug>`). When the sandbox went
+ * multi-repo the copy was never updated, so every *resumed* run addressed a
+ * project that does not exist and compose truthfully answered
+ * `service "agent" is not running` — against a live, reachable container. Fresh
+ * runs took `IsolatedEnvironment.project` from this provider and were unaffected,
+ * which is exactly why the breakage hid behind three clean dispatches.
  */
-const SANDBOX_REPO_SLUG = 'marphob-page';
+export function composeProjectFor(repo: string, slug: string): string {
+  return `archon-${repo}-${slug}`;
+}
+
+/** Same rule, derived from a working path `<worktree-root>/<repo>/<slug>`. */
+export function composeProjectFromWorkingPath(workingPath: string): string {
+  const { repo, slug } = repoSlugFromWorkingPath(workingPath);
+  return composeProjectFor(repo, slug);
+}
 
 /** Last path segment, tolerating POSIX and Windows separators + trailing slash. */
 function basename(p: string): string {
@@ -52,19 +75,13 @@ function basename(p: string): string {
   return parts[parts.length - 1] ?? '';
 }
 
-/**
- * Guard the single-repo assumption. `codebaseId` is the canonical repo path
- * (see `IIsolationProvider.list`), so its basename is the repo name.
- */
-function assertRepoInScope(codebaseId: string): void {
-  const repo = basename(codebaseId);
-  if (repo && repo !== SANDBOX_REPO_SLUG) {
-    throw new Error(
-      `ContainerProvider is scoped to "${SANDBOX_REPO_SLUG}" but was asked about "${repo}". ` +
-        'Compose projects are named archon-<slug> with no repo component, so listing ' +
-        `would return ${SANDBOX_REPO_SLUG}'s environments as if they were ${repo}'s.`
-    );
-  }
+/** Split a working path `<base>/<repo>/<slug>` into its repo and slug segments. */
+function repoSlugFromWorkingPath(envId: string): { repo: string; slug: string } {
+  const parts = envId
+    .replace(/[/\\]+$/, '')
+    .split(/[/\\]/)
+    .filter(Boolean);
+  return { slug: parts[parts.length - 1] ?? '', repo: parts[parts.length - 2] ?? '' };
 }
 
 /** `sandbox.sh up` provisions (uv sync + pnpm install + alembic + playwright); be generous. */
@@ -134,16 +151,16 @@ export class ContainerProvider implements IIsolationProvider {
     // worktree from origin/<base>, go green, and open the PR on the wrong base.
     assertRequestSupported(request, ContainerProvider.capabilities, this.providerType);
 
+    const repo = basename(request.canonicalRepoPath);
     const slug = this.slugFor(request);
-    const workingPath = `${WORKTREE_ROOT}/${slug}`;
+    const workingPath = `${worktreeRoot(repo)}/${slug}`;
     // The worktree lives in the distro, so the branch has to cross the wsl.exe
-    // boundary as an argument; auto-detection runs against the host checkout,
-    // which Windows git can reach.
+    // boundary as an argument; auto-detection runs against the host checkout.
     const baseBranch = await resolveBaseBranch(request, this.loadConfig);
     // Worktree-in-distro + compose up + provision. No port allocator — the
     // container owns its own 3000/8123/5432 in its private network namespace.
-    await runSandbox(['up', slug, baseBranch], SANDBOX_UP_TIMEOUT_MS, identityEnv(request));
-    return this.buildEnv(slug, workingPath, request);
+    await runSandbox(['up', repo, slug, baseBranch], SANDBOX_UP_TIMEOUT_MS, identityEnv(request));
+    return this.buildEnv(repo, slug, workingPath, request);
   }
 
   /**
@@ -152,8 +169,8 @@ export class ContainerProvider implements IIsolationProvider {
    * `sandbox/<slug>` branch. A failure is swallowed — the run is already over.
    */
   async destroy(envId: string, _options?: WorktreeDestroyOptions): Promise<DestroyResult> {
-    const slug = this.slugFromWorkingPath(envId);
-    await runSandbox(['down', slug], SANDBOX_DOWN_TIMEOUT_MS).catch(() => undefined);
+    const { repo, slug } = repoSlugFromWorkingPath(envId);
+    await runSandbox(['down', repo, slug], SANDBOX_DOWN_TIMEOUT_MS).catch(() => undefined);
     return {
       worktreeRemoved: true,
       branchDeleted: null,
@@ -164,15 +181,20 @@ export class ContainerProvider implements IIsolationProvider {
   }
 
   async get(envId: string): Promise<IsolatedEnvironment | null> {
-    const slug = this.slugFromWorkingPath(envId);
-    if (!(await this.composeAgentRunning(slug))) {
+    const { repo, slug } = repoSlugFromWorkingPath(envId);
+    if (!(await this.composeAgentRunning(repo, slug))) {
       return null;
     }
-    return this.buildEnv(slug, envId);
+    return this.buildEnv(repo, slug, envId);
   }
 
   async list(codebaseId: string): Promise<IsolatedEnvironment[]> {
-    assertRepoInScope(codebaseId);
+    // codebaseId is the canonical repo path; its basename names the repo whose
+    // environments the caller is asking about. Compose projects are named
+    // archon-<repo>-<slug>, so filtering by the archon-<repo>- prefix returns
+    // only this repo's envs — repo-scoped by parameter, never leaking another's.
+    const repo = basename(codebaseId);
+    const prefix = `archon-${repo}-`;
     let stdout = '[]';
     try {
       ({ stdout } = await execFileAsync('docker', ['compose', 'ls', '--all', '--format', 'json'], {
@@ -189,25 +211,33 @@ export class ContainerProvider implements IIsolationProvider {
     }
     return entries
       .map(e => e.Name ?? '')
-      .filter(name => name.startsWith('archon-'))
-      .map(name =>
-        this.buildEnv(
-          name.slice('archon-'.length),
-          `${WORKTREE_ROOT}/${name.slice('archon-'.length)}`
-        )
-      );
+      .filter(name => name.startsWith(prefix))
+      .map(name => {
+        const slug = name.slice(prefix.length);
+        return this.buildEnv(repo, slug, `${worktreeRoot(repo)}/${slug}`);
+      });
   }
 
   async healthCheck(envId: string): Promise<boolean> {
-    return this.composeAgentRunning(this.slugFromWorkingPath(envId));
+    const { repo, slug } = repoSlugFromWorkingPath(envId);
+    return this.composeAgentRunning(repo, slug);
   }
 
-  /** `docker compose -p archon-<slug> ps` → is the `agent` service running? */
-  private async composeAgentRunning(slug: string): Promise<boolean> {
+  /** `docker compose -p archon-<repo>-<slug> ps` → is the `agent` service running? */
+  private async composeAgentRunning(repo: string, slug: string): Promise<boolean> {
     try {
       const { stdout } = await execFileAsync(
         'docker',
-        ['compose', '-p', `archon-${slug}`, 'ps', '--status', 'running', '--format', 'json'],
+        [
+          'compose',
+          '-p',
+          composeProjectFor(repo, slug),
+          'ps',
+          '--status',
+          'running',
+          '--format',
+          'json',
+        ],
         { timeout: DOCKER_QUERY_TIMEOUT_MS }
       );
       return /"Service"\s*:\s*"agent"/.test(stdout);
@@ -216,8 +246,9 @@ export class ContainerProvider implements IIsolationProvider {
     }
   }
 
-  /** Assemble the ContainerEnvironment literal for a slug/workingPath. */
+  /** Assemble the ContainerEnvironment literal for a repo/slug/workingPath. */
   private buildEnv(
+    repo: string,
     slug: string,
     workingPath: string,
     request?: IsolationRequest
@@ -226,7 +257,7 @@ export class ContainerProvider implements IIsolationProvider {
       id: workingPath,
       provider: 'container',
       workingPath,
-      project: `archon-${slug}`,
+      project: composeProjectFor(repo, slug),
       containerWorkdir: CONTAINER_WORKDIR,
       // sandbox.sh creates the branch as `sandbox/<slug>` off the base clone.
       branchName: toBranchName(`sandbox/${slug}`),
@@ -246,17 +277,6 @@ export class ContainerProvider implements IIsolationProvider {
     return this.generateBranchName(request)
       .replace(/^archon\//, '')
       .replace(/\//g, '-');
-  }
-
-  /** envId is, by contract, the worktree working path; the slug is its last segment. */
-  private slugFromWorkingPath(envId: string): string {
-    return (
-      envId
-        .replace(/[/\\]+$/, '')
-        .split(/[/\\]/)
-        .filter(Boolean)
-        .pop() ?? ''
-    );
   }
 
   // --- Branch-name helpers copied verbatim from WorktreeProvider so the slug
