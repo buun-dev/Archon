@@ -51,7 +51,7 @@ describe('ContainerProvider', () => {
     expect(env.id).toBe(env.workingPath);
     expect(env.status).toBe('active');
     if (env.provider !== 'container') throw new Error('expected container env');
-    expect(env.project).toBe('archon-issue-42');
+    expect(env.project).toBe('archon-marphob-page-issue-42');
     expect(env.containerWorkdir).toBe('/work');
     // sandbox.sh (real LF-safe path) driven through wsl.exe -d Ubuntu -- bash …
     expect(execSpy).toHaveBeenCalledWith(
@@ -63,6 +63,7 @@ describe('ContainerProvider', () => {
         'bash',
         expect.stringContaining('sandbox.sh'),
         'up',
+        'marphob-page',
         'issue-42',
       ]),
       expect.any(Object)
@@ -82,6 +83,7 @@ describe('ContainerProvider', () => {
         'bash',
         expect.stringContaining('sandbox.sh'),
         'down',
+        'marphob-page',
         'issue-42',
       ]),
       expect.any(Object)
@@ -102,7 +104,7 @@ describe('ContainerProvider', () => {
     expect(healthy).toBe(true);
     expect(execSpy).toHaveBeenCalledWith(
       'docker',
-      expect.arrayContaining(['compose', '-p', 'archon-issue-42', 'ps']),
+      expect.arrayContaining(['compose', '-p', 'archon-marphob-page-issue-42', 'ps']),
       expect.any(Object)
     );
   });
@@ -126,7 +128,7 @@ describe('ContainerProvider', () => {
     const env = await provider.get('/home/bunny/archon/worktrees/marphob-page/issue-42');
     expect(env?.provider).toBe('container');
     if (env?.provider !== 'container') throw new Error('expected container env');
-    expect(env.project).toBe('archon-issue-42');
+    expect(env.project).toBe('archon-marphob-page-issue-42');
     expect(env.containerWorkdir).toBe('/work');
   });
 
@@ -140,7 +142,7 @@ describe('ContainerProvider', () => {
     await configured.create(issueRequest);
 
     const argv = execSpy.mock.calls[0]![1] as string[];
-    expect(argv.slice(-3)).toEqual(['up', 'issue-42', 'develop']);
+    expect(argv.slice(-4)).toEqual(['up', 'marphob-page', 'issue-42', 'develop']);
     // A configured branch means no needless git call against the host checkout.
     expect(defaultBranchSpy).not.toHaveBeenCalled();
   });
@@ -151,7 +153,7 @@ describe('ContainerProvider', () => {
     await configured.create(issueRequest);
 
     const argv = execSpy.mock.calls[0]![1] as string[];
-    expect(argv.slice(-3)).toEqual(['up', 'issue-42', 'master']);
+    expect(argv.slice(-4)).toEqual(['up', 'marphob-page', 'issue-42', 'master']);
     // Resolved against the HOST checkout, which Windows git can reach.
     expect(defaultBranchSpy).toHaveBeenCalledWith('/repo/marphob-page');
   });
@@ -194,21 +196,35 @@ describe('ContainerProvider', () => {
     expect(opts.env.WSLENV).not.toContain('ARCHON_GIT_USER_EMAIL');
   });
 
-  test('list() maps archon- compose projects to container envs', async () => {
+  test("list() maps this repo's archon- compose projects to container envs", async () => {
     execSpy.mockResolvedValueOnce({
       stdout: JSON.stringify([
-        { Name: 'archon-issue-42', Status: 'running(3)' },
+        { Name: 'archon-marphob-page-issue-42', Status: 'running(3)' },
+        { Name: 'archon-bunshee-task-foo', Status: 'running(2)' }, // another repo — excluded
         { Name: 'some-other-project', Status: 'running(1)' },
       ]),
       stderr: '',
     });
-    // `list` takes the canonical repo path; its basename must name the one repo
-    // this provider serves, else it throws rather than leak another repo's envs.
     const envs = await provider.list('/repo/marphob-page');
     expect(envs).toHaveLength(1);
     expect(envs[0]?.provider).toBe('container');
     if (envs[0]?.provider !== 'container') throw new Error('expected container env');
-    expect(envs[0].project).toBe('archon-issue-42');
+    expect(envs[0].project).toBe('archon-marphob-page-issue-42');
     expect(envs[0].workingPath).toBe('/home/bunny/archon/worktrees/marphob-page/issue-42');
+  });
+
+  test("list() is scoped to the requested repo — another repo's envs are excluded", async () => {
+    execSpy.mockResolvedValueOnce({
+      stdout: JSON.stringify([
+        { Name: 'archon-marphob-page-issue-42' },
+        { Name: 'archon-bunshee-task-foo' },
+      ]),
+      stderr: '',
+    });
+    const envs = await provider.list('/repo/bunshee');
+    expect(envs).toHaveLength(1);
+    if (envs[0]?.provider !== 'container') throw new Error('expected container env');
+    expect(envs[0].project).toBe('archon-bunshee-task-foo');
+    expect(envs[0].workingPath).toBe('/home/bunny/archon/worktrees/bunshee/task-foo');
   });
 });
