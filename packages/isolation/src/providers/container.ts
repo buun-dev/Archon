@@ -8,7 +8,7 @@
  * state queries run WITHOUT wsl.exe. Only the git-provisioning script
  * (`sandbox.sh`, which lives in the distro FS) is invoked through `wsl.exe`.
  *
- * Addressing (from P1 `compose.yml.tmpl`): compose project `archon-<slug>`,
+ * Addressing (from P1 `compose.yml.tmpl`): compose project `archon-<repo>-<slug>`,
  * service `agent`, in-container workdir `/work` (the bind-mounted worktree).
  */
 
