@@ -160,7 +160,7 @@ Options:
   --quiet, -q                Reduce log verbosity to warnings and errors only
   --verbose, -v              Show debug-level output
   --json                     Output machine-readable JSON (list/status/get/runs/approve/reject/abandon/resume)
-  --detach                   Run 'workflow run' in a detached background child (returns immediately)
+  --detach                   Run 'workflow run'/'approve'/'resume' in a detached background child (returns immediately)
   --all                      For 'workflow runs': list across all projects (ignore cwd scope)
   --status <status>          For 'workflow runs': filter to one status (running, completed, failed, ...)
   --limit <n>                For 'workflow runs': max rows (default 20)
@@ -549,7 +549,7 @@ async function main(): Promise<number> {
               console.error('Usage: archon workflow resume <run-id>');
               return 1;
             }
-            await workflowResumeCommand(resumeRunId, jsonFlag);
+            await workflowResumeCommand(resumeRunId, jsonFlag, detachFlag);
             break;
           }
 
@@ -572,7 +572,7 @@ async function main(): Promise<number> {
             // Accept comment as positional args (everything after run ID) or --comment flag
             const approveComment =
               (values.comment as string | undefined) || positionals.slice(3).join(' ') || undefined;
-            await workflowApproveCommand(approveRunId, approveComment, jsonFlag);
+            await workflowApproveCommand(approveRunId, approveComment, jsonFlag, detachFlag);
             break;
           }
 

@@ -1621,6 +1621,53 @@ function printJsonWriteError(runId: string, action: string, error: unknown): voi
   );
 }
 
+/**
+ * Shared `--detach` front half for `approve`/`resume`. Validates the run
+ * READ-ONLY via `precheck`, then hands the whole command to a detached child
+ * that re-invokes the same argv (minus `--detach`/`--json`) and owns ALL state
+ * mutation in its own process group — so killing the shell that hosted the
+ * parent cannot zombie the run mid-resume. The parent must never call
+ * approveWorkflow/resumeWorkflow itself, or the decision would be recorded
+ * twice (mirrors workflowRunCommand's detach shape: the parent does nothing).
+ *
+ * Spawns with the PARENT's cwd, never the run's working_path: the child
+ * re-resolves everything by run-id, and a container run's working_path is a
+ * distro path the host cannot spawn into (ENOENT → the detach would silently
+ * no-op).
+ */
+async function runDetachedControlCommand(
+  runId: string,
+  action: 'approve' | 'resume',
+  json: boolean | undefined,
+  precheck: () => Promise<WorkflowRun>
+): Promise<void> {
+  try {
+    const run = await precheck();
+    const logPath = spawnDetachedWorkflowRun(process.cwd(), runId, []);
+    if (json) {
+      console.log(
+        JSON.stringify(
+          { ok: true, runId, action, detached: true, workflowName: run.workflow_name, logPath },
+          null,
+          2
+        )
+      );
+      return;
+    }
+    console.log(`Started '${action}' for run ${runId} in the background.`);
+    console.log(`Track it with: archon workflow get ${runId}`);
+    if (logPath) console.log(`Child output: ${logPath}`);
+  } catch (error) {
+    // Precheck failures follow each mode's error contract: --json emits the
+    // standard { ok: false } line; human mode throws like the inline path.
+    if (json) {
+      printJsonWriteError(runId, action, error);
+      return;
+    }
+    throw error;
+  }
+}
+
 async function resolveDiscoveryCwdForCodebase(
   runId: string,
   codebaseId: string,
@@ -1659,13 +1706,27 @@ async function resolveDiscoveryCwdForCodebase(
  * Re-executes the workflow with --resume semantics: `workflowRunCommand` locates
  * the prior failed run via findResumableRun and hands it to the executor, which
  * skips already-completed nodes (the executor no longer auto-detects on its own).
+ * `--detach` hosts that re-execution in a detached background child instead of
+ * this process, so it survives the launching shell.
  */
-export async function workflowResumeCommand(runId: string, json?: boolean): Promise<void> {
+export async function workflowResumeCommand(
+  runId: string,
+  json?: boolean,
+  detach?: boolean
+): Promise<void> {
+  // --detach: validate read-only (failed/paused via resumeWorkflowOp), then let
+  // a detached child re-invoke the blocking resume and own all mutation +
+  // execution. Composes with --json (structured ack; nothing executes here).
+  if (detach) {
+    await runDetachedControlCommand(runId, 'resume', json, () => resumeWorkflowOp(runId));
+    return;
+  }
+
   // JSON mode is a non-blocking control-plane ack: validate the run is resumable
   // and report its state, but do NOT re-execute the workflow inline (execution
   // streams workflow output to stdout, which would corrupt the JSON contract).
-  // To actually execute a resumable run, use the blocking `resume` (no --json,
-  // run as a background task) or `run <name> --resume --detach`.
+  // To actually execute a resumable run, use `resume <id> --detach` (a detached
+  // child owns the execution) or the blocking `resume` (no flags).
   if (json) {
     try {
       const run = await resumeWorkflowOp(runId);
@@ -1769,12 +1830,37 @@ export async function workflowAbandonCommand(runId: string, json?: boolean): Pro
  * auto-resumes the run inline. `--json` mode records the approval and returns a
  * structured ack WITHOUT resuming — the run is left resumable for a backgrounded
  * `resume`/`run --resume` (inline resume would stream output and break the JSON).
+ * `--detach` hosts the approve + inline auto-resume in a detached background
+ * child instead of this process, so it survives the launching shell.
  */
 export async function workflowApproveCommand(
   runId: string,
   comment?: string,
-  json?: boolean
+  json?: boolean,
+  detach?: boolean
 ): Promise<void> {
+  // --detach: hand the approve AND its inline auto-resume to a detached child
+  // (same argv minus --detach/--json). Handled BEFORE any state change — the
+  // parent only validates read-only, so the approval is recorded exactly once,
+  // in the child. Composes with --json (structured ack; nothing executes here).
+  if (detach) {
+    await runDetachedControlCommand(runId, 'approve', json, async () => {
+      const run = await workflowDb.getWorkflowRun(runId);
+      if (!run) {
+        throw new Error(`Workflow run not found: ${runId}`);
+      }
+      // Mirrors approveWorkflow's gate so a wrong-status error surfaces
+      // synchronously instead of dying unseen in the child's log.
+      if (run.status !== 'paused') {
+        throw new Error(
+          `Cannot approve run with status '${run.status}'. Only paused runs can be approved.`
+        );
+      }
+      return run;
+    });
+    return;
+  }
+
   // JSON mode records the approval and returns a structured ack WITHOUT the
   // inline auto-resume (resuming executes the workflow and streams output to
   // stdout, which would corrupt the JSON contract). The run becomes resumable
