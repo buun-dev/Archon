@@ -20,7 +20,11 @@ import { logWorkflowStart, logWorkflowError } from './logger';
 import { formatDuration, parseDbTimestamp } from './utils/duration';
 import { keepAwake } from './utils/keep-awake';
 import { getWorkflowEventEmitter } from './event-emitter';
-import { isRegisteredProvider, getRegisteredProviders } from '@archon/providers';
+import {
+  isRegisteredProvider,
+  getRegisteredProviders,
+  isContainerStylePath,
+} from '@archon/providers';
 import type { IsolationDescriptor } from '@archon/providers';
 import {
   classifyError,
@@ -226,8 +230,15 @@ async function resolveUserProviderEnvForWorkflow(
  * Resolve the artifacts and log directories for a workflow run.
  * Looks up the codebase by ID once, parses owner/repo, and returns project-scoped paths.
  * Falls back to cwd-based paths for unregistered repos.
+ *
+ * Engine io must NEVER be rooted at a container-style cwd: on Windows a
+ * `/home/...` worktree path resolves drive-relative, so cwd-based dirs
+ * materialize a `D:\home\...` ghost worktree holding the run's logs — whose
+ * existence then lets a mis-wired unwrapped spawn succeed instead of failing
+ * fast (bunshee run df04b366). Registered-but-unparsable names and
+ * container-style fallbacks both divert to archon-home instead.
  */
-async function resolveProjectPaths(
+export async function resolveProjectPaths(
   deps: WorkflowDeps,
   cwd: string,
   workflowRunId: string,
@@ -245,6 +256,7 @@ async function resolveProjectPaths(
           };
         }
         getLog().warn({ codebaseName: codebase.name }, 'codebase_name_not_owner_repo_format');
+        return unparsedProjectPaths(codebase.name, workflowRunId);
       }
     } catch (error) {
       const fallbackArtifactsDir = join(cwd, '.archon', 'artifacts', 'runs', workflowRunId);
@@ -254,10 +266,26 @@ async function resolveProjectPaths(
       );
     }
   }
-  // Fallback for unregistered repos
+  // Fallback for unregistered repos — still never under a container-style cwd.
+  if (process.platform === 'win32' && isContainerStylePath(cwd)) {
+    return unparsedProjectPaths('_unknown', workflowRunId);
+  }
   return {
     artifactsDir: join(cwd, '.archon', 'artifacts', 'runs', workflowRunId),
     logDir: join(cwd, '.archon', 'logs'),
+  };
+}
+
+/** Engine-io dirs under archon-home for codebases without an owner/repo name. */
+function unparsedProjectPaths(
+  name: string,
+  workflowRunId: string
+): { artifactsDir: string; logDir: string } {
+  const safe = name.replace(/[^A-Za-z0-9._-]/g, '_') || '_unknown';
+  const root = join(archonPaths.getArchonHome(), 'workspaces', '_unparsed', safe);
+  return {
+    artifactsDir: join(root, 'artifacts', 'runs', workflowRunId),
+    logDir: join(root, 'logs'),
   };
 }
 

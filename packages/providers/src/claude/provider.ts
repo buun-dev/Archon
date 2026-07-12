@@ -544,6 +544,41 @@ export function applyContainerIsolation(
   return process.env.ARCHON_SANDBOX_CLAUDE_SHIM ?? DEFAULT_CLAUDE_SHIM;
 }
 
+/**
+ * Paths under the sandbox worktree/mount roots (`/home/...`, `/work`,
+ * `/archon-meta`) — container-side locations that are never valid working
+ * paths on a Windows host. Keep the roots in sync with WORKTREE_ROOT_BASE in
+ * @archon/isolation's ContainerProvider and the compose mounts in
+ * ~/.archon/sandbox/compose.yml.tmpl.
+ */
+export function isContainerStylePath(p: string): boolean {
+  return /^\/(home|work|archon-meta)(\/|$)/.test(p);
+}
+
+/**
+ * Tripwire for the sandbox-escape class (bunshee run df04b366): a spawn that is
+ * NOT container-wrapped must never target a container-style cwd. On win32 a
+ * leading-/ path resolves drive-relative (`/home/...` → `D:\home\...`), so the
+ * subprocess would silently run OUTSIDE the sandbox against a filesystem that
+ * does not hold the worktree. Reaching this state always means a call site
+ * dropped the isolation descriptor — fail loud so it surfaces as an
+ * attributable node error instead of a wandering agent.
+ */
+export function assertHostSpawnCwdSafe(
+  cwd: string,
+  isolation: IsolationDescriptor | undefined,
+  platform: NodeJS.Platform = process.platform
+): void {
+  if (isolation?.kind === 'container' && isolation.project) return; // wrapped — the shim owns the cwd
+  if (platform === 'win32' && isContainerStylePath(cwd)) {
+    throw new Error(
+      `Refusing host spawn: cwd '${cwd}' is a container path but no usable container ` +
+        'isolation descriptor reached this call site (missing descriptor or empty project). ' +
+        'The subprocess would resolve it drive-relative and run outside the sandbox.'
+    );
+  }
+}
+
 function buildBaseClaudeOptions(
   cwd: string,
   requestOptions: SendQueryOptions | undefined,
@@ -1010,6 +1045,10 @@ export class ClaudeProvider implements IAgentProvider {
     // Container isolation (step-5 P2): swap the claude executable for the
     // docker-exec shim and inject the exec locators into `env`. No-op otherwise.
     const cliForRun = applyContainerIsolation(resolvedCliPath, env, requestOptions?.isolation);
+
+    // Tripwire: an UNWRAPPED spawn must never target a container-style cwd
+    // (the df04b366 sandbox-escape class — descriptor dropped upstream).
+    assertHostSpawnCwdSafe(cwd, requestOptions?.isolation);
 
     // The SDK spawns the executable with `options.cwd`. For a container run the
     // node's `cwd` is a distro path that does NOT exist on the Windows host, so

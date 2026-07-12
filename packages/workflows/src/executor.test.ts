@@ -4,6 +4,7 @@
  * that the inner dag-executor.test.ts cannot reach.
  */
 import { describe, it, expect, mock, beforeEach } from 'bun:test';
+import { join } from 'path';
 
 // --- Mock logger ---
 const mockLogFn = mock(() => {});
@@ -23,11 +24,15 @@ const mockLogger = {
 // Hoisted so tests can assert on the completion call (outcome / exit reason).
 const mockCaptureWorkflowInvoked = mock(() => {});
 const mockCaptureWorkflowCompleted = mock(() => {});
+// Hoisted so the resolveProjectPaths tests can flip it to an owner/repo parse.
+const mockParseOwnerRepo = mock((): { owner: string; repo: string } | null => null);
+const MOCK_ARCHON_HOME = '/mock-archon-home';
 mock.module('@archon/paths', () => ({
   createLogger: mock(() => mockLogger),
-  parseOwnerRepo: mock(() => null),
+  parseOwnerRepo: mockParseOwnerRepo,
   getRunArtifactsPath: mock(() => '/tmp/artifacts'),
   getProjectLogsPath: mock(() => '/tmp/logs'),
+  getArchonHome: mock(() => MOCK_ARCHON_HOME),
   captureWorkflowInvoked: mockCaptureWorkflowInvoked,
   captureWorkflowCompleted: mockCaptureWorkflowCompleted,
 }));
@@ -66,7 +71,7 @@ clearRegistry();
 registerBuiltinProviders();
 
 // --- Import after mocks ---
-import { executeWorkflow, hydrateResumableRun } from './executor';
+import { executeWorkflow, hydrateResumableRun, resolveProjectPaths } from './executor';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
 import type { WorkflowDefinition, WorkflowRun } from './schemas';
@@ -1359,4 +1364,74 @@ describe('hydrateResumableRun', () => {
     const deps = makeDeps(store);
     await expect(hydrateResumableRun(deps, candidate)).rejects.toThrow('DB write failed');
   });
+});
+
+// --- resolveProjectPaths: engine-io placement (ghost-tree fix, run df04b366) ---
+//
+// Engine io (assistant logs, artifacts scaffolding) must never be rooted at a
+// container-style cwd: on Windows a /home/... cwd resolves drive-relative,
+// materializing a D:\home\... ghost worktree whose existence later lets a
+// mis-wired host spawn succeed instead of failing fast.
+
+describe('resolveProjectPaths', () => {
+  const runId = 'run123';
+  const containerCwd = '/home/bunny/archon/worktrees/bunshee/task-x';
+
+  const depsWithCodebaseName = (name: string | null): WorkflowDeps =>
+    makeDeps(
+      makeStore({
+        getCodebase: mock(
+          async () =>
+            (name === null ? null : { name }) as unknown as Awaited<
+              ReturnType<IWorkflowStore['getCodebase']>
+            >
+        ),
+      })
+    );
+
+  it('owner/repo codebase → workspace-scoped engine io (the /archon-meta mount)', async () => {
+    mockParseOwnerRepo.mockReturnValueOnce({ owner: 'buun-dev', repo: 'bunshee' });
+    const paths = await resolveProjectPaths(
+      depsWithCodebaseName('buun-dev/bunshee'),
+      containerCwd,
+      runId,
+      'cb1'
+    );
+    expect(paths.artifactsDir).toBe('/tmp/artifacts');
+    expect(paths.logDir).toBe('/tmp/logs');
+  });
+
+  it('bare-named codebase → archon-home _unparsed dirs, never under cwd', async () => {
+    const paths = await resolveProjectPaths(
+      depsWithCodebaseName('bunshee'),
+      containerCwd,
+      runId,
+      'cb1'
+    );
+    const root = join(MOCK_ARCHON_HOME, 'workspaces', '_unparsed', 'bunshee');
+    expect(paths.artifactsDir).toBe(join(root, 'artifacts', 'runs', runId));
+    expect(paths.logDir).toBe(join(root, 'logs'));
+    expect(paths.artifactsDir.startsWith(containerCwd)).toBe(false);
+  });
+
+  it('unregistered repo on a host cwd keeps the legacy cwd fallback', async () => {
+    const cwd = join('C:', 'repos', 'some-repo');
+    const paths = await resolveProjectPaths(depsWithCodebaseName(null), cwd, runId, undefined);
+    expect(paths.artifactsDir).toBe(join(cwd, '.archon', 'artifacts', 'runs', runId));
+    expect(paths.logDir).toBe(join(cwd, '.archon', 'logs'));
+  });
+
+  it.skipIf(process.platform !== 'win32')(
+    'win32: a container-style cwd never becomes an engine-io root, even unregistered',
+    async () => {
+      const paths = await resolveProjectPaths(
+        depsWithCodebaseName(null),
+        containerCwd,
+        runId,
+        undefined
+      );
+      const root = join(MOCK_ARCHON_HOME, 'workspaces', '_unparsed', '_unknown');
+      expect(paths.artifactsDir).toBe(join(root, 'artifacts', 'runs', runId));
+    }
+  );
 });

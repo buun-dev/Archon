@@ -1142,6 +1142,97 @@ describe('executeDagWorkflow -- tool restrictions', () => {
     expect(nodeConfig?.allowed_tools).toEqual(['Read', 'Grep']);
   });
 
+  it('passes isolation to sendQuery options for a plain AI node', async () => {
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+    const containerIso = { kind: 'container', project: 'archon-slug', workdir: '/work' } as const;
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      { name: 'dag-ai-iso', nodes: [{ id: 'review', command: 'my-cmd' }] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      containerIso
+    );
+
+    const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
+    expect(optionsArg?.isolation).toEqual(containerIso);
+  });
+
+  // Regression (2026-07-12): the loop node threaded `isolation` into isoMetaDirs — so its
+  // prompt carried CONTAINER paths ($ARTIFACTS_DIR=/archon-meta/...) — but omitted it from
+  // the sendQuery options, so the claude subprocess was spawned on the HOST instead of
+  // through the docker-exec shim. The agent then could not read a single artifact and the
+  // implement loop wrote zero lines while still reporting iterations. Guard both halves.
+  it('passes isolation to sendQuery options for a LOOP node', async () => {
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+    const containerIso = { kind: 'container', project: 'archon-slug', workdir: '/work' } as const;
+
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'done COMPLETE' };
+      yield { type: 'result', sessionId: 'loop-session-id' };
+    });
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'dag-loop-iso',
+        nodes: [
+          {
+            id: 'implement-backend',
+            loop: {
+              prompt: 'Implement. Output COMPLETE when done.',
+              until: 'COMPLETE',
+              max_iterations: 2,
+            },
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      containerIso
+    );
+
+    expect(mockSendQueryDag.mock.calls.length).toBeGreaterThan(0);
+    const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
+    // Without the fix this is `undefined` → resolveClaudeCliPath() returns the host CLI
+    // and the iteration runs outside the container it was given paths into.
+    expect(optionsArg?.isolation).toEqual(containerIso);
+  });
+
   it('routes Codex tier effort to assistantConfig.modelReasoningEffort', async () => {
     mockGetAgentProviderDag.mockImplementation(() => ({
       sendQuery: mockSendQueryDag,
@@ -9740,6 +9831,20 @@ describe('runIsolatedCommand', () => {
     expect(eKeys).toContain('WF_ONLY'); // workflow-injected → forwarded
     expect(eKeys).not.toContain('PATH'); // identical to host → skipped
   });
+
+  it.skipIf(process.platform !== 'win32')(
+    'win32 tripwire: refuses an UNWRAPPED spawn whose cwd is a container worktree path (df04b366)',
+    async () => {
+      await expect(
+        runIsolatedCommand(undefined, 'bash', ['-c', ':'], {
+          cwd: '/home/bunny/archon/worktrees/bunshee/task-x',
+          timeout: 1000,
+          env: {} as NodeJS.ProcessEnv,
+        })
+      ).rejects.toThrow(/Refusing host spawn/);
+      expect(execSpy).not.toHaveBeenCalled();
+    }
+  );
 });
 
 // --- step-5 sandbox P2: container-facing run meta dirs (fix C) ---

@@ -48,6 +48,10 @@ export {
 
 // Provider classes
 export { ClaudeProvider } from './claude/provider';
+
+// Sandbox-escape tripwire (df04b366 class) — shared with @archon/workflows'
+// runIsolatedCommand and the executor's engine-io placement.
+export { assertHostSpawnCwdSafe, isContainerStylePath } from './claude/provider';
 export { CodexProvider } from './codex/provider';
 
 // Config parsers

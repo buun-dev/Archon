@@ -28,6 +28,7 @@ import {
   getRegisteredProviders,
   isRegisteredProvider,
   validateStructuredOutput,
+  assertHostSpawnCwdSafe,
 } from '@archon/providers';
 import type {
   DagNode,
@@ -154,6 +155,8 @@ export async function runIsolatedCommand(
   opts: { cwd: string; timeout: number; env: NodeJS.ProcessEnv }
 ): Promise<{ stdout: string; stderr: string }> {
   if (iso?.kind !== 'container' || !iso.project) {
+    // Tripwire (df04b366 class): an unwrapped spawn must not target a container path.
+    assertHostSpawnCwdSafe(opts.cwd, iso);
     return execFileAsync(cmd, args, opts); // worktree — unchanged host spawn
   }
   const workdir = iso.workdir ?? '/work';
@@ -2503,6 +2506,11 @@ async function executeLoopNode(
       const iterationOptions: SendQueryOptions | undefined = {
         ...resolvedOptions,
         abortSignal: iterationAbortController.signal,
+        // Route the claude subprocess through the docker-exec shim for container envs,
+        // exactly as the plain AI node does. Without this the iteration runs on the HOST
+        // while its prompt carries container paths (nodeArtifactsDir above is
+        // container-facing), so every $ARTIFACTS_DIR read fails and the loop writes nothing.
+        ...(isolation ? { isolation } : {}),
       };
 
       const generator = aiClient.sendQuery(finalPrompt, cwd, resumeSessionId, iterationOptions);

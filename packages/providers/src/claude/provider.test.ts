@@ -16,7 +16,13 @@ mock.module('@anthropic-ai/claude-agent-sdk', () => ({
   query: mockQuery,
 }));
 
-import { ClaudeProvider, shouldPassNoEnvFile, applyContainerIsolation } from './provider';
+import {
+  ClaudeProvider,
+  shouldPassNoEnvFile,
+  applyContainerIsolation,
+  assertHostSpawnCwdSafe,
+  isContainerStylePath,
+} from './provider';
 import * as claudeModule from './provider';
 import * as binaryResolver from './binary-resolver';
 
@@ -1820,5 +1826,55 @@ describe('applyContainerIsolation', () => {
       if (prev === undefined) delete process.env.ARCHON_SANDBOX_CLAUDE_SHIM;
       else process.env.ARCHON_SANDBOX_CLAUDE_SHIM = prev;
     }
+  });
+});
+
+// --- sandbox-escape tripwire (bunshee run df04b366): an UNWRAPPED spawn must
+// never target a container-style cwd — on win32 it resolves drive-relative
+// (D:\home\...) and the subprocess silently runs outside the sandbox.
+
+describe('isContainerStylePath', () => {
+  test('matches the sandbox worktree/mount roots', () => {
+    expect(isContainerStylePath('/home/bunny/archon/worktrees/bunshee/task-x')).toBe(true);
+    expect(isContainerStylePath('/work')).toBe(true);
+    expect(isContainerStylePath('/work/backend')).toBe(true);
+    expect(isContainerStylePath('/archon-meta/artifacts/runs/abc')).toBe(true);
+  });
+
+  test('does not match host paths or prefix-lookalikes', () => {
+    expect(isContainerStylePath('C:\\Users\\Buun\\repo')).toBe(false);
+    expect(isContainerStylePath('/workspace')).toBe(false); // '/work' + more word chars
+    expect(isContainerStylePath('/tmp/x')).toBe(false);
+  });
+});
+
+describe('assertHostSpawnCwdSafe', () => {
+  const containerCwd = '/home/bunny/archon/worktrees/bunshee/task-x';
+
+  test('throws on win32 when no isolation descriptor reached the call site', () => {
+    expect(() => assertHostSpawnCwdSafe(containerCwd, undefined, 'win32')).toThrow(
+      /Refusing host spawn/
+    );
+  });
+
+  test('throws on win32 when the descriptor is container-kind but the project is empty', () => {
+    expect(() =>
+      assertHostSpawnCwdSafe(containerCwd, { kind: 'container', project: '' }, 'win32')
+    ).toThrow(/Refusing host spawn/);
+  });
+
+  test('no-op when the spawn is container-wrapped (shim owns the cwd)', () => {
+    expect(() =>
+      assertHostSpawnCwdSafe(containerCwd, { kind: 'container', project: 'archon-b-x' }, 'win32')
+    ).not.toThrow();
+  });
+
+  test('no-op on non-Windows hosts, where a leading-/ cwd is a real path', () => {
+    expect(() => assertHostSpawnCwdSafe(containerCwd, undefined, 'linux')).not.toThrow();
+  });
+
+  test('no-op on win32 for host-style and non-signature cwds', () => {
+    expect(() => assertHostSpawnCwdSafe('C:\\work\\repo', undefined, 'win32')).not.toThrow();
+    expect(() => assertHostSpawnCwdSafe('/workspace', { kind: 'worktree' }, 'win32')).not.toThrow();
   });
 });
