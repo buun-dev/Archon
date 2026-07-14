@@ -799,7 +799,11 @@ describe('workflowRunCommand', () => {
       'claude',
       '/test/path',
       'assist',
-      {}
+      {},
+      // A worktree run threads its descriptor too — harmless (it means "spawn on the
+      // host at this path", which is what already happened). The descriptor only
+      // CHANGES behavior for `container`, where the host must not spawn at all.
+      { isolation: { kind: 'worktree' } }
     );
   });
 
@@ -845,7 +849,8 @@ describe('workflowRunCommand', () => {
       'codex',
       '/test/path',
       'figma-mcp-smoke',
-      { model: 'gpt-5.4' }
+      { model: 'gpt-5.4' },
+      undefined // host run — no isolation descriptor to thread
     );
   });
 
@@ -1173,6 +1178,76 @@ describe('workflowRunCommand', () => {
       workdir: '/work',
     });
     expect(opts.baseBranch).toBe('master');
+  });
+
+  // 2026-07-14 (run 62cbe603): the title-generator was the last AI call site that
+  // never threaded `isolation`. On a container run it called sendQuery at the
+  // CONTAINER's distro cwd from the HOST, and assertHostSpawnCwdSafe (the 2075ece1
+  // tripwire) correctly REFUSED the spawn — so the title silently never generated.
+  // Asserted LITERALLY on the descriptor, not re-derived from the implementation.
+  it('threads the container isolation descriptor into title generation', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const { executeWorkflow, hydrateResumableRun } = await import('@archon/workflows/executor');
+    const conversationDb = await import('@archon/core/db/conversations');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    const workflowDb = await import('@archon/core/db/workflows');
+    const isolationEnvDb = await import('@archon/core/db/isolation-environments');
+    const { loadConfig: loadRepoConfig } = await import('@archon/core');
+    const core = await import('@archon/core');
+
+    const workingPath = '/home/bunny/archon/worktrees/bunshee/task-member-workspaces-p2-keys';
+
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'implement', description: 'Impl' })],
+      errors: [],
+    });
+    (conversationDb.getOrCreateConversation as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'conv-title-container',
+    });
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'cb-container',
+      name: 'test/repo',
+      default_cwd: '/host/repo',
+    });
+    const resumableRun = {
+      id: 'run-title-container',
+      workflow_name: 'implement',
+      working_path: workingPath,
+      user_message: 'plan.md',
+      status: 'failed',
+      conversation_id: 'conv-title-container',
+    };
+    (workflowDb.findResumableRun as ReturnType<typeof mock>).mockResolvedValueOnce(resumableRun);
+    (isolationEnvDb.listByCodebase as ReturnType<typeof mock>).mockResolvedValueOnce([
+      { id: 'iso-container', provider: 'container', working_path: workingPath },
+    ]);
+    (loadRepoConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      isolation: { provider: 'container' },
+      worktree: { baseBranch: 'master' },
+    });
+    (hydrateResumableRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      preCreatedRun: resumableRun,
+      priorCompletedNodes: new Map([['bootstrap', 'ok']]),
+    });
+    (executeWorkflow as ReturnType<typeof mock>).mockResolvedValueOnce({
+      success: true,
+      workflowRunId: 'run-title-container',
+    });
+    (core.generateAndSetTitle as ReturnType<typeof mock>).mockClear();
+
+    await workflowRunCommand('/host/repo', 'implement', 'plan.md', { resume: true });
+
+    const titleArgs = (core.generateAndSetTitle as ReturnType<typeof mock>).mock.calls.at(-1)!;
+    // The cwd handed to the title generator IS the container's distro path...
+    expect(titleArgs[3]).toBe(workingPath);
+    // ...so the descriptor MUST ride along, or the spawn is refused on the host.
+    expect(titleArgs[6]).toEqual({
+      isolation: {
+        kind: 'container',
+        project: 'archon-bunshee-task-member-workspaces-p2-keys',
+        workdir: '/work',
+      },
+    });
   });
 
   it('resumes a container run whose distro working path is invisible to the host fs', async () => {
