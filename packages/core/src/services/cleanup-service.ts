@@ -7,7 +7,7 @@ import * as conversationDb from '../db/conversations';
 import * as sessionDb from '../db/sessions';
 import { SessionNotFoundError } from '../db/sessions';
 import * as codebaseDb from '../db/codebases';
-import { getIsolationProvider, getPrState } from '@archon/isolation';
+import { getIsolationProvider, getPrState, isHostVisibleEnv } from '@archon/isolation';
 import type { WorktreeStatusBreakdown, PrState } from '@archon/isolation';
 import {
   hasUncommittedChanges,
@@ -306,6 +306,12 @@ export async function runScheduledCleanup(): Promise<CleanupReport> {
       try {
         // Skip if already processing or destroyed
         if (env.status !== 'active') continue;
+
+        // A container env's worktree lives in the WSL distro, which the host fs
+        // always reports missing — tearing it down on that false-negative would
+        // destroy a LIVE run's worktree, branch, and row. Its lifecycle belongs
+        // to the substrate (sandbox.sh), not to this sweep.
+        if (!isHostVisibleEnv(env.provider)) continue;
 
         // Check if path still exists
         const pathExists = await worktreeExists(toWorktreePath(env.working_path));

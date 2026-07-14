@@ -533,6 +533,37 @@ describe('runScheduledCleanup', () => {
     expect(mockUpdateStatus).toHaveBeenCalledWith('env-123', 'destroyed');
   });
 
+  // A container env's worktree lives inside the WSL distro, so worktreeExists()
+  // ALWAYS false-negatives on it from the Windows host. Reading that as "path
+  // missing" tears down a LIVE run's environment — worktree, branch, and DB row
+  // (step-5 rollout P1, 2026-07-14). Note the fixture reuses the SAME host-fs
+  // answer as the test above (`worktreeExists` → false); only `provider` differs.
+  test('never host-stats a container env, so a live distro worktree is not torn down', async () => {
+    mockListAllActiveWithCodebase.mockResolvedValueOnce([
+      {
+        id: 'env-container',
+        working_path: '/home/bunny/archon/worktrees/bunshee/task-slice',
+        branch_name: 'sandbox/task-slice',
+        status: 'active',
+        created_by_platform: 'cli',
+        created_at: new Date(),
+        codebase_default_cwd: '/workspace/bunshee',
+        codebase_id: 'codebase-1',
+        workflow_type: 'task',
+        workflow_id: 'slice',
+        provider: 'container',
+        metadata: {},
+      },
+    ]);
+
+    const report = await runScheduledCleanup();
+
+    expect(mockWorktreeExists).not.toHaveBeenCalled();
+    expect(mockDestroy).not.toHaveBeenCalled();
+    expect(mockUpdateStatus).not.toHaveBeenCalledWith('env-container', 'destroyed');
+    expect(report.removed).toHaveLength(0);
+  });
+
   test('removes merged branches without uncommitted changes', async () => {
     mockListAllActiveWithCodebase.mockResolvedValueOnce([
       {

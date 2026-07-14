@@ -31,7 +31,7 @@ export type {
   IsolationResolution,
 } from './types';
 
-export { isPRIsolationRequest } from './types';
+export { isPRIsolationRequest, isHostVisibleEnv } from './types';
 
 // --- Store ---
 export type { IIsolationStore } from './store';
