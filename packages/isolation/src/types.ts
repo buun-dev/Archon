@@ -12,6 +12,23 @@ import type { RepoPath, BranchName } from '@archon/git';
 
 export type IsolationProviderType = 'worktree' | 'container' | 'vm' | 'remote';
 
+/**
+ * Can the HOST filesystem answer whether this environment's working path exists?
+ *
+ * A `container` env's worktree lives inside the WSL distro (`/home/<user>/archon/…`),
+ * a path the Windows host cannot stat: `worktreeExists()` and `existsSync()` ALWAYS
+ * report false for it. Any caller that reads that false-negative as "the worktree is
+ * gone" will destroy the environment row of a **live** run — and that row is the
+ * substrate's only source of truth once the dispatching process is gone, so the run
+ * becomes unresumable. The substrate owns a container env's liveness, never the host fs.
+ *
+ * Callers must ask this BEFORE host-statting `working_path`. Keep it the single copy
+ * of the rule: it previously lived inline in three places and only one was ever fixed.
+ */
+export function isHostVisibleEnv(provider: IsolationProviderType): boolean {
+  return provider !== 'container';
+}
+
 export type IsolationWorkflowType = 'issue' | 'pr' | 'review' | 'thread' | 'task';
 
 export type EnvironmentStatus = 'active' | 'destroyed';

@@ -5,6 +5,10 @@
  */
 import { createLogger } from '@archon/paths';
 import { toWorktreePath, worktreeExists } from '@archon/git';
+// Leaf subpath, not the barrel: `@archon/isolation`'s index pulls in the git
+// runtime, which this module's tests double only partially.
+import { isHostVisibleEnv } from '@archon/isolation/types';
+import type { IsolationProviderType } from '@archon/isolation/types';
 import * as isolationDb from '../db/isolation-environments';
 import { cleanupStaleWorktrees, cleanupMergedWorktrees } from '../services/cleanup-service';
 import type { CleanupOperationResult } from '../services/cleanup-service';
@@ -46,6 +50,7 @@ export { type CleanupOperationResult } from '../services/cleanup-service';
 async function reconcileGhosts(
   envs: readonly {
     id: string;
+    provider: IsolationProviderType;
     working_path: string;
     branch_name: string | null;
     workflow_id: string;
@@ -53,6 +58,10 @@ async function reconcileGhosts(
 ): Promise<number> {
   let reconciled = 0;
   for (const env of envs) {
+    // The host fs cannot see a container env's distro path and always reports it
+    // missing — ghosting on that would destroy a LIVE run's row (and strand its
+    // resume, which reads this row to learn the run was containerized).
+    if (!isHostVisibleEnv(env.provider)) continue;
     try {
       const exists = await worktreeExists(toWorktreePath(env.working_path));
       if (!exists) {

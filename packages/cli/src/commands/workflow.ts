@@ -21,6 +21,7 @@ import {
   configureIsolation,
   getIsolationProvider,
   composeProjectFromWorkingPath,
+  isHostVisibleEnv,
   CONTAINER_WORKDIR,
 } from '@archon/isolation';
 import type { IsolationDescriptor } from '@archon/providers';
@@ -867,7 +868,7 @@ export async function workflowRunCommand(
     // Reuse the working path from the resumable run (verify it still exists —
     // host worktrees only; container worktrees live in the distro).
     if (resumable.working_path) {
-      if (matchingEnv?.provider !== 'container') {
+      if (!matchingEnv || isHostVisibleEnv(matchingEnv.provider)) {
         const { existsSync } = await import('fs');
         if (!existsSync(resumable.working_path)) {
           throw new Error(
