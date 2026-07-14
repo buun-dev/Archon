@@ -584,7 +584,7 @@ async function main(): Promise<number> {
             }
             const rejectReason =
               (values.reason as string | undefined) || positionals.slice(3).join(' ') || undefined;
-            await workflowRejectCommand(rejectRunId, rejectReason, jsonFlag);
+            await workflowRejectCommand(rejectRunId, rejectReason, jsonFlag, detachFlag);
             break;
           }
 

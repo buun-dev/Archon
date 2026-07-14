@@ -1100,7 +1100,15 @@ export async function workflowRunCommand(
         titleAssistantType,
         workingCwd,
         workflowName,
-        titleAssistantConfig
+        titleAssistantConfig,
+        // Thread the substrate descriptor. `workingCwd` is the CONTAINER's distro path
+        // on an isolated run, so a HOST spawn there is exactly the mis-wiring the
+        // 2075ece1 tripwire exists to stop — and it did: on 2026-07-14 (run 62cbe603)
+        // assertHostSpawnCwdSafe REFUSED this call ("cwd is a container path but no
+        // usable container isolation descriptor reached this call site"), so the title
+        // silently never generated. Every other AI call site threads `isolation`; this
+        // one was missed because a cosmetic, fire-and-forget service is easy to forget.
+        isolationDescriptor ? { isolation: isolationDescriptor } : undefined
       );
     } catch (error) {
       getLog().warn(
@@ -1636,13 +1644,19 @@ function printJsonWriteError(runId: string, action: string, error: unknown): voi
 }
 
 /**
- * Shared `--detach` front half for `approve`/`resume`. Validates the run
+ * Shared `--detach` front half for `approve`/`reject`/`resume`. Validates the run
  * READ-ONLY via `precheck`, then hands the whole command to a detached child
  * that re-invokes the same argv (minus `--detach`/`--json`) and owns ALL state
  * mutation in its own process group — so killing the shell that hosted the
  * parent cannot zombie the run mid-resume. The parent must never call
- * approveWorkflow/resumeWorkflow itself, or the decision would be recorded
- * twice (mirrors workflowRunCommand's detach shape: the parent does nothing).
+ * approveWorkflow/rejectWorkflow/resumeWorkflow itself, or the decision would be
+ * recorded twice (mirrors workflowRunCommand's detach shape: the parent does nothing).
+ *
+ * `reject` joined 2026-07-14: it was missed when --detach landed for approve/resume,
+ * leaving the one control verb that still hosted the executor inline — and an
+ * on_reject prompt is a full AI rework pass, so a reaped shell wedged the run
+ * (archon-worker-killed-midrun, 8th). A control-verb fix that covers 2 of 3 verbs
+ * leaves the class alive.
  *
  * Spawns with the PARENT's cwd, never the run's working_path: the child
  * re-resolves everything by run-id, and a container run's working_path is a
@@ -1651,7 +1665,7 @@ function printJsonWriteError(runId: string, action: string, error: unknown): voi
  */
 async function runDetachedControlCommand(
   runId: string,
-  action: 'approve' | 'resume',
+  action: 'approve' | 'reject' | 'resume',
   json: boolean | undefined,
   precheck: () => Promise<WorkflowRun>
 ): Promise<void> {
@@ -1970,8 +1984,34 @@ export async function workflowApproveCommand(
 export async function workflowRejectCommand(
   runId: string,
   reason?: string,
-  json?: boolean
+  json?: boolean,
+  detach?: boolean
 ): Promise<void> {
+  // --detach: hand the reject AND its inline on_reject rework to a detached child,
+  // exactly as `approve` does. Without this, `reject` hosts the executor in the
+  // CALLING shell — the archon-worker-killed-midrun class (8th recurrence,
+  // 2026-07-14): the --detach work covered approve/resume and MISSED reject, so the
+  // one control verb that still ran inline stayed zombie-prone. An on_reject prompt
+  // is a full AI rework pass; a caller whose shell is reaped mid-flight (a harness
+  // task, a closed terminal) leaves the run wedged.
+  if (detach) {
+    await runDetachedControlCommand(runId, 'reject', json, async () => {
+      const run = await workflowDb.getWorkflowRun(runId);
+      if (!run) {
+        throw new Error(`Workflow run not found: ${runId}`);
+      }
+      // Mirrors rejectWorkflow's gate so a wrong-status error surfaces
+      // synchronously instead of dying unseen in the child's log.
+      if (run.status !== 'paused') {
+        throw new Error(
+          `Cannot reject run with status '${run.status}'. Only paused runs can be rejected.`
+        );
+      }
+      return run;
+    });
+    return;
+  }
+
   // JSON mode records the rejection and returns a structured ack WITHOUT the
   // inline auto-resume (an on_reject rework executes the workflow and streams
   // to stdout, corrupting the JSON contract). When `cancelled` is false the run
