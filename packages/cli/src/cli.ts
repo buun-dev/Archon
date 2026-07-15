@@ -273,6 +273,7 @@ async function main(): Promise<number> {
         help: { type: 'boolean', short: 'h' },
         branch: { type: 'string', short: 'b' },
         from: { type: 'string' },
+        base: { type: 'string' },
         'from-branch': { type: 'string' },
         'no-worktree': { type: 'boolean' },
         resume: { type: 'boolean' },
@@ -317,6 +318,7 @@ async function main(): Promise<number> {
   const branchName = values.branch as string | undefined;
   const fromBranch =
     (values.from as string | undefined) ?? (values['from-branch'] as string | undefined);
+  const baseBranch = values.base as string | undefined;
   const noWorktree = values['no-worktree'] as boolean | undefined;
   const resumeFlag = values.resume as boolean | undefined;
   const spawnFlag = values.spawn as boolean | undefined;
@@ -489,6 +491,7 @@ async function main(): Promise<number> {
             const options = {
               branchName,
               fromBranch,
+              baseBranch,
               noWorktree,
               resume: resumeFlag,
               quiet: values.quiet as boolean | undefined,

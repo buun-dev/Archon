@@ -123,6 +123,8 @@ export function isolationDescriptorFromEnv(env: {
 export interface WorkflowRunOptions {
   branchName?: string;
   fromBranch?: string;
+  /** Per-dispatch PR base + cut-from override (epic/<name>). Wins over config. */
+  baseBranch?: string;
   noWorktree?: boolean;
   resume?: boolean;
   codebaseId?: string; // Skips path-based codebase lookup when resume/approve/reject already resolved it
