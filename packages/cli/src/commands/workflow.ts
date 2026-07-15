@@ -891,8 +891,13 @@ export async function workflowRunCommand(
       // every post-resume node referencing $BASE_BRANCH fails its prompt
       // substitution (reuse-review/pr-summary in tdd:4b9ba482).
       if (isolationDescriptor.kind === 'container') {
+        const snapshotBase =
+          typeof matchingEnv.metadata?.baseBranch === 'string'
+            ? matchingEnv.metadata.baseBranch
+            : undefined;
         hostBaseBranch =
-          (await loadRepoConfig(codebase.default_cwd))?.worktree?.baseBranch?.trim() || undefined;
+          snapshotBase ??
+          ((await loadRepoConfig(codebase.default_cwd))?.worktree?.baseBranch?.trim() || undefined);
       }
       getLog().info(
         { envId: isolationEnvId, workingPath: workingCwd, isolationKind: isolationDescriptor.kind },
@@ -1002,7 +1007,9 @@ export async function workflowRunCommand(
         working_path: isolatedEnv.workingPath,
         branch_name: isolatedEnv.branchName,
         created_by_platform: 'cli',
-        metadata: {},
+        // Snapshot the resolved base so resume reads a fixed target, not a
+        // config label that may have moved since dispatch (predecessor footgun).
+        metadata: hostBaseBranch ? { baseBranch: hostBaseBranch } : {},
       });
 
       workingCwd = isolatedEnv.workingPath;
