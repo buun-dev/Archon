@@ -10,6 +10,23 @@ import type {
 } from '@archon/isolation';
 import { createLogger } from '@archon/paths';
 
+/**
+ * Normalize an isolation-env row from the database.
+ * SQLite stores metadata as TEXT (JSON string); PostgreSQL returns parsed
+ * objects. This ensures metadata is always a parsed object regardless of
+ * backend — mirrors normalizeWorkflowRun in db/workflows.ts.
+ */
+function normalizeEnvRow<T extends IsolationEnvironmentRow>(row: T): T {
+  if (typeof row.metadata === 'string') {
+    try {
+      row.metadata = JSON.parse(row.metadata) as Record<string, unknown>;
+    } catch {
+      row.metadata = {};
+    }
+  }
+  return row;
+}
+
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
 function getLog(): ReturnType<typeof createLogger> {
@@ -25,7 +42,7 @@ export async function getById(id: string): Promise<IsolationEnvironmentRow | nul
     'SELECT * FROM remote_agent_isolation_environments WHERE id = $1',
     [id]
   );
-  return result.rows[0] ?? null;
+  return result.rows[0] ? normalizeEnvRow(result.rows[0]) : null;
 }
 
 /**
@@ -41,7 +58,7 @@ export async function findActiveByWorkflow(
      WHERE codebase_id = $1 AND workflow_type = $2 AND workflow_id = $3 AND status = 'active'`,
     [codebaseId, workflowType, workflowId]
   );
-  return result.rows[0] ?? null;
+  return result.rows[0] ? normalizeEnvRow(result.rows[0]) : null;
 }
 
 /**
@@ -56,7 +73,7 @@ export async function listByCodebase(
      ORDER BY created_at DESC`,
     [codebaseId]
   );
-  return result.rows;
+  return result.rows.map(normalizeEnvRow);
 }
 
 /**
@@ -105,7 +122,7 @@ export async function create(env: CreateEnvironmentParams): Promise<IsolationEnv
     { envId: result.rows[0].id, codebaseId: env.codebase_id, branch: env.branch_name },
     'db.isolation_env_create_completed'
   );
-  return result.rows[0];
+  return normalizeEnvRow(result.rows[0]);
 }
 
 /**
