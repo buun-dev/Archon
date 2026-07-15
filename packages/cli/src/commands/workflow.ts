@@ -923,8 +923,13 @@ export async function workflowRunCommand(
     const repoIsolationKind = repoConfigForRun?.isolation?.provider ?? 'worktree';
     // For container runs, resolve the base branch here (host-accessible) — the
     // executor can't read it from its distro-path cwd.
+    // --base wins over config for the PR target here, and for the worktree
+    // cut-from in the provider.create request below (layer B).
+    const flagBase = options.baseBranch?.trim() || undefined;
     if (repoIsolationKind === 'container') {
-      hostBaseBranch = repoConfigForRun?.worktree?.baseBranch?.trim() || undefined;
+      hostBaseBranch = flagBase ?? (repoConfigForRun?.worktree?.baseBranch?.trim() || undefined);
+    } else if (flagBase) {
+      hostBaseBranch = flagBase;
     }
 
     // Configure isolation with repo config loader (same as orchestrator)
