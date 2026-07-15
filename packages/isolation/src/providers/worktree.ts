@@ -125,6 +125,7 @@ export class WorktreeProvider implements IIsolationProvider {
   static readonly capabilities: ProviderCapabilities = {
     startPointOverride: true,
     prCheckout: true,
+    baseOverride: true,
   };
 
   constructor(private loadConfig: RepoConfigLoader = () => Promise.resolve(null)) {}

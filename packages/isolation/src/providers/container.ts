@@ -142,6 +142,7 @@ export class ContainerProvider implements IIsolationProvider {
   static readonly capabilities: ProviderCapabilities = {
     startPointOverride: false,
     prCheckout: false,
+    baseOverride: true,
   };
 
   constructor(private loadConfig: RepoConfigLoader = () => Promise.resolve(null)) {}

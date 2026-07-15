@@ -39,7 +39,7 @@ import type { IsolationProviderType, IsolationRequest, RepoConfigLoader } from '
  * deriving `<repo>` from `request.canonicalRepoPath`. That divergence is an
  * intentional layout choice, not a capability.
  */
-export type CapabilityKey = 'startPointOverride' | 'prCheckout';
+export type CapabilityKey = 'startPointOverride' | 'prCheckout' | 'baseOverride';
 
 /**
  * What a provider promises to honor. Every key is required — a provider cannot
@@ -51,6 +51,7 @@ export type ProviderCapabilities = Record<CapabilityKey, boolean>;
 const CAPABILITY_FIELD: Record<CapabilityKey, string> = {
   startPointOverride: 'fromBranch (--from)',
   prCheckout: "PR checkout (the PR's own branch, or a fork's pinned prSha)",
+  baseOverride: 'baseBranch (--base)',
 };
 
 /**
@@ -63,6 +64,9 @@ export function requiredCapabilities(request: IsolationRequest): CapabilityKey[]
   const required: CapabilityKey[] = [];
   if (request.workflowType === 'task' && request.fromBranch) {
     required.push('startPointOverride');
+  }
+  if (request.workflowType === 'task' && request.baseBranch) {
+    required.push('baseOverride');
   }
   // Every PR workflow needs the PR's code. A provider that always cuts a fresh
   // branch from `origin/<base>` would review the base branch and report on it

@@ -114,6 +114,10 @@ describe('WorktreeProvider', () => {
     mockRm.mockClear();
   });
 
+  test('declares baseOverride capability', () => {
+    expect(WorktreeProvider.capabilities.baseOverride).toBe(true);
+  });
+
   describe('generateBranchName', () => {
     test('generates issue-N for issue workflows', () => {
       const request: IsolationRequest = {
