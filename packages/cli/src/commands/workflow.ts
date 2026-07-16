@@ -640,6 +640,11 @@ export async function workflowRunCommand(
         'Remove --from or drop --no-worktree.'
     );
   }
+  if (options.noWorktree && options.baseBranch !== undefined) {
+    throw new Error(
+      '--base has no effect with --no-worktree.\n' + 'Remove --base or drop --no-worktree.'
+    );
+  }
   if (options.resume && options.branchName !== undefined) {
     throw new Error(
       '--resume and --branch are mutually exclusive.\n' +
