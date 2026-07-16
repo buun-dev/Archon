@@ -2395,6 +2395,27 @@ describe('WorktreeProvider', () => {
       });
     });
 
+    test('honors per-dispatch --base override over configured base branch for worktree cut-from', async () => {
+      worktreeExistsSpy.mockResolvedValue(false);
+      const configLoader: RepoConfigLoader = async () => ({ baseBranch: 'main' });
+      provider = new WorktreeProvider(configLoader);
+
+      const request: IsolationRequest = {
+        ...baseRequest,
+        workflowType: 'task',
+        identifier: 'test-feature',
+        baseBranch: 'epic/foo',
+      };
+
+      await provider.create(request);
+
+      // request.baseBranch (--base) must win over worktreeConfig.baseBranch ('main') —
+      // otherwise WorktreeProvider declares baseOverride but doesn't honor it.
+      expect(syncWorkspaceSpy).toHaveBeenCalledWith('/workspace/owner/repo', 'epic/foo', {
+        mode: 'fast-forward',
+      });
+    });
+
     test('auto-detects when fromBranch is set but workflowType is not task and no baseBranch', async () => {
       worktreeExistsSpy.mockResolvedValue(false);
       const configLoader: RepoConfigLoader = async () => ({});
