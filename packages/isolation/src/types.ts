@@ -104,6 +104,13 @@ export interface TaskIsolationRequest extends IsolationRequestBase {
   identifier: string;
   /** Optional branch to use as start point for new task branch creation */
   fromBranch?: BranchName;
+  /**
+   * Optional per-dispatch base override (epic/<name>): the branch the worktree
+   * is cut from AND the PR targets. Distinct from fromBranch — this couples
+   * cut-from and PR-target; fromBranch decouples them. Requires the provider's
+   * `baseOverride` capability.
+   */
+  baseBranch?: BranchName;
 }
 
 export type IsolationRequest =

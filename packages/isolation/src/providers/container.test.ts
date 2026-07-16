@@ -43,6 +43,10 @@ describe('ContainerProvider', () => {
     expect(provider.providerType).toBe('container');
   });
 
+  test('declares baseOverride capability', () => {
+    expect(ContainerProvider.capabilities.baseOverride).toBe(true);
+  });
+
   test('create() provisions via sandbox.sh up and returns a container env', async () => {
     const env = await provider.create(issueRequest);
 

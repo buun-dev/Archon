@@ -125,6 +125,7 @@ export class WorktreeProvider implements IIsolationProvider {
   static readonly capabilities: ProviderCapabilities = {
     startPointOverride: true,
     prCheckout: true,
+    baseOverride: true,
   };
 
   constructor(private loadConfig: RepoConfigLoader = () => Promise.resolve(null)) {}
@@ -721,9 +722,15 @@ export class WorktreeProvider implements IIsolationProvider {
   ): Promise<{ warnings: string[] }> {
     const repoPath = request.canonicalRepoPath;
 
-    // Sync uses only the configured base branch (or auto-detects via getDefaultBranch).
-    // request.fromBranch is the start-point for worktree creation, not a sync target.
-    const baseBranch = await this.syncWorkspaceBeforeCreate(repoPath, worktreeConfig?.baseBranch);
+    // A per-dispatch --base (task override) wins over the configured base branch
+    // for the worktree cut-from, so WorktreeProvider genuinely honors the
+    // baseOverride capability it declares (mirrors the container path).
+    // fromBranch stays the start-point (resolveStartPoint), not a sync target.
+    const configuredBase =
+      request.workflowType === 'task' && request.baseBranch
+        ? request.baseBranch
+        : worktreeConfig?.baseBranch;
+    const baseBranch = await this.syncWorkspaceBeforeCreate(repoPath, configuredBase);
 
     const override: WorktreeBaseOverride = {
       repoLocal: resolveRepoLocalOverride(worktreeConfig?.path, repoPath),

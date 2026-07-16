@@ -39,7 +39,7 @@ import type { IsolationProviderType, IsolationRequest, RepoConfigLoader } from '
  * deriving `<repo>` from `request.canonicalRepoPath`. That divergence is an
  * intentional layout choice, not a capability.
  */
-export type CapabilityKey = 'startPointOverride' | 'prCheckout';
+export type CapabilityKey = 'startPointOverride' | 'prCheckout' | 'baseOverride';
 
 /**
  * What a provider promises to honor. Every key is required — a provider cannot
@@ -51,6 +51,7 @@ export type ProviderCapabilities = Record<CapabilityKey, boolean>;
 const CAPABILITY_FIELD: Record<CapabilityKey, string> = {
   startPointOverride: 'fromBranch (--from)',
   prCheckout: "PR checkout (the PR's own branch, or a fork's pinned prSha)",
+  baseOverride: 'baseBranch (--base)',
 };
 
 /**
@@ -63,6 +64,9 @@ export function requiredCapabilities(request: IsolationRequest): CapabilityKey[]
   const required: CapabilityKey[] = [];
   if (request.workflowType === 'task' && request.fromBranch) {
     required.push('startPointOverride');
+  }
+  if (request.workflowType === 'task' && request.baseBranch) {
+    required.push('baseOverride');
   }
   // Every PR workflow needs the PR's code. A provider that always cuts a fresh
   // branch from `origin/<base>` would review the base branch and report on it
@@ -97,15 +101,21 @@ export function assertRequestSupported(
 }
 
 /**
- * The base branch a new worktree syncs against: repo config wins, else the
- * repo's default branch. Never a hardcoded fallback — `getDefaultBranch` throws
- * when it cannot resolve, which is the loud behavior `syncWorkspaceBeforeCreate`
- * already relies on.
+ * The base branch a new worktree syncs against: a per-dispatch task `--base`
+ * override wins first, else repo config wins, else the repo's default branch.
+ * Never a hardcoded fallback — `getDefaultBranch` throws when it cannot
+ * resolve, which is the loud behavior `syncWorkspaceBeforeCreate` already
+ * relies on.
  */
 export async function resolveBaseBranch(
   request: IsolationRequest,
   loadConfig: RepoConfigLoader
 ): Promise<string> {
+  // A per-dispatch --base wins over config and default (couples cut-from to
+  // the PR target for epic slices). Narrowed to task — only tasks carry it.
+  if (request.workflowType === 'task' && request.baseBranch) {
+    return request.baseBranch;
+  }
   const config = await loadConfig(request.canonicalRepoPath);
   return config?.baseBranch ?? (await getDefaultBranch(request.canonicalRepoPath));
 }

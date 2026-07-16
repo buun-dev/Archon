@@ -117,12 +117,15 @@ export function isolationDescriptorFromEnv(env: {
  * --no-worktree: opt out of isolation, run in live checkout.
  * --resume: reuse worktree from last failed run.
  * --from: override base branch (start-point for worktree).
+ * --base: per-dispatch override for PR base + worktree cut-from (wins over config).
  *
  * Mutually exclusive: --branch + --no-worktree, --resume + --branch.
  */
 export interface WorkflowRunOptions {
   branchName?: string;
   fromBranch?: string;
+  /** Per-dispatch PR base + cut-from override (epic/<name>). Wins over config. */
+  baseBranch?: string;
   noWorktree?: boolean;
   resume?: boolean;
   codebaseId?: string; // Skips path-based codebase lookup when resume/approve/reject already resolved it
@@ -637,6 +640,11 @@ export async function workflowRunCommand(
         'Remove --from or drop --no-worktree.'
     );
   }
+  if (options.noWorktree && options.baseBranch !== undefined) {
+    throw new Error(
+      '--base has no effect with --no-worktree.\n' + 'Remove --base or drop --no-worktree.'
+    );
+  }
   if (options.resume && options.branchName !== undefined) {
     throw new Error(
       '--resume and --branch are mutually exclusive.\n' +
@@ -921,8 +929,13 @@ export async function workflowRunCommand(
     const repoIsolationKind = repoConfigForRun?.isolation?.provider ?? 'worktree';
     // For container runs, resolve the base branch here (host-accessible) — the
     // executor can't read it from its distro-path cwd.
+    // --base wins over config for the PR target here, and for the worktree
+    // cut-from in the provider.create request below (layer B).
+    const flagBase = options.baseBranch?.trim() || undefined;
     if (repoIsolationKind === 'container') {
-      hostBaseBranch = repoConfigForRun?.worktree?.baseBranch?.trim() || undefined;
+      hostBaseBranch = flagBase ?? (repoConfigForRun?.worktree?.baseBranch?.trim() || undefined);
+    } else if (flagBase) {
+      hostBaseBranch = flagBase;
     }
 
     // Configure isolation with repo config loader (same as orchestrator)
@@ -992,6 +1005,9 @@ export async function workflowRunCommand(
         identifier: branchIdentifier,
         fromBranch: options.fromBranch?.trim()
           ? git.toBranchName(options.fromBranch.trim())
+          : undefined,
+        baseBranch: options.baseBranch?.trim()
+          ? git.toBranchName(options.baseBranch.trim())
           : undefined,
         codebaseId: codebase.id,
         canonicalRepoPath: git.toRepoPath(codebase.default_cwd),

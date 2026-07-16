@@ -154,6 +154,7 @@ Options:
   --cwd <path>               Override working directory (default: current directory)
   --branch, -b <name>        Create worktree for branch (or reuse existing)
   --from, --from-branch <name> Create new branch from specific start point
+  --base <branch>            Per-dispatch base branch override for epic slices (worktree cut-from + PR target)
   --no-worktree              Run on branch directly without worktree isolation
   --resume                   Resume the most recent failed run of the workflow (mutually exclusive with --branch)
   --spawn                    Open setup wizard in a new terminal window (for setup command)
@@ -273,6 +274,7 @@ async function main(): Promise<number> {
         help: { type: 'boolean', short: 'h' },
         branch: { type: 'string', short: 'b' },
         from: { type: 'string' },
+        base: { type: 'string' },
         'from-branch': { type: 'string' },
         'no-worktree': { type: 'boolean' },
         resume: { type: 'boolean' },
@@ -317,6 +319,7 @@ async function main(): Promise<number> {
   const branchName = values.branch as string | undefined;
   const fromBranch =
     (values.from as string | undefined) ?? (values['from-branch'] as string | undefined);
+  const baseBranch = values.base as string | undefined;
   const noWorktree = values['no-worktree'] as boolean | undefined;
   const resumeFlag = values.resume as boolean | undefined;
   const spawnFlag = values.spawn as boolean | undefined;
@@ -478,6 +481,13 @@ async function main(): Promise<number> {
               );
               return 1;
             }
+            if (noWorktree && baseBranch !== undefined) {
+              console.error(
+                'Error: --base has no effect with --no-worktree.\n' +
+                  'Remove --base or drop --no-worktree.'
+              );
+              return 1;
+            }
             if (resumeFlag && branchName !== undefined) {
               console.error(
                 'Error: --resume and --branch are mutually exclusive.\n' +
@@ -489,6 +499,7 @@ async function main(): Promise<number> {
             const options = {
               branchName,
               fromBranch,
+              baseBranch,
               noWorktree,
               resume: resumeFlag,
               quiet: values.quiet as boolean | undefined,

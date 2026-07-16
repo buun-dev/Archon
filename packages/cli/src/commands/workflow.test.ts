@@ -931,6 +931,23 @@ describe('workflowRunCommand', () => {
     ).rejects.toThrow('--from/--from-branch has no effect with --no-worktree');
   });
 
+  it('throws when --base is used with --no-worktree', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'assist', description: 'Help' })],
+      errors: [],
+    });
+
+    // Validation throws before codebase lookup — no need to mock findCodebaseByDefaultCwd
+    await expect(
+      workflowRunCommand('/test/path', 'assist', 'hello', {
+        baseBranch: 'epic/foo',
+        noWorktree: true,
+      })
+    ).rejects.toThrow('--base has no effect with --no-worktree');
+  });
+
   it('creates worktree with auto-generated branch when no --branch given', async () => {
     const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
     const { executeWorkflow } = await import('@archon/workflows/executor');

@@ -3,6 +3,7 @@ import { describe, test, expect } from 'bun:test';
 import {
   assertRequestSupported,
   requiredCapabilities,
+  resolveBaseBranch,
   resolveStartPoint,
   type ProviderCapabilities,
 } from './create-plan';
@@ -75,6 +76,44 @@ describe('requiredCapabilities', () => {
     expect(requiredCapabilities(taskRequest({ codebaseName: 'buun-dev/marphob-page' }))).toEqual(
       []
     );
+  });
+});
+
+describe('resolveBaseBranch override', () => {
+  const canonical = '/repo' as IsolationRequest['canonicalRepoPath'];
+
+  test('returns the request baseBranch without reading config', async () => {
+    let configRead = false;
+    const loadConfig = async () => {
+      configRead = true;
+      return { baseBranch: 'master' };
+    };
+    const result = await resolveBaseBranch(
+      {
+        workflowType: 'task',
+        identifier: 'slice-a',
+        codebaseId: 'cb-1',
+        canonicalRepoPath: canonical,
+        baseBranch: 'epic/x' as never,
+      } as IsolationRequest,
+      loadConfig as never
+    );
+    expect(result).toBe('epic/x');
+    expect(configRead).toBe(false);
+  });
+
+  test('falls back to config when no override', async () => {
+    const loadConfig = async () => ({ baseBranch: 'master' });
+    const result = await resolveBaseBranch(
+      {
+        workflowType: 'task',
+        identifier: 'slice-a',
+        codebaseId: 'cb-1',
+        canonicalRepoPath: canonical,
+      } as IsolationRequest,
+      loadConfig as never
+    );
+    expect(result).toBe('master');
   });
 });
 
@@ -156,6 +195,58 @@ describe('ContainerProvider capability declaration', () => {
 
 describe('WorktreeProvider capability declaration', () => {
   test('is the reference implementation — honors every capability', () => {
-    expect(WorktreeProvider.capabilities).toEqual({ startPointOverride: true, prCheckout: true });
+    expect(WorktreeProvider.capabilities).toEqual({
+      startPointOverride: true,
+      prCheckout: true,
+      baseOverride: true,
+    });
+  });
+});
+
+describe('baseOverride capability', () => {
+  const taskReq = (extra: Partial<IsolationRequest> = {}): IsolationRequest =>
+    ({
+      workflowType: 'task',
+      identifier: 'slice-a',
+      codebaseId: 'cb-1',
+      canonicalRepoPath: '/repo' as IsolationRequest['canonicalRepoPath'],
+      ...extra,
+    }) as IsolationRequest;
+
+  test('requiredCapabilities includes baseOverride when a task sets baseBranch', () => {
+    expect(requiredCapabilities(taskReq({ baseBranch: 'epic/x' as never }))).toContain(
+      'baseOverride'
+    );
+  });
+
+  test('requiredCapabilities omits baseOverride when baseBranch is absent', () => {
+    expect(requiredCapabilities(taskReq())).not.toContain('baseOverride');
+  });
+
+  test('assertRequestSupported throws when provider lacks baseOverride', () => {
+    const caps: ProviderCapabilities = {
+      startPointOverride: true,
+      prCheckout: true,
+      baseOverride: false,
+    };
+    expect(() =>
+      assertRequestSupported(taskReq({ baseBranch: 'epic/x' as never }), caps, 'worktree')
+    ).toThrow();
+  });
+
+  test('assertRequestSupported passes when provider has baseOverride', () => {
+    const caps: ProviderCapabilities = {
+      startPointOverride: true,
+      prCheckout: true,
+      baseOverride: true,
+    };
+    expect(() =>
+      assertRequestSupported(taskReq({ baseBranch: 'epic/x' as never }), caps, 'container')
+    ).not.toThrow();
+  });
+
+  test('both providers declare baseOverride: true', () => {
+    expect(ContainerProvider.capabilities.baseOverride).toBe(true);
+    expect(WorktreeProvider.capabilities.baseOverride).toBe(true);
   });
 });
