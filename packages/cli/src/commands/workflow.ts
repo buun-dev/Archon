@@ -1000,6 +1000,9 @@ export async function workflowRunCommand(
         fromBranch: options.fromBranch?.trim()
           ? git.toBranchName(options.fromBranch.trim())
           : undefined,
+        baseBranch: options.baseBranch?.trim()
+          ? git.toBranchName(options.baseBranch.trim())
+          : undefined,
         codebaseId: codebase.id,
         canonicalRepoPath: git.toRepoPath(codebase.default_cwd),
         description: `CLI workflow: ${workflowName}`,

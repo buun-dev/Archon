@@ -110,6 +110,11 @@ export async function resolveBaseBranch(
   request: IsolationRequest,
   loadConfig: RepoConfigLoader
 ): Promise<string> {
+  // A per-dispatch --base wins over config and default (couples cut-from to
+  // the PR target for epic slices). Narrowed to task — only tasks carry it.
+  if (request.workflowType === 'task' && request.baseBranch) {
+    return request.baseBranch;
+  }
   const config = await loadConfig(request.canonicalRepoPath);
   return config?.baseBranch ?? (await getDefaultBranch(request.canonicalRepoPath));
 }

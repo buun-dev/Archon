@@ -3,6 +3,7 @@ import { describe, test, expect } from 'bun:test';
 import {
   assertRequestSupported,
   requiredCapabilities,
+  resolveBaseBranch,
   resolveStartPoint,
   type ProviderCapabilities,
 } from './create-plan';
@@ -75,6 +76,44 @@ describe('requiredCapabilities', () => {
     expect(requiredCapabilities(taskRequest({ codebaseName: 'buun-dev/marphob-page' }))).toEqual(
       []
     );
+  });
+});
+
+describe('resolveBaseBranch override', () => {
+  const canonical = '/repo' as IsolationRequest['canonicalRepoPath'];
+
+  test('returns the request baseBranch without reading config', async () => {
+    let configRead = false;
+    const loadConfig = async () => {
+      configRead = true;
+      return { baseBranch: 'master' };
+    };
+    const result = await resolveBaseBranch(
+      {
+        workflowType: 'task',
+        identifier: 'slice-a',
+        codebaseId: 'cb-1',
+        canonicalRepoPath: canonical,
+        baseBranch: 'epic/x' as never,
+      } as IsolationRequest,
+      loadConfig as never
+    );
+    expect(result).toBe('epic/x');
+    expect(configRead).toBe(false);
+  });
+
+  test('falls back to config when no override', async () => {
+    const loadConfig = async () => ({ baseBranch: 'master' });
+    const result = await resolveBaseBranch(
+      {
+        workflowType: 'task',
+        identifier: 'slice-a',
+        codebaseId: 'cb-1',
+        canonicalRepoPath: canonical,
+      } as IsolationRequest,
+      loadConfig as never
+    );
+    expect(result).toBe('master');
   });
 });
 
