@@ -101,10 +101,11 @@ export function assertRequestSupported(
 }
 
 /**
- * The base branch a new worktree syncs against: repo config wins, else the
- * repo's default branch. Never a hardcoded fallback — `getDefaultBranch` throws
- * when it cannot resolve, which is the loud behavior `syncWorkspaceBeforeCreate`
- * already relies on.
+ * The base branch a new worktree syncs against: a per-dispatch task `--base`
+ * override wins first, else repo config wins, else the repo's default branch.
+ * Never a hardcoded fallback — `getDefaultBranch` throws when it cannot
+ * resolve, which is the loud behavior `syncWorkspaceBeforeCreate` already
+ * relies on.
  */
 export async function resolveBaseBranch(
   request: IsolationRequest,

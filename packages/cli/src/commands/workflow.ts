@@ -117,6 +117,7 @@ export function isolationDescriptorFromEnv(env: {
  * --no-worktree: opt out of isolation, run in live checkout.
  * --resume: reuse worktree from last failed run.
  * --from: override base branch (start-point for worktree).
+ * --base: per-dispatch override for PR base + worktree cut-from (wins over config).
  *
  * Mutually exclusive: --branch + --no-worktree, --resume + --branch.
  */
