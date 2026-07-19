@@ -190,7 +190,21 @@ export class ContainerProvider implements IIsolationProvider {
     );
 
     const containerId = await this.resolveContainerId(project);
-    return this.buildEnv(repo, slug, workingPath, project, containerId, request);
+    return this.buildEnv(repo, slug, workingPath, project, containerId, request, baseBranch);
+  }
+
+  /**
+   * Reattach to an existing sandbox on RESUME (D8 recovery). The container may be
+   * STOPPED after a kill or a docker restart — resolveContainerId `start`s the
+   * agent before resolving — so this rebuilds the container execContext from the
+   * working path WITHOUT re-running `sandbox.sh up` (no re-provision). Throws if
+   * the stack is gone (torn down); a resume then cannot continue in-container.
+   */
+  async reattach(envId: string): Promise<ContainerEnvironment> {
+    const { repo, slug } = repoSlugFromWorkingPath(envId);
+    const project = composeProjectFor(repo, slug);
+    const containerId = await this.resolveContainerId(project);
+    return this.buildEnv(repo, slug, envId, project, containerId);
   }
 
   /**
@@ -338,7 +352,8 @@ export class ContainerProvider implements IIsolationProvider {
     workingPath: string,
     project: string,
     containerId: string,
-    request?: IsolationRequest
+    request?: IsolationRequest,
+    baseBranch?: string
   ): ContainerEnvironment {
     const execContext: Extract<ExecutionContext, { kind: 'container' }> = {
       kind: 'container',
@@ -360,6 +375,7 @@ export class ContainerProvider implements IIsolationProvider {
       execContext,
       // sandbox.sh creates the branch as `sandbox/<slug>` off the base clone.
       branchName: toBranchName(`sandbox/${slug}`),
+      ...(baseBranch ? { baseBranch: toBranchName(baseBranch) } : {}),
       status: 'active',
       createdAt: new Date(),
       metadata: { adopted: false, ...(request ? { request } : {}) },

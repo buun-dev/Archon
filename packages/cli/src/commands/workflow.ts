@@ -24,6 +24,8 @@ import {
   configureIsolation,
   selectIsolationProvider,
   isContainerEnvironment,
+  isHostVisibleEnv,
+  ContainerProvider,
   resolveFolderBackend,
   classifyIsolationError,
 } from '@archon/isolation';
@@ -1083,6 +1085,13 @@ export async function workflowRunCommand(
   // the host; the folder-backend seam sets this and is where `--container` flips
   // it to a container context.
   let execContext: ExecutionContext = { kind: 'host' };
+  // On a CONTAINER resume, the fixed base branch snapshotted into the env metadata
+  // at create time — used instead of re-deriving from a (possibly moved) config label.
+  let resumeBaseBranch: string | undefined;
+  // Repo-config loader (worktree section) shared by the container-provider
+  // constructions on both the resume and fresh-dispatch paths.
+  const worktreeConfigLoader: RepoConfigLoader = async repoPath =>
+    (await loadRepoConfig(repoPath))?.worktree ?? null;
   // Container backend handle for a folder-project container run — held so the CLI
   // tears it down after a TERMINAL run (a PAUSED run keeps its suspended container
   // for resume). The engine drives suspend + the write-back gate through the same
@@ -1135,27 +1144,54 @@ export async function workflowRunCommand(
     // which calls backend.resumeEnv when `resumable.metadata.isolation` is
     // 'container'). Nothing to reject here anymore.
 
-    // Reuse the working path from the resumable run (verify it still exists)
-    if (resumable.working_path) {
-      const { existsSync } = await import('fs');
-      if (!existsSync(resumable.working_path)) {
-        throw new Error(
-          `Cannot resume: the working path from the run no longer exists: ${resumable.working_path}\n` +
-            'The worktree may have been cleaned up. Start a fresh run with --branch instead.'
-        );
+    // Look up the isolation environment FIRST — its provider decides whether the
+    // host can even stat the working path (a container env lives in the WSL distro).
+    // Capture the path in a const so it stays narrowed inside the `.find` closure.
+    const resumableWorkingPath = resumable.working_path;
+    const allEnvs = await isolationDb.listByCodebase(codebase.id);
+    const matchingEnv = resumableWorkingPath
+      ? allEnvs.find(e => e.working_path === resumableWorkingPath)
+      : undefined;
+
+    // Reuse the working path from the resumable run. A container env's working_path
+    // is a distro path the host cannot stat, so skip existsSync for it — a false
+    // negative would refuse a LIVE run (D8). Host-visible envs still verify.
+    if (resumableWorkingPath) {
+      const hostVisible = !matchingEnv || isHostVisibleEnv(matchingEnv.provider);
+      if (hostVisible) {
+        const { existsSync } = await import('fs');
+        if (!existsSync(resumableWorkingPath)) {
+          throw new Error(
+            `Cannot resume: the working path from the run no longer exists: ${resumableWorkingPath}\n` +
+              'The worktree may have been cleaned up. Start a fresh run with --branch instead.'
+          );
+        }
       }
-      workingCwd = resumable.working_path;
+      workingCwd = resumableWorkingPath;
     }
 
-    // Look up the isolation environment that owns this working path (if any)
-    const allEnvs = await isolationDb.listByCodebase(codebase.id);
-    const matchingEnv = allEnvs.find(e => e.working_path === workingCwd);
     if (matchingEnv) {
       isolationEnvId = matchingEnv.id;
       getLog().info(
         { envId: isolationEnvId, workingPath: workingCwd },
         'workflow.resume_env_found'
       );
+
+      // Container resume (D8): reattach to the (restarted) sandbox container and
+      // rebuild the execContext so post-resume nodes keep routing into the
+      // container. Read the FIXED base snapshotted at create time (a config label
+      // may have moved since dispatch — PR#1 container-resume metadata).
+      if (matchingEnv.provider === 'container') {
+        const containerProvider = new ContainerProvider({ loadConfig: worktreeConfigLoader });
+        const reattached = await containerProvider.reattach(matchingEnv.working_path);
+        execContext = reattached.execContext;
+        const snapshottedBase = matchingEnv.metadata?.baseBranch;
+        if (typeof snapshottedBase === 'string') resumeBaseBranch = snapshottedBase;
+        getLog().info(
+          { envId: isolationEnvId, containerId: reattached.execContext.containerId },
+          'workflow.resume_container_reattached'
+        );
+      }
     }
 
     console.log(`Resuming workflow run: ${resumable.id}`);
@@ -1301,8 +1337,6 @@ export async function workflowRunCommand(
     const branchIdentifier = options.branchName ?? `${workflowName}-${Date.now()}`;
 
     // Configure isolation with repo config loader (same as orchestrator)
-    const worktreeConfigLoader: RepoConfigLoader = async repoPath =>
-      (await loadRepoConfig(repoPath))?.worktree ?? null;
     configureIsolation(worktreeConfigLoader);
 
     // Repo-kind container isolation is opt-in via `.archon/config.yaml
@@ -1400,7 +1434,12 @@ export async function workflowRunCommand(
         working_path: isolatedEnv.workingPath,
         branch_name: isolatedEnv.branchName,
         created_by_platform: 'cli',
-        metadata: {},
+        // Snapshot the resolved base so a container RESUME reads a fixed target,
+        // not a config label that may have moved since dispatch (PR#1).
+        metadata:
+          isContainerEnvironment(isolatedEnv) && isolatedEnv.baseBranch
+            ? { baseBranch: isolatedEnv.baseBranch }
+            : {},
       });
 
       workingCwd = isolatedEnv.workingPath;
@@ -1638,7 +1677,7 @@ export async function workflowRunCommand(
           codebaseId: codebase?.id,
           source: workflowSource,
           userId: cliUserId,
-          baseBranch: flagBase ?? codebaseDefaultBranch,
+          baseBranch: resumeBaseBranch ?? flagBase ?? codebaseDefaultBranch,
           execContext,
           container: containerRunCtx,
           ...prepared,
@@ -1647,7 +1686,7 @@ export async function workflowRunCommand(
           codebaseId: codebase?.id,
           source: workflowSource,
           userId: cliUserId,
-          baseBranch: flagBase ?? codebaseDefaultBranch,
+          baseBranch: resumeBaseBranch ?? flagBase ?? codebaseDefaultBranch,
           execContext,
           container: containerRunCtx,
         };

@@ -52,6 +52,8 @@ describe('ContainerProvider.create', () => {
     expect(env.execContext.pathMap?.some(m => m.containerPrefix === '/archon-meta')).toBe(true);
     expect(env.branchName).toBe('sandbox/task-my-task');
     expect(env.project).toBe('archon-marphob-page-task-my-task');
+    // Resolved base snapshotted for a fixed-base resume (PR#1).
+    expect(env.baseBranch).toBe('main');
   });
 
   test('resolves the container id via `docker compose -p <project> ps -q agent`', async () => {
@@ -138,5 +140,30 @@ describe('ContainerProvider.create', () => {
         isForkPR: false,
       } as IsolationRequest)
     ).rejects.toThrow(/pr|pull request/i);
+  });
+});
+
+describe('ContainerProvider.reattach (resume / D8 recovery)', () => {
+  test('restarts the agent then rebuilds the execContext from a working path', async () => {
+    const { calls, runSandbox, docker } = makeRunners('cid-resumed');
+    const provider = new ContainerProvider({ runSandbox, docker, loadConfig: async () => null });
+
+    const env = await provider.reattach('/home/bunny/archon/worktrees/marphob-page/task-x');
+
+    // The container may be stopped after a kill/docker-restart, so `start` runs
+    // BEFORE the id is resolved (D8).
+    const started = calls.docker.find(a => a.includes('start'));
+    expect(started).toContain('archon-marphob-page-task-x');
+    expect(started).toContain('agent');
+
+    expect(env.provider).toBe('container');
+    if (env.provider !== 'container') throw new Error('expected a container environment');
+    expect(env.execContext.containerId).toBe('cid-resumed');
+    expect(env.execContext.workdir).toBe('/work');
+    expect(env.execContext.pathMap?.some(m => m.containerPrefix === '/archon-meta')).toBe(true);
+    expect(env.project).toBe('archon-marphob-page-task-x');
+    expect(env.branchName).toBe('sandbox/task-x');
+    // reattach must NOT re-run the sandbox `up` (no re-provision on resume).
+    expect(calls.sandbox.find(a => a[0] === 'up')).toBeUndefined();
   });
 });

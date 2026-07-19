@@ -190,6 +190,13 @@ export interface ContainerEnvironment extends IsolatedEnvironmentBase {
   execContext: Extract<ExecutionContext, { kind: 'container' }>;
   /** Compose project `archon-<repo>-<slug>` — re-addresses the stack on resume/teardown. */
   project: string;
+  /**
+   * The base branch actually resolved at create time (baseOverride ?? config ??
+   * codebase default ?? autodetect). Snapshotted into the env-row metadata so a
+   * RESUME reads a FIXED base, not a config label that may have moved since
+   * dispatch. Absent on reattach (a resume reads the snapshot, not this).
+   */
+  baseBranch?: BranchName;
   metadata: WorktreeMetadata;
 }
 
