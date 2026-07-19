@@ -67,6 +67,7 @@ import {
   collectContainerIncompatibleProviders,
   containerCommandName,
   buildSubprocessDockerArgs,
+  remapTextualPath,
 } from './dag-executor';
 import { writeNodeArtifact } from './artifacts-index';
 import { getWorkflowEventEmitter, type WorkflowEmitterEvent } from './event-emitter';
@@ -998,6 +999,79 @@ describe('substituteNodeOutputRefs -- large output file substitution', () => {
     // Should fall back to inline shell-quoting instead of crashing
     expect(result).not.toContain('$(cat ');
     expect(result).toBe(`echo '${largeOutput}'`);
+  });
+});
+
+describe('spill files under a container pathMap (textual channel, Session-5 fix)', () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = join(tmpdir(), `archon-test-spill-remap-${Date.now()}`);
+    await mkdir(tempDir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  it('bakes the remapped in-container path into bash text while writing the file host-side', async () => {
+    const largeOutput = 'x'.repeat(33_000);
+    const outputs = new Map([['a', makeOutput('completed', largeOutput)]]);
+    const pathMap = [{ hostPrefix: tempDir, containerPrefix: '/archon-meta/logs' }];
+    const result = substituteNodeOutputRefs('echo $a.output', outputs, true, tempDir, pathMap);
+    // The bash text runs IN-CONTAINER → it must reference the container-side path…
+    expect(result).toContain("$(cat '/archon-meta/logs/a.nodeoutput')");
+    // …while the engine (host-side) wrote the file at the host path (bind-mounted).
+    const { readFile: readFileAsync } = await import('fs/promises');
+    const written = await readFileAsync(join(tempDir, 'a.nodeoutput'), 'utf-8');
+    expect(written).toBe(largeOutput);
+  });
+
+  it('without a pathMap the reference stays host-pathed (host runs unchanged)', () => {
+    const largeOutput = 'x'.repeat(33_000);
+    const outputs = new Map([['a', makeOutput('completed', largeOutput)]]);
+    const result = substituteNodeOutputRefs('echo $a.output', outputs, true, tempDir);
+    expect(result).toContain('a.nodeoutput');
+    expect(result).not.toContain('/archon-meta/');
+  });
+
+  it('substituteLoopPrevRefs spill honors the pathMap the same way', async () => {
+    const largeOutput = 'y'.repeat(33_000);
+    const prev = new Map([['a', makeOutput('completed', largeOutput)]]);
+    const pathMap = [{ hostPrefix: tempDir, containerPrefix: '/archon-meta/logs' }];
+    const result = substituteLoopPrevRefs(
+      'echo $LOOP_PREV.a.output',
+      prev,
+      true,
+      tempDir,
+      undefined,
+      undefined,
+      pathMap
+    );
+    expect(result).toContain("$(cat '/archon-meta/logs/a.nodeoutput')");
+  });
+});
+
+describe('remapTextualPath (paths baked into node text)', () => {
+  const pathMap = [
+    { hostPrefix: 'C:\\Users\\u\\.archon\\workspaces\\o\\r', containerPrefix: '/archon-meta' },
+  ];
+
+  it('remaps a mapped host path for a container execContext', () => {
+    const execContext = { kind: 'container' as const, containerId: 'cid', pathMap };
+    expect(
+      remapTextualPath('C:\\Users\\u\\.archon\\workspaces\\o\\r\\artifacts\\runs\\1', execContext)
+    ).toBe('/archon-meta/artifacts/runs/1');
+  });
+
+  it('no-ops for a host execContext', () => {
+    const hostPath = 'C:\\Users\\u\\.archon\\workspaces\\o\\r\\artifacts\\runs\\1';
+    expect(remapTextualPath(hostPath, { kind: 'host' })).toBe(hostPath);
+  });
+
+  it('passes through paths outside the pathMap (e.g. a relative docs/ dir)', () => {
+    const execContext = { kind: 'container' as const, containerId: 'cid', pathMap };
+    expect(remapTextualPath('docs/', execContext)).toBe('docs/');
   });
 });
 

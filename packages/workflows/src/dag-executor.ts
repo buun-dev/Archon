@@ -22,6 +22,7 @@ import type {
   ProviderCapabilities,
   TokenUsage,
   ExecutionContext,
+  ContainerPathMap,
   OverlayChangeSummary,
 } from '@archon/providers/types';
 import {
@@ -586,21 +587,37 @@ function shellQuote(value: string): string {
 }
 
 /**
+ * Remap a host path for TEXTUAL substitution into node text (bash/script source,
+ * AI prompts, spill-file references): the text executes where the node RUNS, so a
+ * container run needs the container-side path. The exact mirror of the env-var
+ * remap in buildSubprocessDockerArgs / buildDockerExecArgs — the two channels MUST
+ * stay in sync, because a workflow script may read `$ARTIFACTS_DIR` either as
+ * substituted text or from the environment. No-op for host runs and for paths
+ * outside the pathMap (e.g. a relative `docs/`).
+ */
+export function remapTextualPath(path: string, execContext: ExecutionContext | undefined): string {
+  return execContext?.kind === 'container' ? remapContainerPath(path, execContext.pathMap) : path;
+}
+
+/**
  * Shell-quote a value for bash, or write it to a file and return a $(cat ...) reference
- * when the value exceeds the inline size threshold.
+ * when the value exceeds the inline size threshold. The file is written HOST-side
+ * (the engine's filesystem); `pathMap` remaps the referenced path for bash text that
+ * executes in a container (the spill dir is under the bind-mounted run meta dir).
  */
 function shellQuoteOrFile(
   value: string,
   nodeId: string,
   field: string | undefined,
-  outputFileDir: string | undefined
+  outputFileDir: string | undefined,
+  pathMap?: ContainerPathMap
 ): string {
   if (outputFileDir && value.length > NODE_OUTPUT_FILE_THRESHOLD) {
     const filename = field ? `${nodeId}.${field}.nodeoutput` : `${nodeId}.nodeoutput`;
     const filePath = joinPath(outputFileDir, filename);
     try {
       writeFileSync(filePath, value);
-      return `$(cat ${shellQuote(filePath)})`;
+      return `$(cat ${shellQuote(remapContainerPath(filePath, pathMap))})`;
     } catch (fileErr) {
       const err = fileErr as Error;
       getLog().error(
@@ -625,12 +642,16 @@ function shellQuoteOrFile(
  * @param escapedForBash - When true, wraps substituted values in single quotes so
  *   they are safe to embed in bash scripts passed to `bash -c`. Set true only for
  *   bash node script substitution; AI/command prompt substitution should use false.
+ * @param pathMap - Container path remap for spill-file REFERENCES (the file itself
+ *   is written host-side): bash text that runs in a container must `cat` the
+ *   container-side path. Omit for host runs.
  */
 export function substituteNodeOutputRefs(
   prompt: string,
   nodeOutputs: Map<string, NodeOutput>,
   escapedForBash = false,
-  outputFileDir?: string
+  outputFileDir?: string,
+  pathMap?: ContainerPathMap
 ): string {
   return prompt.replace(
     /\$([a-zA-Z_][a-zA-Z0-9_-]*)\.output(?:\.([a-zA-Z_][a-zA-Z0-9_]*))?/g,
@@ -657,7 +678,7 @@ export function substituteNodeOutputRefs(
       }
       if (!field) {
         return escapedForBash
-          ? shellQuoteOrFile(nodeOutput.output, nodeId, undefined, outputFileDir)
+          ? shellQuoteOrFile(nodeOutput.output, nodeId, undefined, outputFileDir, pathMap)
           : nodeOutput.output;
       }
       // No-silent-drop field access (resolveNodeOutputField): prefers the parsed
@@ -671,7 +692,9 @@ export function substituteNodeOutputRefs(
       if (resolution.kind === 'empty') return escapedForBash ? "''" : '';
       const value = resolution.value;
       if (typeof value === 'string')
-        return escapedForBash ? shellQuoteOrFile(value, nodeId, field, outputFileDir) : value;
+        return escapedForBash
+          ? shellQuoteOrFile(value, nodeId, field, outputFileDir, pathMap)
+          : value;
       // numbers and booleans are shell-safe without quoting: JSON disallows
       // NaN/Infinity so String(number) is digits/sign/'.', and String(boolean) is
       // 'true'/'false' — no shell metacharacters.
@@ -679,7 +702,7 @@ export function substituteNodeOutputRefs(
       // arrays and objects: JSON-stringify so downstream tools (jq, etc.) get a
       // single JSON literal argument.
       const json = JSON.stringify(value);
-      return escapedForBash ? shellQuoteOrFile(json, nodeId, field, outputFileDir) : json;
+      return escapedForBash ? shellQuoteOrFile(json, nodeId, field, outputFileDir, pathMap) : json;
     }
   );
 }
@@ -747,7 +770,8 @@ export function substituteLoopPrevRefs(
   escapedForBash = false,
   outputFileDir?: string,
   knownBodyIds?: ReadonlySet<string>,
-  directBodyIds?: ReadonlySet<string>
+  directBodyIds?: ReadonlySet<string>,
+  pathMap?: ContainerPathMap
 ): string {
   // Fast path: no refs to resolve. When refs ARE present but the map is empty/undefined
   // (iteration 1 — no prior iteration), we still run the replace so each ref resolves to
@@ -795,17 +819,19 @@ export function substituteLoopPrevRefs(
       }
       if (!field) {
         return escapedForBash
-          ? shellQuoteOrFile(nodeOutput.output, nodeId, undefined, outputFileDir)
+          ? shellQuoteOrFile(nodeOutput.output, nodeId, undefined, outputFileDir, pathMap)
           : nodeOutput.output;
       }
       const resolution = resolveNodeOutputField(nodeOutput, nodeId, field);
       if (resolution.kind === 'empty') return escapedForBash ? "''" : '';
       const value = resolution.value;
       if (typeof value === 'string')
-        return escapedForBash ? shellQuoteOrFile(value, nodeId, field, outputFileDir) : value;
+        return escapedForBash
+          ? shellQuoteOrFile(value, nodeId, field, outputFileDir, pathMap)
+          : value;
       if (typeof value === 'number' || typeof value === 'boolean') return String(value);
       const json = JSON.stringify(value);
-      return escapedForBash ? shellQuoteOrFile(json, nodeId, field, outputFileDir) : json;
+      return escapedForBash ? shellQuoteOrFile(json, nodeId, field, outputFileDir, pathMap) : json;
     }
   );
 }
@@ -1241,16 +1267,18 @@ async function executeNodeInternal(
     rawPrompt = node.prompt;
   }
 
-  // Standard variable substitution
+  // Standard variable substitution. An AI node's execContext rides on nodeOptions
+  // (set only for container runs — absent means host), and the in-container agent
+  // needs container-side paths in its prompt text (Session-5 textual remap).
   let substitutedPrompt: string;
   try {
     substitutedPrompt = buildPromptWithContext(
       rawPrompt,
       workflowRun.id,
       workflowRun.user_message,
-      artifactsDir,
+      remapTextualPath(artifactsDir, nodeOptions?.execContext),
       baseBranch,
-      docsDir,
+      remapTextualPath(docsDir, nodeOptions?.execContext),
       issueContext,
       `dag node '${node.id}' prompt`
     );
@@ -2351,21 +2379,31 @@ async function executeBashNode(
     nodeName: node.id,
   });
 
-  // Variable substitution on script
+  // Variable substitution on script. Paths are baked INTO the script text, so a
+  // container run substitutes the container-side paths (Session-5 fix: the env-var
+  // channel alone is dead code for scripts that reference `$ARTIFACTS_DIR` as a
+  // literal — substitution replaces it before the container ever runs).
+  const containerPathMap = execContext.kind === 'container' ? execContext.pathMap : undefined;
   const { prompt: substitutedScript } = substituteWorkflowVariables(
     node.bash,
     workflowRun.id,
     workflowRun.user_message,
-    artifactsDir,
+    remapTextualPath(artifactsDir, execContext),
     baseBranch,
-    docsDir,
+    remapTextualPath(docsDir, execContext),
     issueContext,
     undefined,
     undefined,
     undefined,
     { shellSafe: true }
   );
-  const finalScript = substituteNodeOutputRefs(substitutedScript, nodeOutputs, true, logDir);
+  const finalScript = substituteNodeOutputRefs(
+    substitutedScript,
+    nodeOutputs,
+    true,
+    logDir,
+    containerPathMap
+  );
 
   const timeout = node.timeout ?? SUBPROCESS_DEFAULT_TIMEOUT;
   // Archon-managed env only — runSubprocess adds the host env for host runs and
@@ -2604,13 +2642,15 @@ async function executeScriptNode(
   // below instead (read via process.env.X / os.environ['X']), mirroring the
   // executeBashNode hardening. $nodeId.output refs keep raw substitution — the
   // strict producer contract bounds those values (#2115).
+  // Container runs substitute container-side paths into the source text — the
+  // script executes in the container (Session-5 textual-channel remap).
   const { prompt: substitutedScript } = substituteWorkflowVariables(
     node.script,
     workflowRun.id,
     workflowRun.user_message,
-    artifactsDir,
+    remapTextualPath(artifactsDir, execContext),
     baseBranch,
-    docsDir,
+    remapTextualPath(docsDir, execContext),
     issueContext,
     undefined,
     undefined,
@@ -3105,7 +3145,8 @@ async function executeLoopGroupNode(
         userInputForIter,
         logDir,
         knownBodyIds,
-        directBodyIds
+        directBodyIds,
+        execContext.kind === 'container' ? execContext.pathMap : undefined
       )
     );
     // Re-layer from the (possibly substituted) body nodes — runLayers walks ctx.layers,
@@ -3258,9 +3299,9 @@ async function executeLoopGroupNode(
           group.until_bash,
           workflowRun.id,
           workflowRun.user_message,
-          artifactsDir,
+          remapTextualPath(artifactsDir, execContext),
           baseBranch,
-          docsDir,
+          remapTextualPath(docsDir, execContext),
           issueContext,
           i === startIteration ? loopUserInput : undefined,
           undefined,
@@ -3271,7 +3312,8 @@ async function executeLoopGroupNode(
           bashPrompt,
           scopedNodeOutputs,
           true, // escapedForBash
-          logDir
+          logDir,
+          execContext.kind === 'container' ? execContext.pathMap : undefined
         );
         await runSubprocess(execContext, groupBashPath, ['-c', substitutedBash], {
           cwd,
@@ -3511,7 +3553,8 @@ export function applyLoopPrevToBodyNode(
   loopUserInput: string,
   outputFileDir?: string,
   knownBodyIds?: ReadonlySet<string>,
-  directBodyIds?: ReadonlySet<string>
+  directBodyIds?: ReadonlySet<string>,
+  pathMap?: ContainerPathMap
 ): DagNode {
   // Substitute $LOOP_USER_INPUT (user free-text) and $LOOP_PREV.* refs.
   // Resolve $LOOP_PREV FIRST, then splice $LOOP_USER_INPUT — so user input containing a
@@ -3534,7 +3577,8 @@ export function applyLoopPrevToBodyNode(
       escapedForBash,
       outputFileDir,
       knownBodyIds,
-      directBodyIds
+      directBodyIds,
+      pathMap
     );
     if (skipUserInput) return prevResolved;
     const userInputForField = escapedForBash ? shellQuote(loopUserInput) : loopUserInput;
@@ -3578,7 +3622,8 @@ export function applyLoopPrevToBodyNode(
             loopUserInput,
             outputFileDir,
             knownBodyIds,
-            directBodyIds
+            directBodyIds,
+            pathMap
           )
         ),
       },
@@ -3808,9 +3853,9 @@ async function executeLoopNode(
         loop.prompt,
         workflowRun.id,
         workflowRun.user_message,
-        artifactsDir,
+        remapTextualPath(artifactsDir, execContext),
         baseBranch,
-        docsDir,
+        remapTextualPath(docsDir, execContext),
         issueContext,
         i === startIteration ? loopUserInput : '',
         undefined, // rejectionReason
@@ -4221,9 +4266,9 @@ async function executeLoopNode(
           loop.until_bash,
           workflowRun.id,
           workflowRun.user_message,
-          artifactsDir,
+          remapTextualPath(artifactsDir, execContext),
           baseBranch,
-          docsDir,
+          remapTextualPath(docsDir, execContext),
           issueContext,
           undefined,
           undefined,
@@ -4234,7 +4279,8 @@ async function executeLoopNode(
           bashPrompt,
           nodeOutputs,
           true, // escapedForBash
-          logDir
+          logDir,
+          execContext.kind === 'container' ? execContext.pathMap : undefined
         );
         await runSubprocess(execContext, loopBashPath, ['-c', substitutedBash], {
           cwd,
@@ -4556,9 +4602,9 @@ async function executeApprovalNode(
       node.approval.on_reject.prompt,
       workflowRun.id,
       workflowRun.user_message ?? '',
-      artifactsDir,
+      remapTextualPath(artifactsDir, execContext),
       baseBranch,
-      docsDir,
+      remapTextualPath(docsDir, execContext),
       issueContext,
       undefined, // loopUserInput
       rejectionReason
