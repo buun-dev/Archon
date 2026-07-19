@@ -44,11 +44,16 @@ mock.module('../isolation', () => ({
 }));
 type PrStateValue = 'MERGED' | 'CLOSED' | 'OPEN' | 'NONE';
 const mockGetPrState = mock(() => Promise.resolve('NONE' as PrStateValue));
+const mockContainerDestroy = mock(() => Promise.resolve());
+class MockContainerBackend {
+  destroy = mockContainerDestroy;
+}
 mock.module('@archon/isolation', () => ({
   getIsolationProvider: () => ({
     destroy: mockDestroy,
   }),
   getPrState: mockGetPrState,
+  ContainerBackend: MockContainerBackend,
 }));
 
 // Mock isolation-environments DB
@@ -59,6 +64,7 @@ const mockGetById = mock(() => Promise.resolve(null));
 const mockListByCodebase = mock(() => Promise.resolve([]));
 const mockListByCodebaseWithAge = mock(() => Promise.resolve([]));
 const mockCountActiveByCodebase = mock(() => Promise.resolve(0));
+const mockListActiveContainerEnvironments = mock((): Promise<unknown[]> => Promise.resolve([]));
 mock.module('../db/isolation-environments', () => ({
   listAllActiveWithCodebase: mockListAllActiveWithCodebase,
   updateStatus: mockUpdateStatus,
@@ -67,6 +73,16 @@ mock.module('../db/isolation-environments', () => ({
   listByCodebase: mockListByCodebase,
   listByCodebaseWithAge: mockListByCodebaseWithAge,
   countActiveByCodebase: mockCountActiveByCodebase,
+  listActiveContainerEnvironments: mockListActiveContainerEnvironments,
+  createIsolationStore: () => ({}),
+}));
+
+// Mock workflows DB (getRunByIsolationEnvId — reaper run-status lookup)
+const mockGetRunByIsolationEnvId = mock(
+  (): Promise<{ id: string; status: string } | null> => Promise.resolve(null)
+);
+mock.module('../db/workflows', () => ({
+  getRunByIsolationEnvId: mockGetRunByIsolationEnvId,
 }));
 
 // Mock conversations DB
@@ -111,8 +127,55 @@ import {
   cleanupStaleWorktrees,
   removeEnvironment,
   onConversationClosed,
+  cleanupContainerEnvironments,
   SESSION_RETENTION_DAYS,
 } from './cleanup-service';
+
+describe('cleanupContainerEnvironments — H3 fail-closed on lookup error', () => {
+  const oldRow = {
+    id: 'env-1',
+    codebase_name: 'ops',
+    working_path: '/tmp/ops',
+    days_since_created: 30,
+  };
+  beforeEach(() => {
+    mockListActiveContainerEnvironments.mockReset();
+    mockGetRunByIsolationEnvId.mockReset();
+    mockContainerDestroy.mockReset();
+    mockContainerDestroy.mockImplementation(() => Promise.resolve());
+  });
+
+  test('does NOT destroy when the run lookup throws — reports the error instead', async () => {
+    mockListActiveContainerEnvironments.mockImplementation(() => Promise.resolve([oldRow]));
+    mockGetRunByIsolationEnvId.mockImplementation(() => Promise.reject(new Error('DB down')));
+
+    const report = await cleanupContainerEnvironments(7);
+    expect(mockContainerDestroy).not.toHaveBeenCalled();
+    expect(report.removed).toEqual([]);
+    expect(report.errors).toHaveLength(1);
+    expect(report.errors[0]?.error).toMatch(/lookup failed/);
+  });
+
+  test('never reaps a PAUSED run’s container (awaited state)', async () => {
+    mockListActiveContainerEnvironments.mockImplementation(() => Promise.resolve([oldRow]));
+    mockGetRunByIsolationEnvId.mockImplementation(() =>
+      Promise.resolve({ id: 'run-1', status: 'paused' })
+    );
+    const report = await cleanupContainerEnvironments(7);
+    expect(mockContainerDestroy).not.toHaveBeenCalled();
+    expect(report.skipped).toHaveLength(1);
+  });
+
+  test('reaps a terminal run’s container older than the threshold', async () => {
+    mockListActiveContainerEnvironments.mockImplementation(() => Promise.resolve([oldRow]));
+    mockGetRunByIsolationEnvId.mockImplementation(() =>
+      Promise.resolve({ id: 'run-1', status: 'completed' })
+    );
+    const report = await cleanupContainerEnvironments(7);
+    expect(mockContainerDestroy).toHaveBeenCalledTimes(1);
+    expect(report.removed).toEqual(['env-1']);
+  });
+});
 
 describe('cleanup-service', () => {
   beforeEach(() => {
@@ -531,37 +594,6 @@ describe('runScheduledCleanup', () => {
       canonicalRepoPath: '/workspace/repo',
     });
     expect(mockUpdateStatus).toHaveBeenCalledWith('env-123', 'destroyed');
-  });
-
-  // A container env's worktree lives inside the WSL distro, so worktreeExists()
-  // ALWAYS false-negatives on it from the Windows host. Reading that as "path
-  // missing" tears down a LIVE run's environment — worktree, branch, and DB row
-  // (step-5 rollout P1, 2026-07-14). Note the fixture reuses the SAME host-fs
-  // answer as the test above (`worktreeExists` → false); only `provider` differs.
-  test('never host-stats a container env, so a live distro worktree is not torn down', async () => {
-    mockListAllActiveWithCodebase.mockResolvedValueOnce([
-      {
-        id: 'env-container',
-        working_path: '/home/bunny/archon/worktrees/bunshee/task-slice',
-        branch_name: 'sandbox/task-slice',
-        status: 'active',
-        created_by_platform: 'cli',
-        created_at: new Date(),
-        codebase_default_cwd: '/workspace/bunshee',
-        codebase_id: 'codebase-1',
-        workflow_type: 'task',
-        workflow_id: 'slice',
-        provider: 'container',
-        metadata: {},
-      },
-    ]);
-
-    const report = await runScheduledCleanup();
-
-    expect(mockWorktreeExists).not.toHaveBeenCalled();
-    expect(mockDestroy).not.toHaveBeenCalled();
-    expect(mockUpdateStatus).not.toHaveBeenCalledWith('env-container', 'destroyed');
-    expect(report.removed).toHaveLength(0);
   });
 
   test('removes merged branches without uncommitted changes', async () => {

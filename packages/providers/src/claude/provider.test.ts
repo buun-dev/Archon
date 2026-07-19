@@ -1,4 +1,4 @@
-import { describe, test, expect, mock, beforeEach, spyOn } from 'bun:test';
+import { describe, test, expect, mock, beforeEach, afterEach, spyOn } from 'bun:test';
 import { createMockLogger } from '../test/mocks/logger';
 
 const mockLogger = createMockLogger();
@@ -16,13 +16,7 @@ mock.module('@anthropic-ai/claude-agent-sdk', () => ({
   query: mockQuery,
 }));
 
-import {
-  ClaudeProvider,
-  shouldPassNoEnvFile,
-  applyContainerIsolation,
-  assertHostSpawnCwdSafe,
-  isContainerStylePath,
-} from './provider';
+import { ClaudeProvider, shouldPassNoEnvFile } from './provider';
 import * as claudeModule from './provider';
 import * as binaryResolver from './binary-resolver';
 
@@ -124,7 +118,7 @@ describe('ClaudeProvider', () => {
   describe('getCapabilities', () => {
     test('returns full capability set for Claude provider', () => {
       const caps = client.getCapabilities();
-      expect(caps).toEqual({
+      expect(caps).toMatchObject({
         sessionResume: true,
         mcp: true,
         hooks: true,
@@ -140,6 +134,16 @@ describe('ClaudeProvider', () => {
         sandbox: true,
         nativeTools: true,
       });
+    });
+
+    test('declares a tool-name vocabulary for allowed/denied_tools validation (#2084)', () => {
+      const caps = client.getCapabilities();
+      // Current names present; renamed legacy names deliberately absent so
+      // validation can flag them with a targeted rename hint.
+      expect(caps.knownToolNames).toContain('Agent');
+      expect(caps.knownToolNames).toContain('Bash');
+      expect(caps.knownToolNames).not.toContain('Task');
+      expect(caps.renamedTools).toMatchObject({ Task: 'Agent' });
     });
   });
 
@@ -607,6 +611,87 @@ describe('ClaudeProvider', () => {
       expect(chunks[0]).toMatchObject({ type: 'task_notification', status: 'failed' });
     });
 
+    // --- #2083 — background-task liveness (SDK 0.3.209 background_tasks_changed) ---
+
+    test('yields background_tasks chunk from SDK background_tasks_changed', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield {
+          type: 'system',
+          subtype: 'background_tasks_changed',
+          tasks: [
+            { task_id: 't-1', task_type: 'local_agent', description: 'Research problem A' },
+            { task_id: 't-2', task_type: 'local_agent', description: 'Research problem B' },
+          ],
+        };
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks).toEqual([
+        {
+          type: 'background_tasks',
+          tasks: [
+            { taskId: 't-1', taskType: 'local_agent', description: 'Research problem A' },
+            { taskId: 't-2', taskType: 'local_agent', description: 'Research problem B' },
+          ],
+        },
+      ]);
+    });
+
+    test('forwards an EMPTY background_tasks_changed set (drain signal)', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'system', subtype: 'background_tasks_changed', tasks: [] };
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      // An empty set means "all background work drained" — it must be forwarded,
+      // not dropped, or the executor's wait gate would never release.
+      expect(chunks).toEqual([{ type: 'background_tasks', tasks: [] }]);
+    });
+
+    test('keeps forwarding chunks that arrive AFTER the result (background-task wait window)', async () => {
+      // Single-turn queries keep streaming after the turn-level result while
+      // background tasks drain; streamClaudeMessages must not stop at result.
+      mockQuery.mockImplementation(async function* () {
+        yield {
+          type: 'system',
+          subtype: 'background_tasks_changed',
+          tasks: [{ task_id: 't-1', task_type: 'local_agent', description: 'bg work' }],
+        };
+        yield { type: 'result', subtype: 'success', session_id: 's-1', is_error: false };
+        yield {
+          type: 'system',
+          subtype: 'task_notification',
+          task_id: 't-1',
+          status: 'completed',
+          output_file: '/tmp/t-1.md',
+          summary: 'done',
+        };
+        yield { type: 'system', subtype: 'background_tasks_changed', tasks: [] };
+        yield { type: 'result', subtype: 'success', session_id: 's-1', is_error: false };
+      });
+
+      const types = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        types.push(chunk.type);
+      }
+
+      expect(types).toEqual([
+        'background_tasks',
+        'result',
+        'task_notification',
+        'background_tasks',
+        'result',
+      ]);
+    });
+
     test('yields hook_started chunk from SDK system message', async () => {
       mockQuery.mockImplementation(async function* () {
         yield {
@@ -907,6 +992,35 @@ describe('ClaudeProvider', () => {
       spy.mockRestore();
     });
 
+    test('container run SKIPS host binary resolution (works when host Claude is absent)', async () => {
+      // Simulate a compiled binary with no host Claude — resolveClaudeBinaryPath
+      // would throw. A container run must NOT call it (Claude is baked into the
+      // runner image; the SDK bypasses disk resolution via spawnClaudeCodeProcess).
+      const spy = spyOn(binaryResolver, 'resolveClaudeBinaryPath').mockRejectedValue(
+        new Error('Claude Code not found — set CLAUDE_BIN_PATH')
+      );
+      mockQuery.mockImplementation(async function* () {
+        // empty
+      });
+
+      // Must not throw at resolution time.
+      for await (const _ of client.sendQuery('test', '/workspace', undefined, {
+        execContext: { kind: 'container', containerId: 'c-1' },
+      })) {
+        // consume
+      }
+
+      expect(spy).not.toHaveBeenCalled();
+      const callArgs = mockQuery.mock.calls[0][0] as {
+        options: { pathToClaudeCodeExecutable?: string; spawnClaudeCodeProcess?: unknown };
+      };
+      // SDK spawn hook is set; host disk path is omitted.
+      expect(typeof callArgs.options.spawnClaudeCodeProcess).toBe('function');
+      expect(callArgs.options.pathToClaudeCodeExecutable).toBeUndefined();
+
+      spy.mockRestore();
+    });
+
     test('classifies exit code errors as crash and retries up to 3 times', async () => {
       const error = new Error('process exited with code 1');
       mockQuery.mockImplementation(async function* () {
@@ -1130,6 +1244,176 @@ describe('ClaudeProvider', () => {
       const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
       const env = callArgs.options.env as Record<string, string>;
       expect(env.HOME).toBe('/custom/home');
+    });
+
+    describe('CLAUDE_API_KEY -> ANTHROPIC_API_KEY mapping', () => {
+      const ENV_KEYS_UNDER_TEST = [
+        'CLAUDE_API_KEY',
+        'ANTHROPIC_API_KEY',
+        'CLAUDE_CODE_OAUTH_TOKEN',
+      ] as const;
+      let savedEnv: Partial<Record<(typeof ENV_KEYS_UNDER_TEST)[number], string>>;
+
+      beforeEach(() => {
+        savedEnv = {};
+        for (const key of ENV_KEYS_UNDER_TEST) savedEnv[key] = process.env[key];
+      });
+
+      afterEach(() => {
+        for (const key of ENV_KEYS_UNDER_TEST) {
+          const value = savedEnv[key];
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+      });
+
+      test('maps when only the API key is set', async () => {
+        mockQuery.mockImplementation(async function* () {
+          yield { type: 'result', session_id: 'sid' };
+        });
+
+        delete process.env.ANTHROPIC_API_KEY;
+        delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+        process.env.CLAUDE_API_KEY = 'sk-test';
+
+        for await (const _ of client.sendQuery('test', '/tmp')) {
+          // consume
+        }
+
+        expect(mockQuery).toHaveBeenCalledTimes(1);
+        const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+        const env = callArgs.options.env as Record<string, string>;
+        expect(env.CLAUDE_API_KEY).toBe('sk-test');
+        expect(env.ANTHROPIC_API_KEY).toBe('sk-test');
+        // Only the subprocess env copy is written — never process.env itself
+        expect(process.env.ANTHROPIC_API_KEY).toBeUndefined();
+      });
+
+      test('does not clobber an explicit ANTHROPIC_API_KEY', async () => {
+        mockQuery.mockImplementation(async function* () {
+          yield { type: 'result', session_id: 'sid' };
+        });
+
+        delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+        process.env.CLAUDE_API_KEY = 'sk-a';
+        process.env.ANTHROPIC_API_KEY = 'sk-b';
+
+        for await (const _ of client.sendQuery('test', '/tmp')) {
+          // consume
+        }
+
+        expect(mockQuery).toHaveBeenCalledTimes(1);
+        const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+        const env = callArgs.options.env as Record<string, string>;
+        expect(env.ANTHROPIC_API_KEY).toBe('sk-b');
+      });
+
+      test('OAuth token wins — no injection', async () => {
+        mockQuery.mockImplementation(async function* () {
+          yield { type: 'result', session_id: 'sid' };
+        });
+
+        delete process.env.ANTHROPIC_API_KEY;
+        process.env.CLAUDE_API_KEY = 'sk-a';
+        process.env.CLAUDE_CODE_OAUTH_TOKEN = 'sk-ant-oat01-x';
+
+        for await (const _ of client.sendQuery('test', '/tmp')) {
+          // consume
+        }
+
+        expect(mockQuery).toHaveBeenCalledTimes(1);
+        const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+        const env = callArgs.options.env as Record<string, string>;
+        expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+      });
+
+      test('no key, no injection', async () => {
+        mockQuery.mockImplementation(async function* () {
+          yield { type: 'result', session_id: 'sid' };
+        });
+
+        delete process.env.CLAUDE_API_KEY;
+        delete process.env.ANTHROPIC_API_KEY;
+        delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+
+        for await (const _ of client.sendQuery('test', '/tmp')) {
+          // consume
+        }
+
+        expect(mockQuery).toHaveBeenCalledTimes(1);
+        const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+        const env = callArgs.options.env as Record<string, string>;
+        expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+      });
+
+      test('requestOptions.env still wins over the mapping', async () => {
+        mockQuery.mockImplementation(async function* () {
+          yield { type: 'result', session_id: 'sid' };
+        });
+
+        delete process.env.ANTHROPIC_API_KEY;
+        delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+        process.env.CLAUDE_API_KEY = 'sk-a';
+
+        for await (const _ of client.sendQuery('test', '/tmp', undefined, {
+          env: { ANTHROPIC_API_KEY: 'sk-override' },
+        })) {
+          // consume
+        }
+
+        expect(mockQuery).toHaveBeenCalledTimes(1);
+        const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+        const env = callArgs.options.env as Record<string, string>;
+        expect(env.ANTHROPIC_API_KEY).toBe('sk-override');
+      });
+
+      test('per-user subscription via requestOptions.env suppresses the mirror', async () => {
+        mockQuery.mockImplementation(async function* () {
+          yield { type: 'result', session_id: 'sid' };
+        });
+
+        delete process.env.ANTHROPIC_API_KEY;
+        delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+        process.env.CLAUDE_API_KEY = 'sk-install-fallback';
+
+        // Exact shape produced by deliverCredential()'s anthropic oauth branch:
+        // the delivered env carries OAuth tokens only, never ANTHROPIC_API_KEY.
+        // The mirror must not inject the install key alongside the user's
+        // subscription token (the CLI would prefer the API key and rebill).
+        for await (const _ of client.sendQuery('test', '/tmp', undefined, {
+          env: {
+            CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-user',
+            ANTHROPIC_OAUTH_TOKEN: 'sk-ant-oat01-user',
+          },
+        })) {
+          // consume
+        }
+
+        expect(mockQuery).toHaveBeenCalledTimes(1);
+        const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+        const env = callArgs.options.env as Record<string, string>;
+        expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+        expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe('sk-ant-oat01-user');
+      });
+
+      test('treats an empty-string ANTHROPIC_API_KEY as missing', async () => {
+        mockQuery.mockImplementation(async function* () {
+          yield { type: 'result', session_id: 'sid' };
+        });
+
+        delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+        process.env.CLAUDE_API_KEY = 'sk-test';
+        process.env.ANTHROPIC_API_KEY = '';
+
+        for await (const _ of client.sendQuery('test', '/tmp')) {
+          // consume
+        }
+
+        expect(mockQuery).toHaveBeenCalledTimes(1);
+        const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+        const env = callArgs.options.env as Record<string, string>;
+        expect(env.ANTHROPIC_API_KEY).toBe('sk-test');
+      });
     });
 
     test('passes effort to SDK via nodeConfig', async () => {
@@ -1782,99 +2066,258 @@ describe('sendQuery decomposition behaviors', () => {
   });
 });
 
-// --- step-5 sandbox P2: container AI-node routing (Task 9) ---
+// ─── API errors surfaced as text (#1797) ─────────────────────────────────
+// The SDK does not throw on API-level failures (auth, billing, rate limit).
+// It synthesizes an assistant message (model: '<synthetic>', wrapper
+// `error` code) with the error prose, then emits a result with
+// subtype: 'success' AND is_error: true — the same field pair as the
+// legitimate stop-sequence carve-out (#1425). Shapes below are verbatim
+// captures from claude CLI 2.1.210 (isolated config dir).
 
-describe('applyContainerIsolation', () => {
-  test('returns cliPath unchanged for worktree / absent isolation', () => {
-    const env: NodeJS.ProcessEnv = {};
-    expect(applyContainerIsolation('/orig/cli.js', env, undefined)).toBe('/orig/cli.js');
-    expect(applyContainerIsolation('/orig/cli.js', env, { kind: 'worktree' })).toBe('/orig/cli.js');
-    expect(env.ARCHON_EXEC_PROJECT).toBeUndefined();
-    expect(env.IS_SANDBOX).toBeUndefined();
+describe('API error surfaced as text (#1797)', () => {
+  let client: ClaudeProvider;
+
+  beforeEach(() => {
+    client = new ClaudeProvider({ retryBaseDelayMs: 1 });
+    mockQuery.mockClear();
+    mockLogger.info.mockClear();
+    mockLogger.warn.mockClear();
+    mockLogger.error.mockClear();
+    mockLogger.debug.mockClear();
   });
 
-  test('container isolation swaps to the .mjs shim and injects the exec locators', () => {
-    const env: NodeJS.ProcessEnv = {};
-    const cli = applyContainerIsolation('/orig/cli.js', env, {
-      kind: 'container',
-      project: 'archon-slug',
-      workdir: '/work',
-    });
-    expect(cli).toMatch(/claude-docker-exec\.mjs$/);
-    // .mjs → the SDK auto-adds --no-env-file and spawns via bun (Gate-2 shape).
-    expect(shouldPassNoEnvFile(cli)).toBe(true);
-    expect(env.ARCHON_EXEC_PROJECT).toBe('archon-slug');
-    expect(env.ARCHON_EXEC_WORKDIR).toBe('/work');
-    expect(env.IS_SANDBOX).toBe('1');
-  });
+  interface CollectedStream {
+    chunks: Array<Record<string, unknown>>;
+    error?: Error;
+  }
 
-  test('defaults the in-container workdir to /work when omitted', () => {
-    const env: NodeJS.ProcessEnv = {};
-    applyContainerIsolation(undefined, env, { kind: 'container', project: 'archon-x' });
-    expect(env.ARCHON_EXEC_WORKDIR).toBe('/work');
-  });
-
-  test('ARCHON_SANDBOX_CLAUDE_SHIM overrides the default shim path', () => {
-    const env: NodeJS.ProcessEnv = {};
-    const prev = process.env.ARCHON_SANDBOX_CLAUDE_SHIM;
-    process.env.ARCHON_SANDBOX_CLAUDE_SHIM = 'D:/custom/shim.mjs';
+  async function collect(gen: AsyncIterable<Record<string, unknown>>): Promise<CollectedStream> {
+    const chunks: Array<Record<string, unknown>> = [];
     try {
-      expect(
-        applyContainerIsolation('/orig', env, { kind: 'container', project: 'archon-y' })
-      ).toBe('D:/custom/shim.mjs');
-    } finally {
-      if (prev === undefined) delete process.env.ARCHON_SANDBOX_CLAUDE_SHIM;
-      else process.env.ARCHON_SANDBOX_CLAUDE_SHIM = prev;
+      for await (const chunk of gen) {
+        chunks.push(chunk);
+      }
+    } catch (e) {
+      return { chunks, error: e as Error };
     }
-  });
-});
+    return { chunks };
+  }
 
-// --- sandbox-escape tripwire (bunshee run df04b366): an UNWRAPPED spawn must
-// never target a container-style cwd — on win32 it resolves drive-relative
-// (D:\home\...) and the subprocess silently runs outside the sandbox.
+  function syntheticAssistantMessage(errorCode: string, text: string): Record<string, unknown> {
+    return {
+      type: 'assistant',
+      message: {
+        model: '<synthetic>',
+        stop_reason: 'stop_sequence',
+        content: [{ type: 'text', text }],
+        usage: { input_tokens: 0, output_tokens: 0 },
+      },
+      error: errorCode,
+      session_id: 'sid-api-err',
+    };
+  }
 
-describe('isContainerStylePath', () => {
-  test('matches the sandbox worktree/mount roots', () => {
-    expect(isContainerStylePath('/home/bunny/archon/worktrees/bunshee/task-x')).toBe(true);
-    expect(isContainerStylePath('/work')).toBe(true);
-    expect(isContainerStylePath('/work/backend')).toBe(true);
-    expect(isContainerStylePath('/archon-meta/artifacts/runs/abc')).toBe(true);
-  });
+  function apiErrorResult(text: string): Record<string, unknown> {
+    return {
+      type: 'result',
+      subtype: 'success',
+      is_error: true,
+      api_error_status: null,
+      result: text,
+      stop_reason: 'stop_sequence',
+      terminal_reason: 'api_error',
+      total_cost_usd: 0,
+      session_id: 'sid-api-err',
+    };
+  }
 
-  test('does not match host paths or prefix-lookalikes', () => {
-    expect(isContainerStylePath('C:\\Users\\Buun\\repo')).toBe(false);
-    expect(isContainerStylePath('/workspace')).toBe(false); // '/work' + more word chars
-    expect(isContainerStylePath('/tmp/x')).toBe(false);
-  });
-});
+  test('auth error (Not logged in) throws instead of completing with poisoned output', async () => {
+    mockQuery.mockImplementation(async function* () {
+      yield syntheticAssistantMessage('authentication_failed', 'Not logged in · Please run /login');
+      yield apiErrorResult('Not logged in · Please run /login');
+    });
 
-describe('assertHostSpawnCwdSafe', () => {
-  const containerCwd = '/home/bunny/archon/worktrees/bunshee/task-x';
+    const { chunks, error } = await collect(client.sendQuery('test', '/workspace'));
 
-  test('throws on win32 when no isolation descriptor reached the call site', () => {
-    expect(() => assertHostSpawnCwdSafe(containerCwd, undefined, 'win32')).toThrow(
-      /Refusing host spawn/
+    expect(error).toBeDefined();
+    expect(error?.message).toContain('Claude API error (authentication_failed)');
+    expect(error?.message).toContain('Not logged in');
+    // The poison: no assistant chunk carrying the error prose, no result chunk
+    expect(chunks.filter(c => c.type === 'assistant')).toHaveLength(0);
+    expect(chunks.filter(c => c.type === 'result')).toHaveLength(0);
+    // Auth errors are non-retryable — a single attempt only
+    expect(mockQuery).toHaveBeenCalledTimes(1);
+    expect(mockLogger.error).toHaveBeenCalledWith(
+      expect.objectContaining({ errorCode: 'authentication_failed' }),
+      'claude.result_api_error'
     );
   });
 
-  test('throws on win32 when the descriptor is container-kind but the project is empty', () => {
-    expect(() =>
-      assertHostSpawnCwdSafe(containerCwd, { kind: 'container', project: '' }, 'win32')
-    ).toThrow(/Refusing host spawn/);
+  test('invalid API key (401) shape throws a non-retryable auth error', async () => {
+    mockQuery.mockImplementation(async function* () {
+      yield syntheticAssistantMessage(
+        'authentication_failed',
+        'Invalid API key · Fix external API key'
+      );
+      yield {
+        ...apiErrorResult('Invalid API key · Fix external API key'),
+        api_error_status: 401,
+      };
+    });
+
+    const { error } = await collect(client.sendQuery('test', '/workspace'));
+    expect(error?.message).toContain('Claude API error (authentication_failed)');
+    expect(error?.message).toContain('Invalid API key');
+    expect(mockQuery).toHaveBeenCalledTimes(1);
   });
 
-  test('no-op when the spawn is container-wrapped (shim owns the cwd)', () => {
-    expect(() =>
-      assertHostSpawnCwdSafe(containerCwd, { kind: 'container', project: 'archon-b-x' }, 'win32')
-    ).not.toThrow();
+  test('api_error result without a preceding synthetic message still throws (belt-and-suspenders)', async () => {
+    mockQuery.mockImplementation(async function* () {
+      yield apiErrorResult('Something went wrong upstream');
+    });
+
+    const { chunks, error } = await collect(client.sendQuery('test', '/workspace'));
+    expect(error?.message).toContain('Claude API error (unknown)');
+    expect(error?.message).toContain('Something went wrong upstream');
+    expect(chunks.filter(c => c.type === 'result')).toHaveLength(0);
   });
 
-  test('no-op on non-Windows hosts, where a leading-/ cwd is a real path', () => {
-    expect(() => assertHostSpawnCwdSafe(containerCwd, undefined, 'linux')).not.toThrow();
+  test('synthetic rate_limit error retries per existing subprocess policy, then throws', async () => {
+    mockQuery.mockImplementation(async function* () {
+      yield syntheticAssistantMessage('rate_limit', 'Rate limited · Try again later');
+      yield apiErrorResult('Rate limited · Try again later');
+    });
+
+    const { error } = await collect(client.sendQuery('test', '/workspace'));
+    expect(error?.message).toContain('Claude API error (rate_limit)');
+    // MAX_SUBPROCESS_RETRIES = 3 → 4 attempts total
+    expect(mockQuery).toHaveBeenCalledTimes(4);
+  }, 5_000);
+
+  test('legitimate output that merely mentions the error phrases is untouched', async () => {
+    // A real model turn (real model id, no wrapper error field, clean result)
+    // whose TEXT happens to discuss login errors — e.g. a node writing docs
+    // about auth failures. Must flow through as a normal success.
+    mockQuery.mockImplementation(async function* () {
+      yield {
+        type: 'assistant',
+        message: {
+          model: 'claude-sonnet-4-5',
+          content: [
+            {
+              type: 'text',
+              text: 'If auth fails you may see "Not logged in · Please run /login".',
+            },
+          ],
+        },
+        session_id: 'sid-legit',
+      };
+      yield {
+        type: 'result',
+        subtype: 'success',
+        is_error: false,
+        result: 'done',
+        session_id: 'sid-legit',
+      };
+    });
+
+    const { chunks, error } = await collect(client.sendQuery('test', '/workspace'));
+    expect(error).toBeUndefined();
+    expect(
+      chunks.some(c => typeof c.content === 'string' && c.content.includes('Not logged in'))
+    ).toBe(true);
+    const result = chunks.find(c => c.type === 'result');
+    expect(result).toBeDefined();
+    expect(result).not.toHaveProperty('isError');
   });
 
-  test('no-op on win32 for host-style and non-signature cwds', () => {
-    expect(() => assertHostSpawnCwdSafe('C:\\work\\repo', undefined, 'win32')).not.toThrow();
-    expect(() => assertHostSpawnCwdSafe('/workspace', { kind: 'worktree' }, 'win32')).not.toThrow();
+  test('#1425 stop-sequence carve-out is preserved (is_error + subtype success without API-error signals)', async () => {
+    mockQuery.mockImplementation(async function* () {
+      yield {
+        type: 'assistant',
+        message: {
+          model: 'claude-sonnet-4-5',
+          content: [{ type: 'text', text: 'Rate limit guidance: back off exponentially.' }],
+        },
+        session_id: 'sid-stop-seq',
+      };
+      yield {
+        type: 'result',
+        subtype: 'success',
+        is_error: true,
+        stop_reason: 'stop_sequence',
+        session_id: 'sid-stop-seq',
+      };
+    });
+
+    const { chunks, error } = await collect(client.sendQuery('test', '/workspace'));
+    expect(error).toBeUndefined();
+    const result = chunks.find(c => c.type === 'result');
+    expect(result).toBeDefined();
+    expect(result).not.toHaveProperty('isError');
+    expect(mockLogger.debug).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: 'sid-stop-seq' }),
+      'claude.result_success_validated'
+    );
+  });
+
+  test('real-model message carrying an error code (e.g. max_output_tokens) is not suppressed', async () => {
+    // A REAL (non-synthetic) message can carry a wrapper error code alongside
+    // genuine truncated output. Only '<synthetic>' content is SDK error prose.
+    mockQuery.mockImplementation(async function* () {
+      yield {
+        type: 'assistant',
+        message: {
+          model: 'claude-sonnet-4-5',
+          content: [{ type: 'text', text: 'partial output before truncation' }],
+        },
+        error: 'max_output_tokens',
+        session_id: 'sid-trunc',
+      };
+      yield {
+        type: 'result',
+        subtype: 'success',
+        is_error: false,
+        session_id: 'sid-trunc',
+      };
+    });
+
+    const { chunks, error } = await collect(client.sendQuery('test', '/workspace'));
+    expect(error).toBeUndefined();
+    expect(chunks.some(c => c.content === 'partial output before truncation')).toBe(true);
+  });
+
+  test('fail-safe: synthetic error contradicted by a clean result yields the withheld text late', async () => {
+    mockQuery.mockImplementation(async function* () {
+      yield syntheticAssistantMessage('server_error', 'Upstream hiccup');
+      yield {
+        type: 'result',
+        subtype: 'success',
+        is_error: false,
+        session_id: 'sid-recovered',
+      };
+    });
+
+    const { chunks, error } = await collect(client.sendQuery('test', '/workspace'));
+    expect(error).toBeUndefined();
+    expect(chunks.some(c => c.type === 'assistant' && c.content === 'Upstream hiccup')).toBe(true);
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ errorCode: 'server_error' }),
+      'claude.synthetic_error_not_confirmed'
+    );
+  });
+
+  test('stream ending after a synthetic error without a result throws', async () => {
+    mockQuery.mockImplementation(async function* () {
+      yield syntheticAssistantMessage('billing_error', 'Credit balance is too low');
+      // stream ends abnormally — no result event
+    });
+
+    const { chunks, error } = await collect(client.sendQuery('test', '/workspace'));
+    expect(error?.message).toContain('Claude API error (billing_error)');
+    expect(error?.message).toContain('Credit balance is too low');
+    expect(chunks.filter(c => c.type === 'assistant')).toHaveLength(0);
+    // billing_error classifies as auth → non-retryable
+    expect(mockQuery).toHaveBeenCalledTimes(1);
   });
 });

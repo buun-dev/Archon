@@ -33,6 +33,8 @@ import {
   type Options,
   type HookCallback,
   type HookCallbackMatcher,
+  type SDKAssistantMessageError,
+  type TerminalReason,
 } from '@anthropic-ai/claude-agent-sdk';
 import type {
   IAgentProvider,
@@ -41,10 +43,10 @@ import type {
   TokenUsage,
   ProviderCapabilities,
   NodeConfig,
-  IsolationDescriptor,
 } from '../types';
 import { parseClaudeConfig } from './config';
 import { CLAUDE_CAPABILITIES } from './capabilities';
+import { buildContainerSpawn } from './container-spawn';
 import { resolveClaudeBinaryPath } from './binary-resolver';
 import { buildArchonMcpServer, ARCHON_TOOL_SERVER } from './native-tools';
 import { createLogger } from '@archon/paths';
@@ -106,6 +108,49 @@ function buildSubprocessEnv(): NodeJS.ProcessEnv {
   return { ...process.env };
 }
 
+/**
+ * Build the base env for a CONTAINER run. Deliberately does NOT spread
+ * `process.env` — that is the isolation boundary itself (the container must
+ * never inherit the host's environment). The Archon-managed bag
+ * (`requestOptions.env`: codebase env vars + per-user AI creds + GitHub token)
+ * is layered on top by the caller, and PATH/HOME/CLAUDE_CONFIG_DIR come from the
+ * runner image. Only a minimal, host-independent base is seeded here.
+ */
+function buildContainerBaseEnv(): NodeJS.ProcessEnv {
+  return { TERM: 'dumb' };
+}
+
+/**
+ * Resolve the environment delivered to the Claude subprocess for a request.
+ *
+ * This is the env-isolation ENFORCEMENT POINT. A container run
+ * (`execContext.kind === 'container'`) gets ONLY the Archon-managed bag
+ * (`requestOptions.env`: codebase env + per-user creds + GitHub token) layered
+ * over a minimal base — host `process.env` NEVER crosses the boundary. A host run
+ * inherits the (already-cleaned) host env exactly as before. Exported so the
+ * invariant can be unit-tested with a `process.env` canary.
+ */
+export function buildRequestSubprocessEnv(
+  requestOptions: SendQueryOptions | undefined
+): NodeJS.ProcessEnv {
+  const isContainerRun = requestOptions?.execContext?.kind === 'container';
+  const subprocessEnv = isContainerRun ? buildContainerBaseEnv() : buildSubprocessEnv();
+  const env = requestOptions?.env ? { ...subprocessEnv, ...requestOptions.env } : subprocessEnv;
+  // CLAUDE_API_KEY is Archon's variable name; the Claude Code CLI only reads
+  // ANTHROPIC_API_KEY, so mirror it or solo .env installs never authenticate
+  // (delivery.ts sets both vars on the per-user api_key path). Guarded on the
+  // MERGED env, not process.env: a per-request CLAUDE_CODE_OAUTH_TOKEN (per-user
+  // subscription delivered via requestOptions.env) must stay authoritative — the
+  // CLI prefers ANTHROPIC_API_KEY over the OAuth token, so injecting the install
+  // key alongside it would silently rebill the run. Truthiness is intentional:
+  // empty string = missing credential. Never clobbers an explicit ANTHROPIC_API_KEY.
+  if (env.CLAUDE_API_KEY && !env.ANTHROPIC_API_KEY && !env.CLAUDE_CODE_OAUTH_TOKEN) {
+    env.ANTHROPIC_API_KEY = env.CLAUDE_API_KEY;
+    getLog().debug('claude.api_key_mirrored');
+  }
+  return env;
+}
+
 /** Max retries for transient subprocess failures */
 const MAX_SUBPROCESS_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 2000;
@@ -130,6 +175,54 @@ function classifySubprocessError(
   if (AUTH_PATTERNS.some(p => combined.includes(p))) return 'auth';
   if (SUBPROCESS_CRASH_PATTERNS.some(p => combined.includes(p))) return 'crash';
   return 'unknown';
+}
+
+/**
+ * The Claude Code SDK surfaces API-level failures (auth not configured,
+ * invalid key, billing, rate limit, model errors) as TEXT rather than
+ * throwing: it synthesizes an assistant message (`message.model:
+ * '<synthetic>'`, wrapper `error: SDKAssistantMessageError`) whose content is
+ * the error prose, then emits a result with `subtype: 'success'` and
+ * `is_error: true` — the same field pair as the legitimate stop-sequence
+ * termination carve-out (#1425). Without structural detection the error prose
+ * flows downstream as successful node output (#1797).
+ *
+ * This error carries the SDK's typed error code so retry classification is
+ * structural — never matched against the message text.
+ */
+type SdkErrorCode = SDKAssistantMessageError | 'unknown';
+
+export class ClaudeApiResultError extends Error {
+  readonly sdkErrorCode: SdkErrorCode;
+
+  constructor(sdkErrorCode: SdkErrorCode, resultText: string) {
+    super(`Claude API error (${sdkErrorCode}): ${resultText}`);
+    this.name = 'ClaudeApiResultError';
+    this.sdkErrorCode = sdkErrorCode;
+  }
+}
+
+/**
+ * Map the SDK's typed assistant-message error code onto the existing
+ * subprocess retry classes. Auth-shaped codes are non-retryable (operator
+ * must fix credentials); transient API states reuse the existing
+ * rate_limit/crash backoff. Everything else is 'unknown' — fail fast rather
+ * than retry blindly.
+ */
+function classifySdkErrorCode(code: SdkErrorCode): 'rate_limit' | 'auth' | 'crash' | 'unknown' {
+  switch (code) {
+    case 'authentication_failed':
+    case 'oauth_org_not_allowed':
+    case 'billing_error':
+      return 'auth';
+    case 'rate_limit':
+    case 'overloaded':
+      return 'rate_limit';
+    case 'server_error':
+      return 'crash';
+    default:
+      return 'unknown';
+  }
 }
 
 function getFirstEventTimeoutMs(): number {
@@ -516,69 +609,6 @@ export function shouldPassNoEnvFile(cliPath: string | undefined): boolean {
  * Build base Claude SDK options from cwd, request options, and assistant defaults.
  * Does not include nodeConfig translation — that is handled by applyNodeConfig.
  */
-/**
- * Default host-accessible path to the docker-exec shim. The engine runs on
- * Windows (step-5 B1), so this is a Windows path (forward slashes are fine for
- * node/bun), NOT a `/mnt/c` WSL path. Override with ARCHON_SANDBOX_CLAUDE_SHIM.
- */
-const DEFAULT_CLAUDE_SHIM = 'C:/Users/Buun/.archon/sandbox/claude-docker-exec.mjs';
-
-/**
- * For a container isolation run (step-5 P2), point the claude executable at the
- * docker-exec shim and inject the exec locators into `env` (mutated in place).
- * The SDK spawns the `.mjs` via the engine runtime (bun, which accepts the
- * auto-added `--no-env-file`) and passes `env` through, so the shim re-emits the
- * auth keys into `docker compose exec`. Returns `cliPath` unchanged otherwise.
- */
-export function applyContainerIsolation(
-  cliPath: string | undefined,
-  env: NodeJS.ProcessEnv,
-  isolation: IsolationDescriptor | undefined
-): string | undefined {
-  if (isolation?.kind !== 'container' || !isolation.project) return cliPath;
-  env.ARCHON_EXEC_PROJECT = isolation.project;
-  env.ARCHON_EXEC_WORKDIR = isolation.workdir ?? '/work';
-  // claude refuses bypassPermissions as UID 0 unless IS_SANDBOX=1; the container
-  // agent is uid 1000 AND sandboxed — set it so the in-container claude agrees.
-  env.IS_SANDBOX = '1';
-  return process.env.ARCHON_SANDBOX_CLAUDE_SHIM ?? DEFAULT_CLAUDE_SHIM;
-}
-
-/**
- * Paths under the sandbox worktree/mount roots (`/home/...`, `/work`,
- * `/archon-meta`) — container-side locations that are never valid working
- * paths on a Windows host. Keep the roots in sync with WORKTREE_ROOT_BASE in
- * @archon/isolation's ContainerProvider and the compose mounts in
- * ~/.archon/sandbox/compose.yml.tmpl.
- */
-export function isContainerStylePath(p: string): boolean {
-  return /^\/(home|work|archon-meta)(\/|$)/.test(p);
-}
-
-/**
- * Tripwire for the sandbox-escape class (bunshee run df04b366): a spawn that is
- * NOT container-wrapped must never target a container-style cwd. On win32 a
- * leading-/ path resolves drive-relative (`/home/...` → `D:\home\...`), so the
- * subprocess would silently run OUTSIDE the sandbox against a filesystem that
- * does not hold the worktree. Reaching this state always means a call site
- * dropped the isolation descriptor — fail loud so it surfaces as an
- * attributable node error instead of a wandering agent.
- */
-export function assertHostSpawnCwdSafe(
-  cwd: string,
-  isolation: IsolationDescriptor | undefined,
-  platform: NodeJS.Platform = process.platform
-): void {
-  if (isolation?.kind === 'container' && isolation.project) return; // wrapped — the shim owns the cwd
-  if (platform === 'win32' && isContainerStylePath(cwd)) {
-    throw new Error(
-      `Refusing host spawn: cwd '${cwd}' is a container path but no usable container ` +
-        'isolation descriptor reached this call site (missing descriptor or empty project). ' +
-        'The subprocess would resolve it drive-relative and run outside the sandbox.'
-    );
-  }
-}
-
 function buildBaseClaudeOptions(
   cwd: string,
   requestOptions: SendQueryOptions | undefined,
@@ -592,12 +622,29 @@ function buildBaseClaudeOptions(
   const isJsExecutable = shouldPassNoEnvFile(cliPath);
   getLog().debug({ cliPath: cliPath ?? null, isJsExecutable }, 'claude.subprocess_env_file_flag');
 
+  // Container execution: the SDK runs Claude via our `docker exec` spawn hook
+  // instead of a local process. When the hook is set the SDK bypasses ALL disk
+  // resolution, so `pathToClaudeCodeExecutable` and the host-only
+  // `--no-env-file` executableArg are intentionally omitted — the in-container
+  // binary is resolved from the runner image's PATH.
+  const containerExecContext =
+    requestOptions?.execContext?.kind === 'container' ? requestOptions.execContext : undefined;
+  const spawnOverride = containerExecContext
+    ? { spawnClaudeCodeProcess: buildContainerSpawn(containerExecContext) }
+    : {};
+
   return {
     cwd,
     // In compiled binaries, the resolver supplies an absolute executable path;
     // in dev mode it returns undefined and the SDK resolves from node_modules.
-    ...(cliPath !== undefined ? { pathToClaudeCodeExecutable: cliPath } : {}),
-    ...(isJsExecutable ? { executableArgs: ['--no-env-file'] } : {}),
+    // Both are skipped for container runs (spawn hook bypasses disk resolution).
+    ...(cliPath !== undefined && containerExecContext === undefined
+      ? { pathToClaudeCodeExecutable: cliPath }
+      : {}),
+    ...(isJsExecutable && containerExecContext === undefined
+      ? { executableArgs: ['--no-env-file'] }
+      : {}),
+    ...spawnOverride,
     env,
     model: requestOptions?.model ?? assistantDefaults.model,
     abortController: controller,
@@ -720,6 +767,12 @@ async function* streamClaudeMessages(
   events: AsyncGenerator,
   toolResultQueue: ToolResultEntry[]
 ): AsyncGenerator<MessageChunk> {
+  // Synthetic error message recorded while waiting for the terminal result to
+  // confirm it (#1797). Detection is two-signal: the typed wrapper `error`
+  // field on a '<synthetic>' assistant message, then `is_error: true` on the
+  // result. See ClaudeApiResultError.
+  let pendingSdkError: { code: SDKAssistantMessageError; text: string } | undefined;
+
   for await (const msg of events) {
     // Drain tool results captured by hooks before processing the next event
     while (toolResultQueue.length > 0) {
@@ -737,8 +790,30 @@ async function* streamClaudeMessages(
     const event = msg as { type: string };
 
     if (event.type === 'assistant') {
-      const message = msg as { message: { content: ContentBlock[] } };
+      const message = msg as {
+        message: { content: ContentBlock[]; model?: string };
+        error?: SDKAssistantMessageError;
+      };
       const content = message.message.content;
+
+      // API-level failure surfaced as text (#1797): the SDK writes the error
+      // prose into a synthesized assistant message instead of throwing. Both
+      // signals are required — a REAL model message can carry an error code
+      // too (e.g. 'max_output_tokens' on truncated output) and its content
+      // must flow through untouched; only '<synthetic>' content is
+      // SDK-generated error prose, never model output.
+      if (message.error !== undefined && message.message.model === '<synthetic>') {
+        const text = content
+          .filter(b => b.type === 'text' && b.text)
+          .map(b => b.text)
+          .join('\n');
+        pendingSdkError = { code: message.error, text };
+        getLog().warn({ errorCode: message.error, text }, 'claude.synthetic_error_message');
+        // Withhold the error prose from the output stream — yielding it is
+        // what poisons downstream $node.output. If the terminal result
+        // contradicts (no is_error), the text is yielded late as a fail-safe.
+        continue;
+      }
 
       for (const block of content) {
         if (block.type === 'text' && block.text) {
@@ -768,6 +843,8 @@ async function* streamClaudeMessages(
         status?: string;
         output_file?: string;
         skip_transcript?: boolean;
+        // Background-task set (Claude SDK v0.3.209+ `background_tasks_changed`)
+        tasks?: { task_id: string; task_type: string; description: string }[];
         // Hook lifecycle (Claude SDK v0.2.89+)
         hook_id?: string;
         hook_name?: string;
@@ -833,6 +910,20 @@ async function* streamClaudeMessages(
           ...(sysMsg.usage !== undefined ? { usage: sysMsg.usage } : {}),
           ...(sysMsg.tool_use_id !== undefined ? { toolUseId: sysMsg.tool_use_id } : {}),
         };
+      } else if (subtype === 'background_tasks_changed') {
+        // Level signal: the FULL set of live background tasks after a membership
+        // change (REPLACE semantics — see the MessageChunk variant docs). An
+        // empty `tasks` array is meaningful ("all drained") and MUST be
+        // forwarded, so no `&& sysMsg.tasks` guard here.
+        const tasks = Array.isArray(sysMsg.tasks) ? sysMsg.tasks : [];
+        yield {
+          type: 'background_tasks',
+          tasks: tasks.map(t => ({
+            taskId: t.task_id,
+            taskType: t.task_type,
+            description: t.description,
+          })),
+        };
       } else if (subtype === 'hook_started' && sysMsg.hook_id) {
         yield {
           type: 'hook_started',
@@ -871,6 +962,9 @@ async function* streamClaudeMessages(
         stop_reason?: string | null;
         num_turns?: number;
         errors?: string[];
+        result?: string;
+        terminal_reason?: TerminalReason;
+        api_error_status?: number | null;
         model_usage?: Record<
           string,
           {
@@ -881,15 +975,64 @@ async function* streamClaudeMessages(
           }
         >;
       };
+      // The terminal result resolves any recorded synthetic error message.
+      const syntheticError = pendingSdkError;
+      pendingSdkError = undefined;
       const tokens = normalizeClaudeUsage(resultMsg.usage);
       const sdkErrors = Array.isArray(resultMsg.errors) ? resultMsg.errors : undefined;
+
+      // `is_error: true` + `subtype: 'success'` is ambiguous: it is BOTH the
+      // SDK's stop-sequence termination encoding (#1425, a legitimate success)
+      // AND its API-failure-as-text encoding (#1797 — auth/billing/rate-limit
+      // errors that even set stop_reason: 'stop_sequence').
+      const isSuccessWithErrorFlag = resultMsg.is_error === true && resultMsg.subtype === 'success';
+
+      // Disambiguate structurally: a preceding synthetic error message
+      // (primary, typed signal), or the typed terminal_reason 'api_error'
+      // (secondary — catches an error result with no preceding synthetic
+      // message), marks a real failure. Throw so callers fail the node/turn
+      // instead of consuming error prose as successful output.
+      if (
+        isSuccessWithErrorFlag &&
+        (syntheticError !== undefined || resultMsg.terminal_reason === 'api_error')
+      ) {
+        const code = syntheticError?.code ?? 'unknown';
+        const text =
+          syntheticError?.text ||
+          resultMsg.result ||
+          sdkErrors?.join('; ') ||
+          'API error result with no error text';
+        getLog().error(
+          {
+            sessionId: resultMsg.session_id,
+            errorCode: code,
+            terminalReason: resultMsg.terminal_reason,
+            apiErrorStatus: resultMsg.api_error_status,
+            text,
+          },
+          'claude.result_api_error'
+        );
+        throw new ClaudeApiResultError(code, text);
+      }
+
+      // Fail-safe (never observed in practice): a synthetic error message
+      // followed by a non-error result. Yield the withheld text late rather
+      // than silently swallowing content.
+      if (syntheticError !== undefined && resultMsg.is_error !== true) {
+        getLog().warn(
+          { sessionId: resultMsg.session_id, errorCode: syntheticError.code },
+          'claude.synthetic_error_not_confirmed'
+        );
+        yield { type: 'assistant', content: syntheticError.text };
+      }
+
       // SDKResultSuccess declares `is_error: boolean` (not literal false). When a
       // model terminates via a configured stop sequence (stop_reason ===
       // 'stop_sequence') the SDK can set is_error: true while keeping
       // subtype: 'success' — its encoding of "non-default termination, not a
       // failure". Treat that pair as a clean success so downstream consumers
       // (which gate failure on isError) don't misclassify it.
-      const isRealError = resultMsg.is_error === true && resultMsg.subtype !== 'success';
+      const isRealError = resultMsg.is_error === true && !isSuccessWithErrorFlag;
       if (isRealError) {
         getLog().error(
           {
@@ -900,7 +1043,7 @@ async function* streamClaudeMessages(
           },
           'claude.result_is_error'
         );
-      } else if (resultMsg.is_error === true && resultMsg.subtype === 'success') {
+      } else if (isSuccessWithErrorFlag) {
         getLog().debug(
           {
             sessionId: resultMsg.session_id,
@@ -926,6 +1069,17 @@ async function* streamClaudeMessages(
           : {}),
       };
     }
+  }
+
+  // Stream ended after a synthetic error message with no terminal result to
+  // confirm or contradict it. A dangling synthetic error is a failure — the
+  // SDK ends every turn with a result, so this is an abnormal end (#1797).
+  if (pendingSdkError !== undefined) {
+    getLog().error(
+      { errorCode: pendingSdkError.code, text: pendingSdkError.text },
+      'claude.synthetic_error_stream_ended'
+    );
+    throw new ClaudeApiResultError(pendingSdkError.code, pendingSdkError.text);
   }
 
   // Drain any remaining tool results after the stream ends
@@ -964,6 +1118,17 @@ function classifyAndEnrichError(
       enrichedError: new Error('Query aborted'),
       errorClass: 'aborted',
       shouldRetry: false,
+    };
+  }
+
+  // API failures the SDK surfaced as text (#1797) carry a typed error code —
+  // classify by that code, never by matching the (arbitrary) message text.
+  if (error instanceof ClaudeApiResultError) {
+    const errorClass = classifySdkErrorCode(error.sdkErrorCode);
+    return {
+      enrichedError: error,
+      errorClass,
+      shouldRetry: errorClass === 'rate_limit' || errorClass === 'crash',
     };
   }
 
@@ -1036,29 +1201,21 @@ export class ClaudeProvider implements IAgentProvider {
     // Resolve Claude CLI path once before the retry loop. In binary mode this
     // throws immediately if neither env nor config supplies a valid path, so
     // the user gets a clean error rather than N retries of "Module not found".
-    const resolvedCliPath = await resolveClaudeBinaryPath(assistantDefaults.claudeBinaryPath);
+    // SKIP entirely for container runs: the SDK bypasses disk resolution when
+    // `spawnClaudeCodeProcess` is set (buildBaseClaudeOptions omits
+    // pathToClaudeCodeExecutable), and Claude is baked into the runner image — a
+    // compiled Archon binary has no host Claude, so resolving it here would throw
+    // and kill an otherwise-valid container run.
+    const isContainerRun = requestOptions?.execContext?.kind === 'container';
+    const resolvedCliPath = isContainerRun
+      ? undefined
+      : await resolveClaudeBinaryPath(assistantDefaults.claudeBinaryPath);
 
-    // Build subprocess env once (avoids re-logging auth mode per retry)
-    const subprocessEnv = buildSubprocessEnv();
-    const env = requestOptions?.env ? { ...subprocessEnv, ...requestOptions.env } : subprocessEnv;
-
-    // Container isolation (step-5 P2): swap the claude executable for the
-    // docker-exec shim and inject the exec locators into `env`. No-op otherwise.
-    const cliForRun = applyContainerIsolation(resolvedCliPath, env, requestOptions?.isolation);
-
-    // Tripwire: an UNWRAPPED spawn must never target a container-style cwd
-    // (the df04b366 sandbox-escape class — descriptor dropped upstream).
-    assertHostSpawnCwdSafe(cwd, requestOptions?.isolation);
-
-    // The SDK spawns the executable with `options.cwd`. For a container run the
-    // node's `cwd` is a distro path that does NOT exist on the Windows host, so
-    // `uv_spawn` ENOENTs ("executable ... exists but failed to launch"). The real
-    // workdir is /work (the shim's `-w`), so spawn from a valid host dir — the
-    // shim's own directory — instead. Host spawn cwd never reaches the container.
-    const cwdForRun =
-      requestOptions?.isolation?.kind === 'container' && cliForRun
-        ? cliForRun.replace(/[\\/][^\\/]*$/, '')
-        : cwd;
+    // Build subprocess env once (avoids re-logging auth mode per retry). A
+    // container run gets ONLY the Archon-managed bag + a minimal base — host
+    // process.env never crosses the boundary (the isolation invariant); the host
+    // path inherits the (already-cleaned) process env exactly as before.
+    const env = buildRequestSubprocessEnv(requestOptions);
 
     // Apply nodeConfig translation once (deterministic, not retry-dependent)
     // We need a throwaway Options to extract warnings from applyNodeConfig,
@@ -1097,14 +1254,14 @@ export class ClaudeProvider implements IAgentProvider {
 
       // 1. Build SDK options (env and cliPath pre-computed above)
       const options = buildBaseClaudeOptions(
-        cwdForRun,
+        cwd,
         requestOptions,
         assistantDefaults,
         controller,
         stderrLines,
         toolResultQueue,
         env,
-        cliForRun
+        resolvedCliPath
       );
 
       // 2. Apply nodeConfig translation (re-applied per attempt since options are fresh)

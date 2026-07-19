@@ -114,10 +114,6 @@ describe('WorktreeProvider', () => {
     mockRm.mockClear();
   });
 
-  test('declares baseOverride capability', () => {
-    expect(WorktreeProvider.capabilities.baseOverride).toBe(true);
-  });
-
   describe('generateBranchName', () => {
     test('generates issue-N for issue workflows', () => {
       const request: IsolationRequest = {
@@ -1131,51 +1127,6 @@ describe('WorktreeProvider', () => {
       await expect(submoduleProvider.create(baseRequest)).rejects.toThrow(
         /Submodule initialization failed/
       );
-    });
-  });
-
-  describe('git identity on worktree creation', () => {
-    const identityRequest: IsolationRequest = {
-      codebaseId: 'cb-123',
-      canonicalRepoPath: '/workspace/repo',
-      workflowType: 'issue',
-      identifier: '42',
-      gitIdentity: { email: '42+alice@users.noreply.github.com', name: 'Alice Example' },
-    };
-
-    // git config calls issued during create(), by their args array.
-    const configCalls = () =>
-      execSpy.mock.calls
-        .map((call: unknown[]) => call[1] as string[])
-        .filter(args => args.includes('config'));
-
-    test('writes user.email to the worktree-scoped config, not the shared repo config', async () => {
-      await provider.create(identityRequest);
-
-      const emailWrites = configCalls().filter(args => args.includes('user.email'));
-      expect(emailWrites).toHaveLength(1);
-      // Worktree-scoped: the identity lands in this worktree's config.worktree.
-      // A bare `git config user.email` (no --worktree) writes to the shared
-      // common config and leaks the identity into every worktree of the repo.
-      expect(emailWrites[0]).toContain('--worktree');
-      expect(emailWrites[0]).toContain('42+alice@users.noreply.github.com');
-    });
-
-    test('enables extensions.worktreeConfig so --worktree has somewhere to write', async () => {
-      await provider.create(identityRequest);
-
-      const extWrites = configCalls().filter(args => args.includes('extensions.worktreeConfig'));
-      expect(extWrites).toHaveLength(1);
-      expect(extWrites[0]).toContain('true');
-    });
-
-    test('writes user.name to the worktree-scoped config when a name is provided', async () => {
-      await provider.create(identityRequest);
-
-      const nameWrites = configCalls().filter(args => args.includes('user.name'));
-      expect(nameWrites).toHaveLength(1);
-      expect(nameWrites[0]).toContain('--worktree');
-      expect(nameWrites[0]).toContain('Alice Example');
     });
   });
 
@@ -2339,6 +2290,58 @@ describe('WorktreeProvider', () => {
       });
     });
 
+    test('uses request baseBranch when no config baseBranch is set', async () => {
+      worktreeExistsSpy.mockResolvedValue(false);
+      syncWorkspaceSpy.mockResolvedValue({
+        branch: 'develop',
+        synced: true,
+        mode: 'fast-forward',
+        state: 'in_sync',
+        previousHead: '',
+        newHead: '',
+        updated: false,
+      });
+      const configLoader: RepoConfigLoader = async () => ({});
+      provider = new WorktreeProvider(configLoader);
+
+      await provider.create({
+        ...baseRequest,
+        baseBranch: git.toBranchName('develop'),
+      });
+
+      expect(syncWorkspaceSpy).toHaveBeenCalledWith('/workspace/owner/repo', 'develop', {
+        mode: 'fast-forward',
+      });
+      expect(execSpy).toHaveBeenCalledWith(
+        'git',
+        expect.arrayContaining([
+          'worktree',
+          'add',
+          '--no-track',
+          expect.any(String),
+          '-b',
+          'archon/issue-42',
+          'origin/develop',
+        ]),
+        expect.any(Object)
+      );
+    });
+
+    test('uses configured baseBranch over request baseBranch when both are set', async () => {
+      worktreeExistsSpy.mockResolvedValue(false);
+      const configLoader: RepoConfigLoader = async () => ({ baseBranch: 'main' });
+      provider = new WorktreeProvider(configLoader);
+
+      await provider.create({
+        ...baseRequest,
+        baseBranch: git.toBranchName('develop'),
+      });
+
+      expect(syncWorkspaceSpy).toHaveBeenCalledWith('/workspace/owner/repo', 'main', {
+        mode: 'fast-forward',
+      });
+    });
+
     test('uses explicit reset mode for managed clone worktree creation', async () => {
       worktreeExistsSpy.mockResolvedValue(false);
       const configLoader: RepoConfigLoader = async () => ({});
@@ -2391,27 +2394,6 @@ describe('WorktreeProvider', () => {
       await provider.create(request);
 
       expect(syncWorkspaceSpy).toHaveBeenCalledWith('/workspace/owner/repo', 'main', {
-        mode: 'fast-forward',
-      });
-    });
-
-    test('honors per-dispatch --base override over configured base branch for worktree cut-from', async () => {
-      worktreeExistsSpy.mockResolvedValue(false);
-      const configLoader: RepoConfigLoader = async () => ({ baseBranch: 'main' });
-      provider = new WorktreeProvider(configLoader);
-
-      const request: IsolationRequest = {
-        ...baseRequest,
-        workflowType: 'task',
-        identifier: 'test-feature',
-        baseBranch: 'epic/foo',
-      };
-
-      await provider.create(request);
-
-      // request.baseBranch (--base) must win over worktreeConfig.baseBranch ('main') —
-      // otherwise WorktreeProvider declares baseOverride but doesn't honor it.
-      expect(syncWorkspaceSpy).toHaveBeenCalledWith('/workspace/owner/repo', 'epic/foo', {
         mode: 'fast-forward',
       });
     });

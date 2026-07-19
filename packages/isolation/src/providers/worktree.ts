@@ -27,8 +27,6 @@ import {
 import type { WorktreeBaseOverride } from '@archon/git';
 import { getArchonWorkspacesPath } from '@archon/paths';
 import type { RepoPath, WorktreeInfo } from '@archon/git';
-import { assertRequestSupported, resolveStartPoint } from '../create-plan';
-import type { ProviderCapabilities } from '../create-plan';
 import { copyWorktreeFiles } from '../worktree-copy';
 import type {
   DestroyResult,
@@ -117,17 +115,6 @@ function resolveRepoLocalOverride(
 export class WorktreeProvider implements IIsolationProvider {
   readonly providerType = 'worktree';
 
-  /**
-   * The reference implementation: honors every capability. `createNewBranch`
-   * respects `fromBranch`; `createFromPR` checks out the PR's own branch, or a
-   * fork's pinned `prSha`.
-   */
-  static readonly capabilities: ProviderCapabilities = {
-    startPointOverride: true,
-    prCheckout: true,
-    baseOverride: true,
-  };
-
   constructor(private loadConfig: RepoConfigLoader = () => Promise.resolve(null)) {}
 
   /**
@@ -140,11 +127,6 @@ export class WorktreeProvider implements IIsolationProvider {
    * object or `null`, never a second chance to reload.
    */
   async create(request: IsolationRequest): Promise<IsolatedEnvironment> {
-    // A no-op for this provider (it declares every capability), but calling it
-    // here keeps both providers on one contract: a new optional request field
-    // adds a CapabilityKey, and every provider must then state its position.
-    assertRequestSupported(request, WorktreeProvider.capabilities, this.providerType);
-
     let repoConfig: WorktreeCreateConfig | null;
     try {
       repoConfig = await this.loadConfig(request.canonicalRepoPath);
@@ -722,15 +704,11 @@ export class WorktreeProvider implements IIsolationProvider {
   ): Promise<{ warnings: string[] }> {
     const repoPath = request.canonicalRepoPath;
 
-    // A per-dispatch --base (task override) wins over the configured base branch
-    // for the worktree cut-from, so WorktreeProvider genuinely honors the
-    // baseOverride capability it declares (mirrors the container path).
-    // fromBranch stays the start-point (resolveStartPoint), not a sync target.
-    const configuredBase =
-      request.workflowType === 'task' && request.baseBranch
-        ? request.baseBranch
-        : worktreeConfig?.baseBranch;
-    const baseBranch = await this.syncWorkspaceBeforeCreate(repoPath, configuredBase);
+    // Sync uses explicit repo config first, then the registered codebase's
+    // default branch (request.baseBranch), then auto-detects via getDefaultBranch.
+    // request.fromBranch is the start-point for worktree creation, not a sync target.
+    const preferredBaseBranch = worktreeConfig?.baseBranch ?? request.baseBranch;
+    const baseBranch = await this.syncWorkspaceBeforeCreate(repoPath, preferredBaseBranch);
 
     const override: WorktreeBaseOverride = {
       repoLocal: resolveRepoLocalOverride(worktreeConfig?.path, repoPath),
@@ -781,38 +759,22 @@ export class WorktreeProvider implements IIsolationProvider {
   }
 
   /**
-   * Set the originating user's `user.email`/`user.name` in this worktree's
-   * *worktree-scoped* config so commits made here attribute to them.
-   *
-   * `extensions.worktreeConfig` must be enabled first, or `git config
-   * --worktree` has nowhere to write. Without `--worktree`, a bare
-   * `git config user.email` lands in the repo's shared common config and
-   * leaks the identity into every worktree of that repo (P3-E). Non-fatal on
-   * failure: a worktree without the override falls back to the ambient git
-   * identity.
+   * Set worktree-local `git config user.email`/`user.name` so commits made in
+   * this worktree attribute to the originating user. Non-fatal on failure: a
+   * worktree without the override simply uses the ambient git identity.
    */
   private async applyGitIdentity(
     worktreePath: string,
     identity: { email: string; name?: string }
   ): Promise<void> {
     try {
-      // Repo-level flag that enables per-worktree config.worktree files.
-      await execFileAsync(
-        'git',
-        ['-C', worktreePath, 'config', 'extensions.worktreeConfig', 'true'],
-        { timeout: 5000 }
-      );
-      await execFileAsync(
-        'git',
-        ['-C', worktreePath, 'config', '--worktree', 'user.email', identity.email],
-        { timeout: 5000 }
-      );
+      await execFileAsync('git', ['-C', worktreePath, 'config', 'user.email', identity.email], {
+        timeout: 5000,
+      });
       if (identity.name) {
-        await execFileAsync(
-          'git',
-          ['-C', worktreePath, 'config', '--worktree', 'user.name', identity.name],
-          { timeout: 5000 }
-        );
+        await execFileAsync('git', ['-C', worktreePath, 'config', 'user.name', identity.name], {
+          timeout: 5000,
+        });
       }
       getLog().debug({ worktreePath, email: identity.email }, 'isolation.git_identity_applied');
     } catch (err) {
@@ -1122,9 +1084,11 @@ export class WorktreeProvider implements IIsolationProvider {
     // Clean up any orphan directory before creating worktree
     await this.cleanOrphanDirectoryIfExists(worktreePath);
 
-    // Determine start-point: explicit fromBranch overrides base branch.
-    // Shared with ContainerProvider so the rule cannot drift between providers.
-    const { startPoint } = resolveStartPoint(request, baseBranch);
+    // Determine start-point: explicit fromBranch overrides base branch
+    const startPoint =
+      request.workflowType === 'task' && request.fromBranch
+        ? request.fromBranch
+        : `origin/${baseBranch}`;
 
     try {
       // `--no-track` keeps `branch.<name>.merge` unset; otherwise `gh pr view`

@@ -3,7 +3,6 @@ export type {
   IAgentProvider,
   AgentRequestOptions,
   SendQueryOptions,
-  IsolationDescriptor,
   NodeConfig,
   ProviderDefaults,
   ProviderDefaultsMap,
@@ -48,10 +47,6 @@ export {
 
 // Provider classes
 export { ClaudeProvider } from './claude/provider';
-
-// Sandbox-escape tripwire (df04b366 class) — shared with @archon/workflows'
-// runIsolatedCommand and the executor's engine-io placement.
-export { assertHostSpawnCwdSafe, isContainerStylePath } from './claude/provider';
 export { CodexProvider } from './codex/provider';
 
 // Config parsers
@@ -61,7 +56,12 @@ export { parseCodexConfig, type CodexProviderDefaults } from './codex/config';
 // Utilities (needed by consumers)
 export { resetCodexSingleton } from './codex/provider';
 export { loadMcpConfig, type LoadedMcpConfig } from './mcp/config';
-export { resolveCodexBinaryPath, fileExists as codexFileExists } from './codex/binary-resolver';
+export {
+  resolveCodexBinaryPath,
+  resolveCodexBinaryWithSource,
+  fileExists as codexFileExists,
+  type CodexBinarySource,
+} from './codex/binary-resolver';
 export { resolveClaudeBinaryPath, fileExists as claudeFileExists } from './claude/binary-resolver';
 
 // Community providers

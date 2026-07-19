@@ -13,7 +13,6 @@ export type {
   CreatedWorktreeMetadata,
   WorktreeMetadata,
   WorktreeEnvironment,
-  ContainerEnvironment,
   IsolatedEnvironment,
   DestroyOptions,
   WorktreeDestroyOptions,
@@ -29,9 +28,27 @@ export type {
   ResolveRequest,
   ResolutionMethod,
   IsolationResolution,
+  ExecutionContext,
+  WriteBackFinalizeResult,
+  WriteBackApplySummary,
+  BackendPrepareRequest,
+  PreparedEnv,
+  IIsolationBackend,
+  ContainerBackendConfig,
 } from './types';
 
-export { isPRIsolationRequest, isHostVisibleEnv } from './types';
+export { isPRIsolationRequest, CONTAINER_LABELS } from './types';
+
+// --- Backend seam (folder projects) ---
+export { resolveFolderBackend } from './backend-router';
+export type { ResolveFolderBackendOptions } from './backend-router';
+export { InPlaceBackend } from './backends/in-place';
+export { ContainerBackend } from './backends/container';
+export type { ContainerBackendDeps } from './backends/container';
+
+// --- Container backend primitives (docker CLI wrapper) ---
+export { dockerCli, dockerPreflight, extractDockerError } from './container/docker-exec';
+export type { DockerRunner, DockerExecOptions, DockerExecResult } from './container/docker-exec';
 
 // --- Store ---
 export type { IIsolationStore } from './store';
@@ -48,12 +65,6 @@ export type { IsolationResolverDeps } from './resolver';
 
 // --- Provider ---
 export { WorktreeProvider } from './providers/worktree';
-export {
-  ContainerProvider,
-  composeProjectFor,
-  composeProjectFromWorkingPath,
-  CONTAINER_WORKDIR,
-} from './providers/container';
 
 // --- PR state lookup ---
 export { getPrState } from './pr-state';
@@ -67,12 +78,3 @@ export {
   isPathWithinRoot,
 } from './worktree-copy';
 export type { CopyFileEntry } from './worktree-copy';
-
-// --- Shared pre-create resolution (provider contract) ---
-export {
-  assertRequestSupported,
-  requiredCapabilities,
-  resolveBaseBranch,
-  resolveStartPoint,
-} from './create-plan';
-export type { CapabilityKey, ProviderCapabilities } from './create-plan';

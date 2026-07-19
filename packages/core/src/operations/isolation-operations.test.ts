@@ -59,7 +59,6 @@ function makeActiveEnv(overrides: Record<string, unknown> = {}) {
 function makeEnvWithAge(overrides: Record<string, unknown> = {}) {
   return {
     id: 'env-1',
-    provider: 'worktree',
     working_path: '/worktrees/feat',
     branch_name: 'feat',
     workflow_id: 'wf-1',
@@ -108,59 +107,6 @@ describe('listEnvironments', () => {
     expect(mockUpdateStatus).toHaveBeenCalledWith('env-ghost', 'destroyed');
     expect(result.ghostsReconciled).toBe(1);
     expect(result.totalEnvironments).toBe(0); // re-fetch returned empty
-  });
-
-  // A container env's worktree lives inside the WSL distro; the Windows host
-  // cannot stat it, so worktreeExists() ALWAYS reports false. Ghosting on that
-  // destroys the DB row of a LIVE run — and that row is the substrate's only
-  // source of truth on resume, so the run is then unresumable (step-5 rollout
-  // P1: `archon isolation list` silently killed a running container dispatch).
-  test('never host-stats a container env, and never ghosts one', async () => {
-    mockListAllActiveWithCodebase.mockResolvedValueOnce([makeActiveEnv()]);
-    mockListByCodebaseWithAge.mockResolvedValueOnce([
-      makeEnvWithAge({
-        id: 'env-container',
-        provider: 'container',
-        working_path: '/home/bunny/archon/worktrees/bunshee/task-slice',
-      }),
-    ]);
-    mockWorktreeExists.mockResolvedValueOnce(false); // what the host fs really answers
-
-    const result = await listEnvironments();
-
-    expect(mockWorktreeExists).not.toHaveBeenCalled();
-    expect(mockUpdateStatus).not.toHaveBeenCalled();
-    expect(result.ghostsReconciled).toBe(0);
-    expect(result.totalEnvironments).toBe(1); // the live env survives the sweep
-  });
-
-  // The discriminating case: the host fs answers "missing" for BOTH envs, and
-  // only the host-backed one may be ghosted. Provider is the sole difference.
-  test('ghosts a missing worktree env but spares the container env beside it', async () => {
-    mockListAllActiveWithCodebase.mockResolvedValueOnce([makeActiveEnv()]);
-    mockListByCodebaseWithAge
-      .mockResolvedValueOnce([
-        makeEnvWithAge({
-          id: 'env-container',
-          provider: 'container',
-          working_path: '/home/bunny/archon/worktrees/bunshee/task-slice',
-        }),
-        makeEnvWithAge({
-          id: 'env-ghost',
-          provider: 'worktree',
-          working_path: '/worktrees/ghost',
-        }),
-      ])
-      .mockResolvedValueOnce([]);
-    mockWorktreeExists.mockResolvedValue(false); // host fs: "missing" for both
-
-    const result = await listEnvironments();
-
-    expect(mockUpdateStatus).toHaveBeenCalledWith('env-ghost', 'destroyed');
-    expect(mockUpdateStatus).not.toHaveBeenCalledWith('env-container', 'destroyed');
-    expect(result.ghostsReconciled).toBe(1);
-
-    mockWorktreeExists.mockResolvedValue(true); // restore the shared default
   });
 
   test('does not re-fetch when no ghosts found', async () => {

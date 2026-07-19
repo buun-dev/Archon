@@ -9,23 +9,22 @@ import * as archonPaths from '@archon/paths';
 import { createLogger, captureWorkflowInvoked, captureWorkflowCompleted } from '@archon/paths';
 import { getDefaultBranch, toRepoPath } from '@archon/git';
 import type {
+  DagNode,
   WorkflowDefinition,
   WorkflowRun,
   WorkflowExecutionResult,
   WorkflowSource,
 } from './schemas';
-import { isLoopNode, isApprovalNode, isScriptNode, isBashNode } from './schemas';
+import { isLoopNode, isLoopGroupNode, isApprovalNode, isScriptNode, isBashNode } from './schemas';
 import { executeDagWorkflow } from './dag-executor';
 import { logWorkflowStart, logWorkflowError } from './logger';
 import { formatDuration, parseDbTimestamp } from './utils/duration';
 import { keepAwake } from './utils/keep-awake';
 import { getWorkflowEventEmitter } from './event-emitter';
-import {
-  isRegisteredProvider,
-  getRegisteredProviders,
-  isContainerStylePath,
-} from '@archon/providers';
-import type { IsolationDescriptor } from '@archon/providers';
+import { isRegisteredProvider, getRegisteredProviders } from '@archon/providers';
+import type { ExecutionContext } from '@archon/providers/types';
+import type { ContainerRunContext } from './container-context';
+export type { ContainerRunContext, ContainerWriteBackBackend } from './container-context';
 import {
   classifyError,
   toTelemetryErrorClass,
@@ -227,36 +226,85 @@ async function resolveUserProviderEnvForWorkflow(
 }
 
 /**
+ * Whether the run's codebase is a folder project (non-git). Folder projects run
+ * in place on a non-git root, so git base-branch auto-detection can only fail
+ * (`fatal: not a git repository`) — skip it to avoid the ERROR/WARN log-spam
+ * pair on every folder run (#2159). `$BASE_BRANCH` keeps its
+ * referenced-but-unresolvable failure semantics (empty string when skipped).
+ *
+ * Contract: NEVER THROWS. A lookup failure returns `false` so the normal
+ * auto-detection path still runs, preserving prior behavior on any DB hiccup.
+ */
+async function isFolderCodebase(
+  deps: WorkflowDeps,
+  codebaseId: string | undefined
+): Promise<boolean> {
+  if (!codebaseId) return false;
+  try {
+    const codebase = await deps.store.getCodebase(codebaseId);
+    return codebase?.kind === 'folder';
+  } catch (err) {
+    getLog().warn({ err: err as Error, codebaseId }, 'workflow.folder_kind_resolve_failed');
+    return false;
+  }
+}
+
+/**
  * Resolve the artifacts and log directories for a workflow run.
  * Looks up the codebase by ID once, parses owner/repo, and returns project-scoped paths.
- * Falls back to cwd-based paths for unregistered repos.
+ * Folder projects route to `_folder/<slug>/` storage; falls back to cwd-based
+ * paths for unregistered repos.
  *
- * Engine io must NEVER be rooted at a container-style cwd: on Windows a
- * `/home/...` worktree path resolves drive-relative, so cwd-based dirs
- * materialize a `D:\home\...` ghost worktree holding the run's logs — whose
- * existence then lets a mis-wired unwrapped spawn succeed instead of failing
- * fast (bunshee run df04b366). Registered-but-unparsable names and
- * container-style fallbacks both divert to archon-home instead.
+ * `artifactsRoot` is the parent of the `runs/` layout (`.../artifacts`) — the base
+ * that run-scoped (`runs/<id>/`) and scope-scoped (`scopes/<workflow>/<scope>/`,
+ * #1846) storage both hang off, whichever branch resolved it.
+ *
+ * Exported for unit testing of the kind-based branch selection.
  */
 export async function resolveProjectPaths(
   deps: WorkflowDeps,
   cwd: string,
   workflowRunId: string,
   codebaseId?: string
-): Promise<{ artifactsDir: string; logDir: string }> {
+): Promise<{ artifactsDir: string; logDir: string; artifactsRoot: string }> {
   if (codebaseId) {
     try {
       const codebase = await deps.store.getCodebase(codebaseId);
       if (codebase) {
-        const parsed = archonPaths.parseOwnerRepo(codebase.name);
-        if (parsed) {
+        // Folder projects run in place — route their named storage to
+        // _folder/<slug>/ instead of owner/repo/ (the name isn't owner/repo).
+        if (codebase.kind === 'folder') {
+          const slug = archonPaths.slugifyFolderName(codebase.name);
           return {
-            artifactsDir: archonPaths.getRunArtifactsPath(parsed.owner, parsed.repo, workflowRunId),
-            logDir: archonPaths.getProjectLogsPath(parsed.owner, parsed.repo),
+            artifactsDir: archonPaths.getFolderRunArtifactsPath(slug, workflowRunId),
+            logDir: archonPaths.getFolderProjectLogsPath(slug),
+            artifactsRoot: archonPaths.getFolderProjectArtifactsPath(slug),
           };
         }
-        getLog().warn({ codebaseName: codebase.name }, 'codebase_name_not_owner_repo_format');
-        return unparsedProjectPaths(codebase.name, workflowRunId);
+        // Repo projects: parse `owner/repo`, or scope a no-remote local repo
+        // under `_local/<basename(cwd)>` — the same identity registration wrote
+        // to disk. Without this branch the paths below fall through to the
+        // <cwd>/.archon fallback, dumping logs/artifacts outside ARCHON_HOME
+        // (#2132).
+        const identity = archonPaths.resolveRepoProjectIdentity(
+          codebase.name,
+          codebase.default_cwd
+        );
+        if (identity) {
+          return {
+            artifactsDir: archonPaths.getRunArtifactsPath(
+              identity.owner,
+              identity.repo,
+              workflowRunId
+            ),
+            logDir: archonPaths.getProjectLogsPath(identity.owner, identity.repo),
+            artifactsRoot: archonPaths.getProjectArtifactsPath(identity.owner, identity.repo),
+          };
+        }
+        getLog().warn(
+          { codebaseName: codebase.name, cwd: codebase.default_cwd },
+          'codebase_project_identity_unresolved'
+        );
       }
     } catch (error) {
       const fallbackArtifactsDir = join(cwd, '.archon', 'artifacts', 'runs', workflowRunId);
@@ -266,27 +314,33 @@ export async function resolveProjectPaths(
       );
     }
   }
-  // Fallback for unregistered repos — still never under a container-style cwd.
-  if (process.platform === 'win32' && isContainerStylePath(cwd)) {
-    return unparsedProjectPaths('_unknown', workflowRunId);
-  }
+  // Fallback for unregistered repos
   return {
     artifactsDir: join(cwd, '.archon', 'artifacts', 'runs', workflowRunId),
     logDir: join(cwd, '.archon', 'logs'),
+    artifactsRoot: join(cwd, '.archon', 'artifacts'),
   };
 }
 
-/** Engine-io dirs under archon-home for codebases without an owner/repo name. */
-function unparsedProjectPaths(
-  name: string,
-  workflowRunId: string
-): { artifactsDir: string; logDir: string } {
-  const safe = name.replace(/[^A-Za-z0-9._-]/g, '_') || '_unknown';
-  const root = join(archonPaths.getArchonHome(), 'workspaces', '_unparsed', safe);
-  return {
-    artifactsDir: join(root, 'artifacts', 'runs', workflowRunId),
-    logDir: join(root, 'logs'),
-  };
+/**
+ * Resolve the stable cross-invocation artifact scope dir for a run (#1846), or
+ * undefined when the feature doesn't apply. Applies only when the workflow uses
+ * cross-run session persistence (workflow-level `persist_sessions` or any node
+ * `persist_session: true`) AND the run has a conversation scope — the same
+ * opt-in + scope key the session store uses. No persistence → no new dirs,
+ * default behavior unchanged.
+ */
+export function resolveScopeArtifactsDir(
+  workflow: { name: string; nodes: readonly DagNode[]; persist_sessions?: boolean },
+  conversationId: string | null | undefined,
+  artifactsRoot: string
+): string | undefined {
+  if (!conversationId) return undefined;
+  const usesPersistence =
+    workflow.persist_sessions === true ||
+    workflow.nodes.some(n => 'persist_session' in n && n.persist_session === true);
+  if (!usesPersistence) return undefined;
+  return archonPaths.getScopeArtifactsPath(artifactsRoot, workflow.name, conversationId);
 }
 
 /**
@@ -312,6 +366,12 @@ export type ExecuteWorkflowOptions = ResumePayload & {
   /** Codebase ID for env vars + isolation context. */
   codebaseId?: string;
   /**
+   * Caller-provided base branch fallback for `$BASE_BRANCH`, normally the
+   * codebase's stored `default_branch`. Repo config still wins when
+   * `worktree.baseBranch` is set; git auto-detection remains the last resort.
+   */
+  baseBranch?: string;
+  /**
    * GitHub issue/PR context. When provided:
    * - Stored in `WorkflowRun.metadata` as `{ github_context }`
    * - Substituted into `$CONTEXT` / `$EXTERNAL_CONTEXT` / `$ISSUE_CONTEXT` variables
@@ -326,18 +386,6 @@ export type ExecuteWorkflowOptions = ResumePayload & {
     prSha?: string;
     prBranch?: string;
   };
-  /**
-   * Substrate descriptor so node executors can route commands + the claude
-   * subprocess into a container (step-5 sandbox P2). Absent = host spawn.
-   */
-  isolation?: IsolationDescriptor;
-  /**
-   * Host-resolved base branch. For a container run the executor's own cwd is a
-   * distro worktree path unreachable from the Windows host, so `deps.loadConfig`
-   * and `getDefaultBranch(cwd)` can't run — the caller resolves the base branch
-   * from a host-accessible config and passes it here (step-5 sandbox P2).
-   */
-  baseBranch?: string;
   /**
    * Discovery source of the workflow (bundled / global / project). Used only
    * for anonymous telemetry — bundled workflows report their real name, custom
@@ -355,6 +403,21 @@ export type ExecuteWorkflowOptions = ResumePayload & {
    * is preserved on resume.
    */
   userId?: string;
+  /**
+   * Execution context resolved by the isolation seam: `{ kind: 'host' }` (default)
+   * runs on the Archon host; `{ kind: 'container', … }` (folder-project container
+   * backend, Phase B) runs provider turns and subprocesses inside the prepared
+   * container. Threaded verbatim into `executeDagWorkflow`. Defaults to host when
+   * absent, so every existing caller is unchanged.
+   */
+  execContext?: ExecutionContext;
+  /**
+   * Container run context (folder-project container backend, Phase C). Present
+   * only when `execContext.kind === 'container'`; carries the prepared env id, the
+   * write-back policy, and the backend port the engine drives for suspend +
+   * write-back. Absent for host runs.
+   */
+  container?: ContainerRunContext;
 };
 
 /**
@@ -415,13 +478,39 @@ export async function executeWorkflow(
     codebaseId,
     issueContext,
     isolationContext,
-    isolation,
     parentConversationId,
     preCreatedRun,
     priorCompletedNodes,
     userId,
     source,
+    baseBranch: callerBaseBranch,
+    execContext = { kind: 'host' },
+    container: containerCtx,
   } = opts;
+
+  // Guard: a container run MUST be resumed with its container rewired (the CLI does
+  // this via backend.resumeEnv, threading a `container` context). A resume that
+  // reaches here for a container run WITHOUT that context — e.g. approving a
+  // --container run from chat/web, which has no docker backend wired — would run
+  // host-side and SILENTLY skip the write-back apply, losing the approved changes.
+  // Fail loudly and point at the CLI instead; the run stays resumable (failed) so
+  // the CLI can rediscover the container and apply.
+  if (preCreatedRun?.metadata?.isolation === 'container' && !containerCtx) {
+    const msg =
+      `Run '${preCreatedRun.id}' executed inside an isolation container. Resume it from the ` +
+      'CLI in the same project (`archon workflow approve/reject/resume <id>`), where the ' +
+      'container is rediscovered — chat/web resume cannot rewire it.';
+    getLog().warn({ workflowRunId: preCreatedRun.id }, 'workflow.container_resume_without_backend');
+    await deps.store.failWorkflowRun(preCreatedRun.id, msg).catch((err: unknown) => {
+      getLog().error(
+        { err, workflowRunId: preCreatedRun.id },
+        'workflow.container_resume_guard_fail_failed'
+      );
+    });
+    await safeSendMessage(platform, conversationId, `⚠️ ${msg}`);
+    return { success: false, workflowRunId: preCreatedRun.id, error: msg };
+  }
+
   // Load config once for the entire workflow execution
   const fileConfig = await deps.loadConfig(cwd);
   const dbEnvVars = codebaseId ? await deps.store.getCodebaseEnvVars(codebaseId) : {};
@@ -446,14 +535,20 @@ export async function executeWorkflow(
   };
   const configuredCommandFolder = config.commands.folder;
 
-  // Auto-detect base branch when not configured. Config takes priority.
+  // Resolve base branch: config takes priority, then the caller-provided
+  // codebase default, then git auto-detection.
   // If detection fails, leave empty — substituteWorkflowVariables throws only if $BASE_BRANCH is referenced.
+  const fallbackBaseBranch = callerBaseBranch?.trim();
   let baseBranch: string;
-  if (opts.baseBranch) {
-    // Host-resolved (container runs — cwd is a distro path unreachable here).
-    baseBranch = opts.baseBranch;
-  } else if (config.baseBranch) {
+  if (config.baseBranch) {
     baseBranch = config.baseBranch;
+  } else if (fallbackBaseBranch) {
+    baseBranch = fallbackBaseBranch;
+  } else if (await isFolderCodebase(deps, codebaseId)) {
+    // Folder projects run on a non-git root — auto-detection can only fail and
+    // emit ERROR/WARN noise on every run (#2159). Leave empty; $BASE_BRANCH
+    // stays unresolved and throws only if a prompt actually references it.
+    baseBranch = '';
   } else {
     try {
       baseBranch = await getDefaultBranch(toRepoPath(cwd));
@@ -601,7 +696,15 @@ export async function executeWorkflow(
         codebase_id: codebaseId,
         user_message: userMessage,
         working_path: cwd,
-        metadata: issueContext ? { github_context: issueContext } : {},
+        // Record container isolation on the run itself so a later resume — a
+        // SEPARATE process with no --container flag in hand — can detect it and
+        // rediscover the container. `isolation_env_id` is the handle the resume
+        // path passes to `backend.resumeEnv()` (Phase C).
+        metadata: {
+          ...(issueContext ? { github_context: issueContext } : {}),
+          ...(execContext.kind === 'container' ? { isolation: 'container' } : {}),
+          ...(containerCtx ? { isolation_env_id: containerCtx.envId } : {}),
+        },
         parent_conversation_id: parentConversationId,
         user_id: userId,
       });
@@ -716,11 +819,27 @@ export async function executeWorkflow(
   }
 
   // Resolve external artifact and log directories
-  const { artifactsDir, logDir } = await resolveProjectPaths(deps, cwd, workflowRun.id, codebaseId);
+  const { artifactsDir, logDir, artifactsRoot } = await resolveProjectPaths(
+    deps,
+    cwd,
+    workflowRun.id,
+    codebaseId
+  );
+
+  // Stable cross-invocation artifact scope (#1846): only for persist_session
+  // workflows with a conversation scope. Undefined otherwise — zero new dirs.
+  const scopeArtifactsDir = resolveScopeArtifactsDir(
+    workflow,
+    workflowRun.conversation_id,
+    artifactsRoot
+  );
 
   // Pre-create the artifacts directory so commands can write to it immediately
+  // (and the durable scope dir, when the workflow opted into one — same disk,
+  // same failure mode, same fatal treatment).
   try {
     await mkdir(artifactsDir, { recursive: true });
+    if (scopeArtifactsDir) await mkdir(scopeArtifactsDir, { recursive: true });
   } catch (error) {
     const err = error as NodeJS.ErrnoException;
     getLog().error(
@@ -759,13 +878,11 @@ export async function executeWorkflow(
 
   // Wrap execution in try-catch to ensure workflow is marked as failed on any error.
   //
-  // Hold a Windows keep-awake request for exactly the executing window so an
-  // unattended machine cannot enter Modern Standby mid-DAG and freeze this
-  // process (a thawed executor spawns bash children that exit 66 — see the
-  // 2026-07-05 mid-run-death record). Placed HERE, not at function top, so the
+  // Hold a Windows keep-awake request for the executing window (see
+  // utils/keep-awake.ts for the Modern Standby / mid-run-death rationale and
+  // best-effort semantics). Placed HERE, not at function top, so the
   // early-return validation paths above never leak an unpaired acquire; the
-  // matching release is the first statement of this try's finally. No-op off
-  // Windows / on FFI failure, and refcounted so concurrent runs share one request.
+  // matching release is the first statement of this try's finally.
   keepAwake.acquire();
   try {
     getLog().info(
@@ -802,6 +919,7 @@ export async function executeWorkflow(
       model: resolvedModel,
       nodeCount: workflow.nodes.length,
       usesLoop: workflow.nodes.some(isLoopNode),
+      usesLoopGroup: workflow.nodes.some(isLoopGroupNode),
       usesApproval: workflow.nodes.some(isApprovalNode),
       usesScript: workflow.nodes.some(isScriptNode),
       usesBash: workflow.nodes.some(isBashNode),
@@ -939,7 +1057,9 @@ export async function executeWorkflow(
       source,
       aiProfile,
       workflowPreset,
-      isolation
+      scopeArtifactsDir,
+      execContext,
+      containerCtx
     );
 
     // executeDagWorkflow throws on fatal errors; check DB status for result

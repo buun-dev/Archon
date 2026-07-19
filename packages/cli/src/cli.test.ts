@@ -248,23 +248,6 @@ describe('CLI argument parsing', () => {
       expect(result.values.scope).toBe('nonsense');
     });
   });
-
-  describe('--base flag', () => {
-    it('parses --base into values.base', () => {
-      const { values } = parseArgs({
-        args: ['run', 'plan-to-pr-tdd', '--branch', 'slice-a', '--base', 'epic/smoke-a'],
-        options: {
-          branch: { type: 'string', short: 'b' },
-          from: { type: 'string' },
-          base: { type: 'string' },
-        },
-        allowPositionals: true,
-        strict: false,
-      });
-      expect(values.base).toBe('epic/smoke-a');
-      expect(values.from).toBeUndefined();
-    });
-  });
 });
 
 describe('Conversation ID generation', () => {
