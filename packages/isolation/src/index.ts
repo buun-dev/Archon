@@ -13,6 +13,7 @@ export type {
   CreatedWorktreeMetadata,
   WorktreeMetadata,
   WorktreeEnvironment,
+  ContainerEnvironment,
   IsolatedEnvironment,
   DestroyOptions,
   WorktreeDestroyOptions,
@@ -37,7 +38,7 @@ export type {
   ContainerBackendConfig,
 } from './types';
 
-export { isPRIsolationRequest, CONTAINER_LABELS } from './types';
+export { isPRIsolationRequest, isContainerEnvironment, CONTAINER_LABELS } from './types';
 
 // --- Backend seam (folder projects) ---
 export { resolveFolderBackend } from './backend-router';
@@ -65,6 +66,14 @@ export type { IsolationResolverDeps } from './resolver';
 
 // --- Provider ---
 export { WorktreeProvider } from './providers/worktree';
+export {
+  ContainerProvider,
+  composeProjectFor,
+  composeProjectFromWorkingPath,
+  CONTAINER_WORKDIR,
+  CONTAINER_META_DIR,
+} from './providers/container';
+export type { ContainerProviderDeps } from './providers/container';
 
 // --- PR state lookup ---
 export { getPrState } from './pr-state';
