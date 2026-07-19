@@ -58,7 +58,12 @@ export type { IIsolationStore } from './store';
 export { IsolationBlockedError, classifyIsolationError } from './errors';
 
 // --- Factory ---
-export { getIsolationProvider, configureIsolation, resetIsolationProvider } from './factory';
+export {
+  getIsolationProvider,
+  configureIsolation,
+  resetIsolationProvider,
+  selectIsolationProvider,
+} from './factory';
 
 // --- Resolver ---
 export { IsolationResolver } from './resolver';

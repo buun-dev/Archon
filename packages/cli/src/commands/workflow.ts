@@ -22,11 +22,17 @@ import {
 } from '@archon/workflows/model-validation';
 import {
   configureIsolation,
-  getIsolationProvider,
+  selectIsolationProvider,
+  isContainerEnvironment,
   resolveFolderBackend,
   classifyIsolationError,
 } from '@archon/isolation';
-import type { ExecutionContext, ContainerBackend, ContainerBackendConfig } from '@archon/isolation';
+import type {
+  ExecutionContext,
+  ContainerBackend,
+  ContainerBackendConfig,
+  RepoConfigLoader,
+} from '@archon/isolation';
 import {
   createLogger,
   getArchonHome,
@@ -1295,17 +1301,27 @@ export async function workflowRunCommand(
     const branchIdentifier = options.branchName ?? `${workflowName}-${Date.now()}`;
 
     // Configure isolation with repo config loader (same as orchestrator)
-    configureIsolation(async (repoPath: string) => {
-      const repoConfig = await loadRepoConfig(repoPath);
-      return repoConfig?.worktree ?? null;
+    const worktreeConfigLoader: RepoConfigLoader = async repoPath =>
+      (await loadRepoConfig(repoPath))?.worktree ?? null;
+    configureIsolation(worktreeConfigLoader);
+
+    // Repo-kind container isolation is opt-in via `.archon/config.yaml
+    // isolation.provider: container` — route to the WSL-sandbox ContainerProvider
+    // (which brings up the container and returns a container execContext). Default
+    // (worktree) is byte-identical to today's host run.
+    const repoIsolationConfig = await loadRepoConfig(codebase.default_cwd);
+    const provider = selectIsolationProvider(repoIsolationConfig?.isolation?.provider, {
+      loadConfig: worktreeConfigLoader,
     });
+    const wantsContainerIsolation = provider.providerType === 'container';
 
-    const provider = getIsolationProvider();
-
-    // Check for existing worktree (only when explicit --branch)
-    const existingEnv = options.branchName
-      ? await isolationDb.findActiveByWorkflow(codebase.id, 'task', options.branchName)
-      : undefined;
+    // Check for existing worktree (only when explicit --branch). Container runs
+    // skip this reuse shortcut: `sandbox.sh up` is idempotent (a re-up re-asserts
+    // the stack), and reuse-by-branch would return no execContext.
+    const existingEnv =
+      !wantsContainerIsolation && options.branchName
+        ? await isolationDb.findActiveByWorkflow(codebase.id, 'task', options.branchName)
+        : undefined;
 
     if (existingEnv && (await provider.healthCheck(existingEnv.working_path))) {
       if (options.fromBranch) {
@@ -1380,7 +1396,7 @@ export async function workflowRunCommand(
         codebase_id: codebase.id,
         workflow_type: 'task',
         workflow_id: branchIdentifier,
-        provider: 'worktree',
+        provider: isolatedEnv.provider,
         working_path: isolatedEnv.workingPath,
         branch_name: isolatedEnv.branchName,
         created_by_platform: 'cli',
@@ -1389,7 +1405,13 @@ export async function workflowRunCommand(
 
       workingCwd = isolatedEnv.workingPath;
       isolationEnvId = envRecord.id;
-      getLog().info({ path: workingCwd }, 'worktree_created');
+      // A container provider brought up the WSL sandbox and returned a container
+      // execContext — thread it so the engine runs every node via `docker exec` at
+      // /work. Worktree runs keep the default host execContext (unchanged).
+      if (isContainerEnvironment(isolatedEnv)) {
+        execContext = isolatedEnv.execContext;
+      }
+      getLog().info({ path: workingCwd, provider: isolatedEnv.provider }, 'worktree_created');
     }
   } else if (options.noWorktree) {
     getLog().info({ cwd }, 'workflow.running_without_isolation');

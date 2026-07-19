@@ -44,9 +44,10 @@ mock.module('@archon/paths', () => ({
 }));
 
 // Mock @archon/isolation (getIsolationProvider moved here from @archon/core)
-mock.module('@archon/isolation', () => ({
-  configureIsolation: mock(() => undefined),
-  getIsolationProvider: mock(() => ({
+mock.module('@archon/isolation', () => {
+  // Fresh provider per call so tests inspect `.mock.results.at(-1)` for their run.
+  const makeWorktreeProvider = (): Record<string, unknown> => ({
+    providerType: 'worktree',
     create: mock(() =>
       Promise.resolve({
         provider: 'worktree',
@@ -59,8 +60,38 @@ mock.module('@archon/isolation', () => ({
       })
     ),
     healthCheck: mock(() => Promise.resolve(true)),
-  })),
-}));
+  });
+  const getIsolationProvider = mock(() => makeWorktreeProvider());
+  return {
+    configureIsolation: mock(() => undefined),
+    getIsolationProvider,
+    // Mirrors the real seam: container config → a container provider, else the
+    // worktree singleton (routed through getIsolationProvider so tests that read
+    // its `.mock.results` still see the provider they assert on).
+    selectIsolationProvider: mock((providerType?: string) =>
+      providerType === 'container'
+        ? {
+            providerType: 'container',
+            create: mock(() =>
+              Promise.resolve({
+                provider: 'container',
+                id: '/home/bunny/archon/worktrees/repo/slug',
+                workingPath: '/home/bunny/archon/worktrees/repo/slug',
+                branchName: 'sandbox/slug',
+                project: 'archon-repo-slug',
+                execContext: { kind: 'container', containerId: 'cid-test', workdir: '/work' },
+                status: 'active',
+                createdAt: new Date(),
+                metadata: { adopted: false },
+              })
+            ),
+            healthCheck: mock(() => Promise.resolve(true)),
+          }
+        : getIsolationProvider()
+    ),
+    isContainerEnvironment: (env: { provider?: string }) => env?.provider === 'container',
+  };
+});
 
 // Mock the @archon/core modules
 mock.module('@archon/core', () => ({

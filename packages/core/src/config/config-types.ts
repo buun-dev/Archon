@@ -290,6 +290,18 @@ export interface RepoConfig {
   container?: ContainerConfig;
 
   /**
+   * Isolation strategy for this repo-kind project.
+   *
+   * `worktree` (default) runs on the host in a git worktree; `container` runs the
+   * worktree inside the WSL sandbox (`docker exec` at `/work`, via the
+   * ContainerProvider). Folder projects ignore this — they select in-place vs the
+   * folder container backend through the `container` section above.
+   */
+  isolation?: {
+    provider?: 'worktree' | 'container';
+  };
+
+  /**
    * Per-project environment variables injected into Claude SDK subprocess env.
    * Values here override process.env for workflow node execution.
    * Sensitive — do not commit actual secrets to version-controlled repos.

@@ -5,8 +5,9 @@
  * Currently only supports WorktreeProvider (git worktrees).
  */
 
-import type { IIsolationProvider, RepoConfigLoader } from './types';
+import type { IIsolationProvider, RepoConfigLoader, IsolationProviderType } from './types';
 import { WorktreeProvider } from './providers/worktree';
+import { ContainerProvider, type ContainerProviderDeps } from './providers/container';
 
 let provider: IIsolationProvider | null = null;
 let configuredLoader: RepoConfigLoader = () => Promise.resolve(null);
@@ -35,4 +36,23 @@ export function getIsolationProvider(): IIsolationProvider {
  */
 export function resetIsolationProvider(): void {
   provider = null;
+}
+
+/**
+ * Select the isolation provider for a repo-kind codebase from its resolved
+ * `isolation.provider` config.
+ *
+ * `'container'` builds a FRESH ContainerProvider per dispatch — it carries a
+ * run-specific containerId + pathMap, so it must not be the reusable singleton.
+ * Anything else (undefined / `'worktree'`) returns the shared WorktreeProvider
+ * from {@link getIsolationProvider} (host execution, byte-identical to today).
+ */
+export function selectIsolationProvider(
+  providerType: IsolationProviderType | undefined,
+  containerDeps: ContainerProviderDeps
+): IIsolationProvider {
+  if (providerType === 'container') {
+    return new ContainerProvider(containerDeps);
+  }
+  return getIsolationProvider();
 }

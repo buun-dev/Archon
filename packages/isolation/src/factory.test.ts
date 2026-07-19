@@ -1,5 +1,10 @@
 import { describe, test, expect, afterEach } from 'bun:test';
-import { getIsolationProvider, resetIsolationProvider, configureIsolation } from './factory';
+import {
+  getIsolationProvider,
+  resetIsolationProvider,
+  configureIsolation,
+  selectIsolationProvider,
+} from './factory';
 
 describe('Isolation Provider Factory', () => {
   afterEach(() => {
@@ -29,5 +34,16 @@ describe('Isolation Provider Factory', () => {
   test('provider type is worktree', () => {
     const provider = getIsolationProvider();
     expect(provider.providerType).toBe('worktree');
+  });
+
+  test('selectIsolationProvider returns a ContainerProvider for provider="container"', () => {
+    const provider = selectIsolationProvider('container', {});
+    expect(provider.providerType).toBe('container');
+  });
+
+  test('selectIsolationProvider falls back to the worktree singleton for undefined/"worktree"', () => {
+    const singleton = getIsolationProvider();
+    expect(selectIsolationProvider(undefined, {})).toBe(singleton);
+    expect(selectIsolationProvider('worktree', {})).toBe(singleton);
   });
 });
