@@ -143,6 +143,39 @@ describe('ContainerProvider.create', () => {
   });
 });
 
+describe('ContainerProvider.writeBackBackend (engine container-run port)', () => {
+  const ENV_ID = '/home/bunny/archon/worktrees/marphob-page/task-x';
+
+  test('suspend stops the compose agent service (pause economics; reattach restarts it)', async () => {
+    const { calls, runSandbox, docker } = makeRunners();
+    const provider = new ContainerProvider({ runSandbox, docker, loadConfig: async () => null });
+
+    await provider.writeBackBackend().suspend(ENV_ID);
+
+    const stop = calls.docker.find(a => a.includes('stop'));
+    expect(stop).toContain('-p');
+    expect(stop).toContain('archon-marphob-page-task-x');
+    expect(stop).toContain('agent');
+  });
+
+  test('finalize never requests approval — a worktree branch has no overlay to write back', async () => {
+    const { runSandbox, docker } = makeRunners();
+    const provider = new ContainerProvider({ runSandbox, docker, loadConfig: async () => null });
+
+    await expect(provider.writeBackBackend().finalize(ENV_ID)).resolves.toEqual({
+      requiresApproval: false,
+    });
+  });
+
+  test('applyChanges and discardChanges are unreachable for repo-kind runs and reject loudly', async () => {
+    const { runSandbox, docker } = makeRunners();
+    const provider = new ContainerProvider({ runSandbox, docker, loadConfig: async () => null });
+
+    await expect(provider.writeBackBackend().applyChanges(ENV_ID)).rejects.toThrow(/write-back/i);
+    await expect(provider.writeBackBackend().discardChanges(ENV_ID)).rejects.toThrow(/write-back/i);
+  });
+});
+
 describe('ContainerProvider.reattach (resume / D8 recovery)', () => {
   test('restarts the agent then rebuilds the execContext from a working path', async () => {
     const { calls, runSandbox, docker } = makeRunners('cid-resumed');

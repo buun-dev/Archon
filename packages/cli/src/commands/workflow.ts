@@ -49,7 +49,11 @@ import { spawn } from 'node:child_process';
 import { createWorkflowDeps } from '@archon/core/workflows/store-adapter';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import { resolveWorkflowName } from '@archon/workflows/router';
-import { executeWorkflow, hydrateResumableRun } from '@archon/workflows/executor';
+import {
+  executeWorkflow,
+  hydrateResumableRun,
+  type ContainerRunContext,
+} from '@archon/workflows/executor';
 import { assertWorkflowRequirementsMet } from '@archon/workflows/utils/workflow-requirements';
 import {
   getWorkflowEventEmitter,
@@ -1101,6 +1105,13 @@ export async function workflowRunCommand(
   // Overlay mode the backend actually mounted (fuse = unprivileged; native =
   // CAP_SYS_ADMIN, gate-bypassable). Threaded to the engine for the H4 run-start warning.
   let containerOverlayMode: 'fuse' | 'native' | undefined;
+  // Engine `container` context for a REPO-KIND sandbox resume: the executor's
+  // resume guard requires it for any run stamped `isolation: 'container'`.
+  // Deliberately SEPARATE from containerBackend/containerEnvId above — those also
+  // engage the folder teardown paths (destroy on terminal outcome / SIGINT), which
+  // for a repo-kind sandbox would `sandbox.sh down` the worktree + branch and lose
+  // un-pushed work. Repo-kind sandbox teardown stays manual (`workflow complete`).
+  let repoContainerCtx: ContainerRunContext | undefined;
 
   // Handle --resume: locate the prior failed run, reuse its worktree, and hand
   // the resumed-run handle to executeWorkflow below via opts. The executor no
@@ -1185,6 +1196,15 @@ export async function workflowRunCommand(
         const containerProvider = new ContainerProvider({ loadConfig: worktreeConfigLoader });
         const reattached = await containerProvider.reattach(matchingEnv.working_path);
         execContext = reattached.execContext;
+        // Thread the engine's `container` context: without it the executor's
+        // resume guard fails the run (`container_resume_without_backend`) even
+        // though the container was just reattached. `finalize` never requests
+        // approval for a repo-kind sandbox, so no write-back gate is raised.
+        repoContainerCtx = {
+          envId: matchingEnv.id,
+          writeBack: 'approve',
+          backend: containerProvider.writeBackBackend(),
+        };
         const snapshottedBase = matchingEnv.metadata?.baseBranch;
         if (typeof snapshottedBase === 'string') resumeBaseBranch = snapshottedBase;
         getLog().info(
@@ -1670,7 +1690,7 @@ export async function workflowRunCommand(
           backend: containerBackend,
           ...(containerOverlayMode ? { overlayMode: containerOverlayMode } : {}),
         }
-      : undefined;
+      : repoContainerCtx;
   try {
     const opts = prepared
       ? {
