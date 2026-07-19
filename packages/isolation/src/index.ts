@@ -38,7 +38,12 @@ export type {
   ContainerBackendConfig,
 } from './types';
 
-export { isPRIsolationRequest, isContainerEnvironment, CONTAINER_LABELS } from './types';
+export {
+  isPRIsolationRequest,
+  isContainerEnvironment,
+  isHostVisibleEnv,
+  CONTAINER_LABELS,
+} from './types';
 
 // --- Backend seam (folder projects) ---
 export { resolveFolderBackend } from './backend-router';

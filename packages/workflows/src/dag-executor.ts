@@ -24,7 +24,11 @@ import type {
   ExecutionContext,
   OverlayChangeSummary,
 } from '@archon/providers/types';
-import { CONTAINER_ENV_DENYLIST, remapContainerPath } from '@archon/providers/types';
+import {
+  CONTAINER_ENV_DENYLIST,
+  remapContainerPath,
+  assertHostSpawnCwdSafe,
+} from '@archon/providers/types';
 import type { ContainerRunContext } from './container-context';
 import { WRITEBACK_GATE_NODE_ID } from './container-context';
 import {
@@ -2278,6 +2282,10 @@ async function runSubprocess(
     });
     return execFileAsync('docker', dockerArgs, { timeout: options.timeout });
   }
+  // Host spawn: fail fast if a container-style cwd (e.g. the WSL worktree /home/…)
+  // reached a host execContext — on win32 it would resolve drive-relative and
+  // escape the sandbox. A throw here means a node missed its container execContext.
+  assertHostSpawnCwdSafe(options.cwd, execContext);
   return execFileAsync(cmd, args, {
     cwd: options.cwd,
     timeout: options.timeout,

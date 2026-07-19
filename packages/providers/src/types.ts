@@ -378,6 +378,39 @@ export function remapContainerPath(value: string, pathMap?: ContainerPathMap): s
 }
 
 /**
+ * Container-style absolute paths — the WSL sandbox mount roots (`/work`,
+ * `/home/...`, `/archon-meta`). On win32 a leading-`/` path resolves DRIVE-relative
+ * (`/home/x` → `D:\home\x`), so spawning one on the host silently escapes the
+ * sandbox onto the Windows filesystem. Boundary-anchored so `/homework` and
+ * `/workspace` do NOT match.
+ */
+export function isContainerStylePath(p: string): boolean {
+  return /^\/(home|work|archon-meta)(\/|$)/.test(p);
+}
+
+/**
+ * Fail-fast tripwire: a HOST spawn must never run at a container-style cwd on
+ * win32 — it would escape the sandbox to a drive-relative path (this guard caught
+ * real prod escapes). No-op for a container execContext (docker exec owns the cwd)
+ * and off win32 (leading-`/` paths are real there). A throw here means a missed
+ * execContext thread — the node should have run in-container.
+ */
+export function assertHostSpawnCwdSafe(
+  cwd: string,
+  execContext: ExecutionContext,
+  platform: NodeJS.Platform = process.platform
+): void {
+  if (execContext.kind === 'container') return;
+  if (platform === 'win32' && isContainerStylePath(cwd)) {
+    throw new Error(
+      `Refusing a host spawn at container-style cwd '${cwd}': on Windows a leading-'/' ` +
+        'path resolves drive-relative and would escape the sandbox. This is a missed ' +
+        "execContext thread — the node should run in-container (kind:'container')."
+    );
+  }
+}
+
+/**
  * Container write-back contract (folder-project container backend, Phase C).
  *
  * These plain-data shapes describe the overlay diff of a finished container run

@@ -1,5 +1,10 @@
 import { describe, test, expect } from 'bun:test';
-import { remapContainerPath, type ContainerPathMap } from './types';
+import {
+  remapContainerPath,
+  isContainerStylePath,
+  assertHostSpawnCwdSafe,
+  type ContainerPathMap,
+} from './types';
 
 // The worktree lives in the WSL distro (POSIX path); the run meta dir is a host
 // (win32) path bind-mounted at /archon-meta. A single pathMap remaps both, so a
@@ -47,5 +52,45 @@ describe('remapContainerPath', () => {
 
   test('leaves an empty value untouched', () => {
     expect(remapContainerPath('', MAP)).toBe('');
+  });
+});
+
+describe('isContainerStylePath', () => {
+  test('flags the sandbox mount roots and their subpaths', () => {
+    expect(isContainerStylePath('/work')).toBe(true);
+    expect(isContainerStylePath('/work/src/app.ts')).toBe(true);
+    expect(isContainerStylePath('/home/bunny/archon/worktrees/repo/slug')).toBe(true);
+    expect(isContainerStylePath('/archon-meta/logs')).toBe(true);
+  });
+
+  test('does not flag host paths or non-boundary near-matches', () => {
+    expect(isContainerStylePath('D:\\Project\\x')).toBe(false);
+    expect(isContainerStylePath('/homework')).toBe(false); // boundary: /home vs /homework
+    expect(isContainerStylePath('/workspace/x')).toBe(false); // boundary: /work vs /workspace
+    expect(isContainerStylePath('/usr/local/bin')).toBe(false);
+  });
+});
+
+describe('assertHostSpawnCwdSafe', () => {
+  const HOST = { kind: 'host' as const };
+  const CONTAINER = { kind: 'container' as const, containerId: 'c' };
+
+  test('throws on win32 for a HOST spawn at a container-style cwd (sandbox escape)', () => {
+    expect(() => assertHostSpawnCwdSafe('/work', HOST, 'win32')).toThrow(/container-style/i);
+    expect(() => assertHostSpawnCwdSafe('/home/bunny/x', HOST, 'win32')).toThrow(
+      /escape|container/i
+    );
+  });
+
+  test('no-op for a container execContext (docker exec owns the cwd)', () => {
+    expect(() => assertHostSpawnCwdSafe('/work', CONTAINER, 'win32')).not.toThrow();
+  });
+
+  test('no-op on non-win32 hosts (leading-/ paths are real there)', () => {
+    expect(() => assertHostSpawnCwdSafe('/work', HOST, 'linux')).not.toThrow();
+  });
+
+  test('allows a normal host cwd on win32', () => {
+    expect(() => assertHostSpawnCwdSafe('D:\\Project\\repo', HOST, 'win32')).not.toThrow();
   });
 });

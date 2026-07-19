@@ -5,6 +5,7 @@
  */
 import { createLogger } from '@archon/paths';
 import { toWorktreePath, worktreeExists } from '@archon/git';
+import { isHostVisibleEnv, type IsolationProviderType } from '@archon/isolation/types';
 import * as isolationDb from '../db/isolation-environments';
 import { cleanupStaleWorktrees, cleanupMergedWorktrees } from '../services/cleanup-service';
 import type { CleanupOperationResult } from '../services/cleanup-service';
@@ -49,10 +50,15 @@ async function reconcileGhosts(
     working_path: string;
     branch_name: string | null;
     workflow_id: string;
+    provider?: IsolationProviderType;
   }[]
 ): Promise<number> {
   let reconciled = 0;
   for (const env of envs) {
+    // A host-invisible env (container) lives in the WSL distro — a host stat would
+    // false-negative and destroy a LIVE run's row (its only resume source of truth).
+    // Skip it before any host stat. Legacy rows without a provider stay host-visible.
+    if (env.provider && !isHostVisibleEnv(env.provider)) continue;
     try {
       const exists = await worktreeExists(toWorktreePath(env.working_path));
       if (!exists) {

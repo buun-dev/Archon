@@ -109,6 +109,26 @@ describe('listEnvironments', () => {
     expect(result.totalEnvironments).toBe(0); // re-fetch returned empty
   });
 
+  test('spares a container env from ghosting (host cannot stat its distro path)', async () => {
+    mockListAllActiveWithCodebase.mockResolvedValueOnce([makeActiveEnv()]);
+    mockListByCodebaseWithAge.mockResolvedValueOnce([
+      makeEnvWithAge({
+        id: 'env-container',
+        provider: 'container',
+        working_path: '/home/bunny/archon/worktrees/repo/slug',
+      }),
+    ]);
+
+    const result = await listEnvironments();
+
+    // A host worktreeExists on the distro path would false-negative and destroy a
+    // LIVE container env — the guard must skip it BEFORE any host stat.
+    expect(mockWorktreeExists).not.toHaveBeenCalled();
+    expect(mockUpdateStatus).not.toHaveBeenCalled();
+    expect(result.ghostsReconciled).toBe(0);
+    expect(result.totalEnvironments).toBe(1);
+  });
+
   test('does not re-fetch when no ghosts found', async () => {
     mockListAllActiveWithCodebase.mockResolvedValueOnce([makeActiveEnv()]);
     mockListByCodebaseWithAge.mockResolvedValueOnce([makeEnvWithAge()]);

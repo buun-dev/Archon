@@ -23,6 +23,18 @@ export type { ExecutionContext, WriteBackFinalizeResult, WriteBackApplySummary }
 
 export type IsolationProviderType = 'worktree' | 'container' | 'vm' | 'remote';
 
+/**
+ * Can the host `stat` this env's `working_path`? True for every provider whose
+ * worktree lives on the host filesystem; FALSE for `container` — its worktree
+ * lives in the WSL distro (`/home/…`), so a host `existsSync`/`worktreeExists`
+ * ALWAYS false-negatives. Callers that read a false-negative as "worktree gone"
+ * would destroy a LIVE container env's row (its only resume source of truth), so
+ * host-liveness checks MUST skip a host-invisible env.
+ */
+export function isHostVisibleEnv(provider: IsolationProviderType): boolean {
+  return provider !== 'container';
+}
+
 export type IsolationWorkflowType = 'issue' | 'pr' | 'review' | 'thread' | 'task';
 
 export type EnvironmentStatus = 'active' | 'destroyed';
