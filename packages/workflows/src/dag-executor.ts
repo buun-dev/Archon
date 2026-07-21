@@ -55,6 +55,7 @@ import type {
   SandboxSettings,
   WorkflowSource,
   LoopGateRunMetadata,
+  ApprovalContext,
 } from './schemas';
 import {
   isBashNode,
@@ -3475,7 +3476,7 @@ async function executeLoopGroupNode(
         .catch((err: Error) => {
           logEventStoreError(err, i);
         });
-      await deps.store.pauseWorkflowRun(workflowRun.id, {
+      await pauseGateRespectingExternalTransition(deps, workflowRun.id, {
         nodeId: node.id,
         message: honestMessage,
         type: 'interactive_loop',
@@ -3493,12 +3494,6 @@ async function executeLoopGroupNode(
         // for honesty; pauseWorkflowRun nulls both on every fresh pause.
         completionSignaled: completionDetected,
         signaledOutput: completionDetected ? lastIterationOutput : null,
-      });
-      getWorkflowEventEmitter().emit({
-        type: 'approval_pending',
-        runId: workflowRun.id,
-        nodeId: node.id,
-        message: honestMessage,
       });
       return {
         state: 'completed',
@@ -3591,7 +3586,11 @@ export function applyLoopPrevToBodyNode(
       ...node,
       loop: {
         ...node.loop,
-        prompt: sub(node.loop.prompt),
+        // A command-backed loop has no inline prompt to substitute — its prompt text
+        // is loaded from the command file inside executeLoopNode. Group-level
+        // $LOOP_PREV.<bodyId>.output refs are resolved only in YAML fields (this
+        // pass); they are not scanned inside command-file bodies.
+        ...(node.loop.prompt !== undefined ? { prompt: sub(node.loop.prompt) } : {}),
         ...(node.loop.until_bash !== undefined
           ? { until_bash: sub(node.loop.until_bash, true) }
           : {}),
@@ -3671,6 +3670,7 @@ async function executeLoopNode(
   nodeOutputs: Map<string, NodeOutput>,
   config: WorkflowConfig,
   issueContext?: string,
+  configuredCommandFolder?: string,
   stepNamePrefix = '',
   execContext: ExecutionContext = { kind: 'host' }
 ): Promise<NodeExecutionResult> {
@@ -3681,19 +3681,88 @@ async function executeLoopNode(
   // each event's data (`iteration`), so no separate iteration param is threaded here.
   const stepName = stepNamePrefix + node.id;
 
-  // Resolve AI client — fail fast with descriptive error
-  let aiClient: ReturnType<typeof deps.getAgentProvider>;
-  try {
-    aiClient = deps.getAgentProvider(workflowProvider);
-  } catch (error) {
-    const err = error as Error;
-    const errorMsg = `Invalid provider '${workflowProvider}' for loop node '${node.id}'. Check workflow YAML or .archon/config.yaml. Original: ${err.message}`;
-    getLog().error(
-      { err, nodeId: node.id, provider: workflowProvider },
-      'loop_node.provider_failed'
-    );
-    return { state: 'failed', output: '', error: errorMsg };
-  }
+  // Emit node_started up-front so every terminal outcome of this loop node is
+  // paired with a corresponding _started event — same pattern the bash and
+  // script node executors follow. The pairing contract: every `return` of a
+  // failed result below goes through `failLoopNode` (one terminal log line, one
+  // persisted node_failed row, exactly one node_failed emitter event), success
+  // paths write node_completed, and a gate pause intentionally has NO terminal
+  // event (the node is still in flight; the resumed invocation emits its own
+  // node_started and eventually the terminal event). Exits that THROW (e.g.
+  // until_bash system errors) are paired by the dispatcher's catch in
+  // runLayers, which emits its own node_failed.
+  getLog().info({ nodeId: node.id, type: 'loop' }, 'loop_node.started');
+  await logNodeStart(logDir, workflowRun.id, node.id, '<loop>');
+
+  deps.store
+    .createWorkflowEvent({
+      workflow_run_id: workflowRun.id,
+      event_type: 'node_started',
+      step_name: stepName,
+      data: { type: 'loop', command: loop.command ?? null },
+    })
+    .catch((err: Error) => {
+      getLog().error(
+        { err, workflowRunId: workflowRun.id, eventType: 'node_started' },
+        'workflow_event_persist_failed'
+      );
+    });
+
+  getWorkflowEventEmitter().emit({
+    type: 'node_started',
+    runId: workflowRun.id,
+    nodeId: node.id,
+    nodeName: node.id,
+  });
+
+  /**
+   * Single failure finalizer for this loop node (see the pairing contract on
+   * the node_started comment above). Call sites keep their specific diagnostic
+   * logs/events (e.g. loop_iteration_failed with per-iteration data); this
+   * closes the node's lifecycle exactly once.
+   */
+  const failLoopNode = async (
+    error: string,
+    extras: {
+      output?: string;
+      costUsd?: number;
+      tokens?: TokenUsage;
+      loopIterations?: number;
+      /** Extra persisted node_failed payload (e.g. the failing command name). */
+      data?: Record<string, unknown>;
+    } = {}
+  ): Promise<NodeExecutionResult> => {
+    getLog().error({ nodeId: node.id, error, ...(extras.data ?? {}) }, 'loop_node.failed');
+    await logNodeError(logDir, workflowRun.id, node.id, error);
+    deps.store
+      .createWorkflowEvent({
+        workflow_run_id: workflowRun.id,
+        event_type: 'node_failed',
+        step_name: stepName,
+        data: { error, ...(extras.data ?? {}) },
+      })
+      .catch((err: Error) => {
+        getLog().error(
+          { err, workflowRunId: workflowRun.id, eventType: 'node_failed' },
+          'workflow_event_persist_failed'
+        );
+      });
+    getWorkflowEventEmitter().emit({
+      type: 'node_failed',
+      runId: workflowRun.id,
+      nodeId: node.id,
+      nodeName: node.id,
+      error,
+    });
+    return {
+      state: 'failed',
+      output: extras.output ?? '',
+      error,
+      ...(extras.costUsd !== undefined ? { costUsd: extras.costUsd } : {}),
+      ...(extras.tokens !== undefined ? { tokens: extras.tokens } : {}),
+      ...(extras.loopIterations !== undefined ? { loopIterations: extras.loopIterations } : {}),
+    };
+  };
 
   // Detect interactive loop resume — check if workflowRun.metadata has loop gate state for this node
   const rawApproval = workflowRun.metadata?.approval;
@@ -3709,7 +3778,9 @@ async function executeLoopNode(
   // Finalize-on-approve (#2074): a gate that paused on a signal-bearing iteration,
   // resumed WITHOUT feedback, completes the node from the persisted output instead of
   // re-running the (expensive) iteration. Feedback (loop_feedback_given) OR a
-  // non-signaled gate falls through to a normal resumed iteration below.
+  // non-signaled gate falls through to a normal resumed iteration below. Runs
+  // BEFORE prompt-source resolution: a bare approve never needs the prompt, so a
+  // command file deleted while the run sat paused cannot fail the finalize.
   const feedbackGiven = loopGateRunMeta.loop_feedback_given === true;
   if (isLoopResume && loopGateMeta?.completionSignaled === true && !feedbackGiven) {
     const finalizeOutput = loopGateMeta.signaledOutput ?? '';
@@ -3724,6 +3795,61 @@ async function executeLoopNode(
       finalizeOutput
     );
     return { state: 'completed', output: finalizeOutput, sessionId: currentSessionId };
+  }
+
+  // Resolve the iteration prompt source. `loop.prompt` is used directly;
+  // `loop.command` is read ONCE per run/node: the first invocation loads the
+  // command file, and the interactive gate persists the loaded text
+  // (`commandSnapshot` in the pause context) so a resumed invocation reuses the
+  // snapshot instead of re-reading — a command file edited or deleted while the
+  // run sat paused at a gate can neither change nor break the running loop's
+  // prompt. The schema guarantees exactly one of prompt/command is defined.
+  let loopPromptTemplate: string;
+  if (typeof loop.prompt === 'string') {
+    loopPromptTemplate = loop.prompt;
+  } else if (typeof loop.command === 'string') {
+    if (isLoopResume && typeof loopGateMeta?.commandSnapshot === 'string') {
+      loopPromptTemplate = loopGateMeta.commandSnapshot;
+    } else {
+      // Fresh execution — or a resume of a run paused under a build that
+      // predates commandSnapshot: fall back to a fresh read (documented,
+      // fail-safe) rather than failing an otherwise-valid resume.
+      const promptResult = await loadCommandPrompt(
+        deps,
+        cwd,
+        loop.command,
+        configuredCommandFolder
+      );
+      if (!promptResult.success) {
+        getLog().error(
+          { nodeId: node.id, command: loop.command, error: promptResult.message },
+          'loop_node.command_load_failed'
+        );
+        // The failing command name travels on the node_failed payload so the
+        // event stream carries the same context as the structured log.
+        return failLoopNode(promptResult.message, { data: { command: loop.command } });
+      }
+      loopPromptTemplate = promptResult.content;
+    }
+  } else {
+    // Unreachable: superRefine on loopNodeConfigSchema enforces exactly-one.
+    throw new Error(
+      `Loop node '${node.id}' has neither 'loop.prompt' nor 'loop.command' — schema invariant violated`
+    );
+  }
+
+  // Resolve AI client — fail fast with descriptive error
+  let aiClient: ReturnType<typeof deps.getAgentProvider>;
+  try {
+    aiClient = deps.getAgentProvider(workflowProvider);
+  } catch (error) {
+    const err = error as Error;
+    const errorMsg = `Invalid provider '${workflowProvider}' for loop node '${node.id}'. Check workflow YAML or .archon/config.yaml. Original: ${err.message}`;
+    getLog().error(
+      { err, nodeId: node.id, provider: workflowProvider },
+      'loop_node.provider_failed'
+    );
+    return failLoopNode(errorMsg, { data: { provider: workflowProvider } });
   }
 
   let lastIterationOutput = '';
@@ -3767,7 +3893,12 @@ async function executeLoopNode(
         `Loop node '${node.id}' stopped at iteration ${String(i)} (${effectiveStatus})`,
         msgContext
       );
-      return { state: 'failed', output: '', error: `Workflow ${effectiveStatus}` };
+      return failLoopNode(`Workflow ${effectiveStatus}`, {
+        costUsd: loopTotalCostUsd,
+        ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
+        loopIterations: i - 1,
+        data: { status: effectiveStatus, iteration: i },
+      });
     }
 
     // Emit iteration started
@@ -3850,7 +3981,7 @@ async function executeLoopNode(
       // executor starts a fresh `lastIterationOutput` variable, so the first iteration of
       // the resume also receives an empty $LOOP_PREV_OUTPUT.
       const { prompt: substitutedPrompt } = substituteWorkflowVariables(
-        loop.prompt,
+        loopPromptTemplate,
         workflowRun.id,
         workflowRun.user_message,
         remapTextualPath(artifactsDir, execContext),
@@ -4143,14 +4274,12 @@ async function executeLoopNode(
           `Loop node '${node.id}' stopped during iteration ${String(i)} (${effectiveStatus})`,
           msgContext
         );
-        return {
-          state: 'failed',
-          output: '',
-          error: `Workflow ${effectiveStatus}`,
+        return await failLoopNode(`Workflow ${effectiveStatus}`, {
           costUsd: loopTotalCostUsd,
           ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
           loopIterations: i,
-        };
+          data: { status: effectiveStatus, iteration: i },
+        });
       }
     } catch (error) {
       foldIterationUsage();
@@ -4174,14 +4303,12 @@ async function executeLoopNode(
         .catch((evtErr: Error) => {
           logEventStoreError(evtErr, i);
         });
-      return {
-        state: 'failed',
-        output: '',
-        error: `Loop iteration ${i} failed: ${err.message}`,
+      return failLoopNode(`Loop iteration ${i} failed: ${err.message}`, {
         costUsd: loopTotalCostUsd,
         ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
         loopIterations: i,
-      };
+        data: { iteration: i },
+      });
     }
 
     // Notify on idle timeout
@@ -4232,14 +4359,12 @@ async function executeLoopNode(
         .catch((evtErr: Error) => {
           logEventStoreError(evtErr, i);
         });
-      return {
-        state: 'failed',
-        output: '',
-        error: `Loop iteration ${i} failed: ${emptyError}`,
+      return failLoopNode(`Loop iteration ${i} failed: ${emptyError}`, {
         costUsd: loopTotalCostUsd,
         ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
         loopIterations: i,
-      };
+        data: { iteration: i },
+      });
     }
 
     // Batch mode: send accumulated output
@@ -4453,11 +4578,16 @@ async function executeLoopNode(
           { nodeId: node.id, workflowRunId: workflowRun.id, iteration: i },
           'loop_node.gate_message_send_failed'
         );
-        return {
-          state: 'failed',
-          output: lastIterationOutput,
-          error: `Loop gate message failed to deliver for node '${node.id}' — cannot pause safely`,
-        };
+        return failLoopNode(
+          `Loop gate message failed to deliver for node '${node.id}' — cannot pause safely`,
+          {
+            output: lastIterationOutput,
+            costUsd: loopTotalCostUsd,
+            ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
+            loopIterations: i,
+            data: { iteration: i },
+          }
+        );
       }
       deps.store
         .createWorkflowEvent({
@@ -4469,7 +4599,7 @@ async function executeLoopNode(
         .catch((err: Error) => {
           logEventStoreError(err, i);
         });
-      await deps.store.pauseWorkflowRun(workflowRun.id, {
+      await pauseGateRespectingExternalTransition(deps, workflowRun.id, {
         nodeId: node.id,
         message: honestMessage,
         type: 'interactive_loop',
@@ -4482,12 +4612,10 @@ async function executeLoopNode(
         // for honesty; pauseWorkflowRun nulls both on every fresh pause.
         completionSignaled: completionDetected,
         signaledOutput: completionDetected ? lastIterationOutput : null,
-      });
-      getWorkflowEventEmitter().emit({
-        type: 'approval_pending',
-        runId: workflowRun.id,
-        nodeId: node.id,
-        message: honestMessage,
+        // Read-once command body for command-backed loops: the resumed invocation
+        // reuses this snapshot instead of re-reading the file (explicit null for
+        // prompt-based loops — same json_patch convention as `sessionId`).
+        commandSnapshot: typeof loop.command === 'string' ? loopPromptTemplate : null,
       });
       // Return completed — the between-layer status check sees 'paused' and halts cleanly.
       // This mirrors the approval-node pattern, preventing false "DAG nodes failed" warnings
@@ -4510,14 +4638,62 @@ async function executeLoopNode(
     'loop_node.max_iterations_reached'
   );
   await safeSendMessage(platform, conversationId, errorMsg, msgContext);
-  return {
-    state: 'failed',
+  return failLoopNode(errorMsg, {
     output: lastIterationOutput,
-    error: errorMsg,
     costUsd: loopTotalCostUsd,
     ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
     loopIterations: loop.max_iterations,
-  };
+    data: { maxIterations: loop.max_iterations },
+  });
+}
+
+/**
+ * Pause the run for a human gate, tolerating a lost CAS when the run was
+ * externally transitioned while the gate was being raised — e.g. a killed CLI's
+ * signal cleanup marked the run failed mid-pause (#1123), or an operator
+ * cancelled it from another surface. `pauseWorkflowRun`'s UPDATE only matches
+ * status='running'; when it misses, re-read the status: any non-running status
+ * means the pause lost a legitimate external race — log, skip the
+ * approval_pending emit, and return so the caller's normal completed-shaped
+ * output lets the between-layer status check halt the DAG cleanly (the same
+ * path a successful pause takes). On a successful pause, the approval_pending
+ * live signal is emitted HERE (from the ApprovalContext's own nodeId/message)
+ * so no call site can accidentally emit it after a lost CAS. A store error
+ * while the run is still 'running' is a genuine pause failure and rethrows.
+ *
+ * Deliberately NOT used by the container write-back gate (raiseWriteBackGate),
+ * which must stay fail-closed: a lost pause there may never fall through
+ * toward the apply/teardown path — throwing is the safe behavior, and the H2
+ * teardown-preserve logic keeps the overlay volume for a retry.
+ */
+async function pauseGateRespectingExternalTransition(
+  deps: WorkflowDeps,
+  runId: string,
+  approvalContext: ApprovalContext
+): Promise<void> {
+  try {
+    await deps.store.pauseWorkflowRun(runId, approvalContext);
+  } catch (pauseErr) {
+    let status: string | null;
+    try {
+      status = await deps.store.getWorkflowRunStatus(runId);
+    } catch {
+      // Status unknowable — surface the original pause failure.
+      throw pauseErr;
+    }
+    if (status === 'running') throw pauseErr;
+    getLog().warn(
+      { workflowRunId: runId, status, err: pauseErr as Error },
+      'dag.gate_pause_skipped_external_transition'
+    );
+    return;
+  }
+  getWorkflowEventEmitter().emit({
+    type: 'approval_pending',
+    runId,
+    nodeId: approvalContext.nodeId,
+    message: approvalContext.message,
+  });
 }
 
 /**
@@ -4703,7 +4879,7 @@ async function executeApprovalNode(
       );
     });
 
-  await deps.store.pauseWorkflowRun(workflowRun.id, {
+  await pauseGateRespectingExternalTransition(deps, workflowRun.id, {
     message: renderedMessage,
     nodeId: node.id,
     type: 'approval',
@@ -4712,14 +4888,8 @@ async function executeApprovalNode(
     onRejectMaxAttempts: node.approval.on_reject?.max_attempts,
   });
 
-  getWorkflowEventEmitter().emit({
-    type: 'approval_pending',
-    runId: workflowRun.id,
-    nodeId: node.id,
-    message: renderedMessage,
-  });
-
-  // Return completed — the between-layer status check will see 'paused' and break.
+  // Return completed — the between-layer status check will see 'paused' (or the
+  // external transition that beat the pause) and break.
   // On resume, the approve endpoint writes a real node_completed event with the user's response.
   return { state: 'completed' as const, output: '' };
 }
@@ -5170,6 +5340,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
               ctx.nodeOutputs,
               config,
               issueContext,
+              configuredCommandFolder,
               stepNamePrefix,
               execContext
             );

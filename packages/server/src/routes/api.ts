@@ -31,6 +31,7 @@ import {
   registerFolder,
   ConversationNotFoundError,
   generateAndSetTitle,
+  resolveTitleRequest,
   isPerUserGitHubEnabled,
   loadDeviceFlowConfig,
   startDeviceFlow,
@@ -74,10 +75,11 @@ import {
   checkForUpdate,
   BUNDLED_IS_BINARY,
   BUNDLED_VERSION,
+  parseOwnerRepo,
 } from '@archon/paths';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import { parseWorkflow } from '@archon/workflows/loader';
-import { isValidCommandName } from '@archon/workflows/command-validation';
+import { isValidCommandName, isValidWorkflowName } from '@archon/workflows/command-validation';
 import { BUNDLED_WORKFLOWS, BUNDLED_COMMANDS, isBinaryBuild } from '@archon/workflows/defaults';
 import {
   RESUMABLE_WORKFLOW_STATUSES,
@@ -2378,13 +2380,21 @@ export function registerApiRoutes(
         const placeholderTitle = message.length > 60 ? message.slice(0, 60) + '...' : message;
         await conversationDb.updateConversationTitle(conversation.id, placeholderTitle);
 
-        // Generate proper AI title for non-command messages (fire-and-forget, overwrites placeholder)
+        // Generate proper AI title for non-command messages (fire-and-forget, overwrites placeholder).
+        // Resolve the `small` tier (config tiers + per-user prefs) instead of the raw
+        // assistant default — the config-default Codex model may not be usable on the
+        // active account (e.g. ChatGPT-plan accounts, #1855). Both calls never throw.
         if (!message.startsWith('/')) {
-          void generateAndSetTitle(
-            conversation.id,
-            message,
-            conversation.ai_assistant_type,
-            getArchonWorkspacesPath()
+          void resolveTitleRequest(conversation.ai_assistant_type, userId).then(titleRequest =>
+            generateAndSetTitle(
+              conversation.id,
+              message,
+              titleRequest.provider,
+              getArchonWorkspacesPath(),
+              undefined,
+              titleRequest.options.assistantConfig,
+              titleRequest.options
+            )
           );
         }
 
@@ -2960,7 +2970,7 @@ export function registerApiRoutes(
   registerOpenApiRoute(runWorkflowRoute, async c => {
     const workflowName = c.req.param('name') ?? '';
     const userId = await resolveWebUserId(c);
-    if (!isValidCommandName(workflowName)) {
+    if (!isValidWorkflowName(workflowName)) {
       return apiError(c, 400, 'Invalid workflow name');
     }
 
@@ -3057,12 +3067,18 @@ export function registerApiRoutes(
         }
         webAdapter.setConversationDbId(conversationId, conv.id);
         if (!conv.title) {
-          void generateAndSetTitle(
-            conv.id,
-            message,
-            conv.ai_assistant_type,
-            getArchonWorkspacesPath(),
-            workflowName
+          // Resolve the `small` tier (config tiers + per-user prefs) instead of the raw
+          // assistant default (#1855). Both calls never throw.
+          void resolveTitleRequest(conv.ai_assistant_type, userId).then(titleRequest =>
+            generateAndSetTitle(
+              conv.id,
+              message,
+              titleRequest.provider,
+              getArchonWorkspacesPath(),
+              workflowName,
+              titleRequest.options.assistantConfig,
+              titleRequest.options
+            )
           );
         }
       }
@@ -3558,9 +3574,27 @@ export function registerApiRoutes(
   // GET /api/workflows/:name - Fetch a single workflow definition
   registerOpenApiRoute(getWorkflowRoute, async c => {
     const name = c.req.param('name') ?? '';
-    if (!isValidCommandName(name)) {
+    if (!isValidWorkflowName(name)) {
       return apiError(c, 400, 'Invalid workflow name');
     }
+
+    // Try `.yaml` then `.yml`, mirroring `loadWorkflowsFromDir` in
+    // workflow-discovery.ts so by-name lookup matches the list endpoint.
+    // Returns null if neither extension exists (caller tries the next source).
+    const tryReadWorkflowAt = async (
+      dir: string
+    ): Promise<{ filename: string; content: string } | null> => {
+      for (const ext of ['yaml', 'yml']) {
+        const filename = `${name}.${ext}`;
+        try {
+          const content = await readFile(join(dir, filename), 'utf-8');
+          return { filename, content };
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+        }
+      }
+      return null;
+    };
 
     try {
       const cwd = c.req.query('cwd');
@@ -3574,82 +3608,80 @@ export function registerApiRoutes(
         if (codebases.length > 0) workingDir = codebases[0].default_cwd;
       }
 
-      const filename = `${name}.yaml`;
-
       // 1. Try user-defined workflow in cwd.
       if (workingDir) {
         const [workflowFolder] = getWorkflowFolderSearchPaths();
-        const filePath = join(workingDir, workflowFolder, filename);
         try {
-          const content = await readFile(filePath, 'utf-8');
-          const result = parseWorkflow(content, filename);
-          if (result.error) {
-            return apiError(c, 500, `Workflow file is invalid: ${result.error.error}`);
+          const hit = await tryReadWorkflowAt(join(workingDir, workflowFolder));
+          if (hit) {
+            const result = parseWorkflow(hit.content, hit.filename);
+            if (result.error) {
+              return apiError(c, 500, `Workflow file is invalid: ${result.error.error}`);
+            }
+            return c.json({
+              workflow: result.workflow,
+              filename: hit.filename,
+              source: 'project' as WorkflowSource,
+            });
           }
-          return c.json({
-            workflow: result.workflow,
-            filename,
-            source: 'project' as WorkflowSource,
-          });
         } catch (err) {
-          if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-            getLog().error({ err, name }, 'workflow.fetch_failed');
-            return apiError(c, 500, 'Failed to read workflow');
-          }
+          getLog().error({ err, name }, 'workflow.fetch_failed');
+          return apiError(c, 500, 'Failed to read workflow');
         }
       }
 
       // 2. Fall back to home-scoped workflow (`~/.archon/workflows/`).
       // Mirrors the discovery order in `discoverWorkflowsWithConfig`.
-      {
-        const homeFilePath = join(getHomeWorkflowsPath(), filename);
-        try {
-          const content = await readFile(homeFilePath, 'utf-8');
-          const result = parseWorkflow(content, filename);
+      try {
+        const hit = await tryReadWorkflowAt(getHomeWorkflowsPath());
+        if (hit) {
+          const result = parseWorkflow(hit.content, hit.filename);
           if (result.error) {
             return apiError(c, 500, `Home workflow file is invalid: ${result.error.error}`);
           }
           return c.json({
             workflow: result.workflow,
-            filename,
+            filename: hit.filename,
             source: 'global' as WorkflowSource,
           });
-        } catch (err) {
-          if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-            getLog().error({ err, name }, 'workflow.fetch_home_failed');
-            return apiError(c, 500, 'Failed to read home-scoped workflow');
-          }
         }
+      } catch (err) {
+        getLog().error({ err, name }, 'workflow.fetch_home_failed');
+        return apiError(c, 500, 'Failed to read home-scoped workflow');
       }
 
       // 3. Fall back to bundled defaults.
       if (Object.hasOwn(BUNDLED_WORKFLOWS, name)) {
+        const bundledFilename = `${name}.yaml`;
         const bundledContent = BUNDLED_WORKFLOWS[name];
-        const result = parseWorkflow(bundledContent, filename);
+        const result = parseWorkflow(bundledContent, bundledFilename);
         if (result.error) {
           return apiError(c, 500, `Bundled workflow is invalid: ${result.error.error}`);
         }
-        return c.json({ workflow: result.workflow, filename, source: 'bundled' as WorkflowSource });
+        return c.json({
+          workflow: result.workflow,
+          filename: bundledFilename,
+          source: 'bundled' as WorkflowSource,
+        });
       }
 
       if (!isBinaryBuild()) {
-        const defaultFilePath = join(getDefaultWorkflowsPath(), filename);
         try {
-          const content = await readFile(defaultFilePath, 'utf-8');
-          const result = parseWorkflow(content, filename);
-          if (result.error) {
-            return apiError(c, 500, `Default workflow is invalid: ${result.error.error}`);
+          const hit = await tryReadWorkflowAt(getDefaultWorkflowsPath());
+          if (hit) {
+            const result = parseWorkflow(hit.content, hit.filename);
+            if (result.error) {
+              return apiError(c, 500, `Default workflow is invalid: ${result.error.error}`);
+            }
+            return c.json({
+              workflow: result.workflow,
+              filename: hit.filename,
+              source: 'bundled' as WorkflowSource,
+            });
           }
-          return c.json({
-            workflow: result.workflow,
-            filename,
-            source: 'bundled' as WorkflowSource,
-          });
         } catch (err) {
-          if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-            getLog().error({ err, name }, 'workflow.fetch_default_failed');
-            return apiError(c, 500, 'Failed to read default workflow');
-          }
+          getLog().error({ err, name }, 'workflow.fetch_default_failed');
+          return apiError(c, 500, 'Failed to read default workflow');
         }
       }
 
@@ -3760,21 +3792,29 @@ export function registerApiRoutes(
       workingDir = getArchonHome();
     }
 
-    const filePath =
+    const dir =
       targetSource === 'global'
-        ? join(getHomeWorkflowsPath(), `${name}.yaml`)
-        : join(workingDir, getWorkflowFolderSearchPaths()[0], `${name}.yaml`);
+        ? getHomeWorkflowsPath()
+        : join(workingDir, getWorkflowFolderSearchPaths()[0]);
 
-    try {
-      await unlink(filePath);
-      return c.json({ deleted: true, name });
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-        return apiError(c, 404, `Workflow not found: ${name}`);
+    // Remove both `.yaml` and `.yml` variants (discovery accepts either), so a
+    // twin file can't stay active after a reported deletion.
+    let deleted = false;
+    for (const ext of ['yaml', 'yml']) {
+      const filePath = join(dir, `${name}.${ext}`);
+      try {
+        await unlink(filePath);
+        deleted = true;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue;
+        getLog().error({ err, name }, 'workflow.delete_failed');
+        return apiError(c, 500, 'Failed to delete workflow');
       }
-      getLog().error({ err, name }, 'workflow.delete_failed');
-      return apiError(c, 500, 'Failed to delete workflow');
     }
+    if (deleted) {
+      return c.json({ deleted: true, name });
+    }
+    return apiError(c, 404, `Workflow not found: ${name}`);
   });
 
   // GET /api/commands - List available command names for the workflow node palette
@@ -3897,11 +3937,9 @@ export function registerApiRoutes(
       }
     }
     if (!codebase?.name) return c.json({ files: [] });
-    const nameParts = codebase.name.split('/');
-    if (nameParts.length < 2) return c.json({ files: [] });
-    const owner = nameParts[0];
-    const repo = nameParts[1];
-    if (!owner || !repo) return c.json({ files: [] });
+    const parsed = parseOwnerRepo(codebase.name);
+    if (!parsed) return c.json({ files: [] });
+    const { owner, repo } = parsed;
 
     const artifactDir = getRunArtifactsPath(owner, repo, runId);
     // Defense-in-depth: even though registration sanitises codebase names,
@@ -4022,12 +4060,12 @@ export function registerApiRoutes(
       getLog().error({ runId, codebaseId: run.codebase_id }, 'artifacts.codebase_lookup_failed');
       return apiError(c, 404, 'Artifact not available: codebase not found');
     }
-    const nameParts = codebase.name.split('/');
-    if (nameParts.length < 2) {
+    const parsed = parseOwnerRepo(codebase.name);
+    if (!parsed) {
       getLog().error({ runId, codebaseName: codebase.name }, 'artifacts.owner_repo_parse_failed');
       return apiError(c, 404, 'Artifact not available: could not determine owner/repo');
     }
-    const [owner, repo] = nameParts;
+    const { owner, repo } = parsed;
 
     const artifactDir = getRunArtifactsPath(owner, repo, runId);
     const filePath = join(artifactDir, filename);

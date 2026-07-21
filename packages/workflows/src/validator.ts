@@ -10,7 +10,6 @@
  */
 
 import { join, resolve, isAbsolute } from 'path';
-import { homedir } from 'os';
 import { access, readFile } from 'fs/promises';
 import {
   createLogger,
@@ -23,7 +22,7 @@ import { execFileAsync } from '@archon/git';
 import { BUNDLED_COMMANDS, isBinaryBuild } from './defaults/bundled-defaults';
 import { isValidCommandName } from './command-validation';
 import { levenshtein, findSimilar } from './utils/fuzzy-match';
-import { getProviderCapabilities, isRegisteredProvider } from '@archon/providers';
+import { getProviderCapabilities, isRegisteredProvider, skillSearchRoots } from '@archon/providers';
 
 /** Lazy-initialized logger */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -407,6 +406,37 @@ export async function validateWorkflowResources(
       }
     }
 
+    // --- Loop nodes with loop.command: check file exists (parallel to command-node check above) ---
+    if (isLoopNode(node) && node.loop.command !== undefined) {
+      const loopCommand = node.loop.command;
+      if (!isValidCommandName(loopCommand)) {
+        issues.push({
+          level: 'error',
+          nodeId: node.id,
+          field: 'loop.command',
+          message: `Invalid command name '${loopCommand}' — must not contain '/', '\\', '..', or start with '.'`,
+          hint: 'Use a simple name like "my-command" (without path separators or the .md extension)',
+        });
+      } else {
+        const resolved = await resolveCommand(loopCommand, cwd, config);
+        if (!resolved) {
+          const similar = findSimilar(loopCommand, availableCommands);
+          const issue: ValidationIssue = {
+            level: 'error',
+            nodeId: node.id,
+            field: 'loop.command',
+            message: `Command '${loopCommand}' not found`,
+            hint: `Create .archon/commands/${loopCommand}.md or use an existing command name`,
+          };
+          if (similar.length > 0) {
+            issue.hint = `Did you mean: ${similar.map(s => `'${s}'`).join(', ')}? Or create .archon/commands/${loopCommand}.md`;
+            issue.suggestions = similar;
+          }
+          issues.push(issue);
+        }
+      }
+    }
+
     // --- MCP nodes: check config file exists and is valid JSON ---
     if ('mcp' in node && typeof node.mcp === 'string') {
       const mcpPath = isAbsolute(node.mcp) ? node.mcp : resolve(cwd, node.mcp);
@@ -462,20 +492,24 @@ export async function validateWorkflowResources(
 
     // --- Skills nodes: check skill directories exist ---
     if ('skills' in node && Array.isArray(node.skills)) {
+      const searchRoots = skillSearchRoots(cwd);
       for (const skillName of node.skills) {
-        const projectSkillPath = join(cwd, '.claude', 'skills', skillName, 'SKILL.md');
-        const userSkillPath = join(homedir(), '.claude', 'skills', skillName, 'SKILL.md');
+        let found = false;
+        for (const root of searchRoots) {
+          const skillPath = join(root, skillName, 'SKILL.md');
+          if (await fileExists(skillPath)) {
+            found = true;
+            break;
+          }
+        }
 
-        const projectExists = await fileExists(projectSkillPath);
-        const userExists = await fileExists(userSkillPath);
-
-        if (!projectExists && !userExists) {
+        if (!found) {
           issues.push({
             level: 'warning',
             nodeId: node.id,
             field: 'skills',
-            message: `Skill '${skillName}' not found in .claude/skills/ or ~/.claude/skills/`,
-            hint: `Install with: npx skills add <repo> — or create manually at .claude/skills/${skillName}/SKILL.md`,
+            message: `Skill '${skillName}' not found in .agents/skills/ or .claude/skills/ (project or user scope)`,
+            hint: `Install with: npx skills add <repo> — or create manually at .agents/skills/${skillName}/SKILL.md`,
           });
         }
       }
