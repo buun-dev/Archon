@@ -3339,6 +3339,44 @@ describe('workflowApproveCommand / workflowRejectCommand / workflowResumeCommand
     expect(parsed).toMatchObject({ ok: true, detached: true, continues: true });
   });
 
+  it('threads a caller-supplied --cwd to the child instead of the parent process.cwd()', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    const paths = await import('@archon/paths');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({ ...pausedRun });
+    (paths.getArchonHome as ReturnType<typeof mock>).mockImplementationOnce(() => {
+      throw new Error('no home in test');
+    });
+    const spawnSpy = mockSpawn();
+    const savedArgv = process.argv;
+    process.argv = [
+      'bun',
+      '/abs/cli.ts',
+      'workflow',
+      'approve',
+      'run-123',
+      '--cwd',
+      '/caller/repo',
+      '--detach',
+    ];
+
+    let spawnCmd: string[] = [];
+    let spawnOptions: { cwd: string; cmd: string[] } | undefined;
+    try {
+      await workflowApproveCommand('run-123', undefined, undefined, '/caller/repo', true);
+      spawnOptions = spawnSpy.mock.calls[0]?.[0] as { cwd: string; cmd: string[] } | undefined;
+      spawnCmd = (spawnOptions?.cmd ?? []).slice();
+    } finally {
+      process.argv = savedArgv;
+      spawnSpy.mockRestore();
+    }
+
+    expect(spawnOptions?.cwd).toBe('/caller/repo');
+    // buildDetachedRunCmd appends --cwd LAST (parser is last-wins), so the
+    // appended value is what the child actually resolves.
+    const lastCwdIdx = spawnCmd.lastIndexOf('--cwd');
+    expect(spawnCmd[lastCwdIdx + 1]).toBe('/caller/repo');
+  });
+
   it('approve --detach refuses a non-paused run synchronously and spawns nothing', async () => {
     const workflowDb = await import('@archon/core/db/workflows');
     (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
