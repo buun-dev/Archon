@@ -3308,6 +3308,37 @@ describe('workflowApproveCommand / workflowRejectCommand / workflowResumeCommand
     });
   });
 
+  it('--detach --json spawns a child WITHOUT --json (so it continues) and says so in the ack', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    const paths = await import('@archon/paths');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({ ...pausedRun });
+    (paths.getArchonHome as ReturnType<typeof mock>).mockImplementationOnce(() => {
+      throw new Error('no home in test');
+    });
+    const spawnSpy = mockSpawn();
+    const savedArgv = process.argv;
+    process.argv = ['bun', '/abs/cli.ts', 'workflow', 'approve', 'run-123', '--detach', '--json'];
+
+    let spawnCmd: string[] = [];
+    try {
+      await workflowApproveCommand('run-123', undefined, true, undefined, true);
+      spawnCmd = (
+        (spawnSpy.mock.calls[0]?.[0] as { cmd: string[] } | undefined)?.cmd ?? []
+      ).slice();
+    } finally {
+      process.argv = savedArgv;
+      spawnSpy.mockRestore();
+    }
+
+    // Both flags are stripped: the child runs the ordinary inline path, which
+    // auto-resumes. That is deliberate — --detach exists to host that execution.
+    expect(spawnCmd).not.toContain('--detach');
+    expect(spawnCmd).not.toContain('--json');
+    // ...so the ack must tell the caller it does NOT own continuation.
+    const parsed = JSON.parse(consoleSpy.mock.calls[0][0] as string) as Record<string, unknown>;
+    expect(parsed).toMatchObject({ ok: true, detached: true, continues: true });
+  });
+
   it('approve --detach refuses a non-paused run synchronously and spawns nothing', async () => {
     const workflowDb = await import('@archon/core/db/workflows');
     (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({

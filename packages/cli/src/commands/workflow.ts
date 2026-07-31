@@ -2273,7 +2273,20 @@ async function runDetachedControlCommand(
     if (json) {
       console.log(
         JSON.stringify(
-          { ok: true, runId, action, detached: true, workflowName: run.workflow_name, logPath },
+          {
+            ok: true,
+            runId,
+            action,
+            detached: true,
+            // The child is spawned WITHOUT --json (buildDetachedRunCmd strips it),
+            // so it takes the inline path and DRIVES THE RUN ONWARD — approve's
+            // auto-resume, reject's on_reject rework, resume's re-run. This is the
+            // opposite of bare `--json`, which withholds continuation on purpose.
+            // Surfaced so an automation knows it does not own continuation here.
+            continues: true,
+            workflowName: run.workflow_name,
+            logPath,
+          },
           null,
           2
         )
