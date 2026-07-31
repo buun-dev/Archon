@@ -6,6 +6,7 @@ import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi';
 import { streamSSE } from 'hono/streaming';
 import { cors } from 'hono/cors';
 import type { WebAdapter } from '../adapters/web';
+import { boundMetadataToolOutputs } from '../adapters/web/truncate';
 import { rm, readFile, writeFile, unlink, mkdir, readdir, stat } from 'fs/promises';
 import { existsSync, readFileSync } from 'fs';
 import { normalize, join, sep, basename } from 'path';
@@ -18,10 +19,12 @@ import type {
   GlobalConfig,
   TiersPatch,
   UserRole,
+  SchemaVersionInfo,
 } from '@archon/core';
 import {
   handleMessage,
   getDatabaseType,
+  getSchemaVersion,
   loadConfig,
   loadRepoConfig,
   toSafeConfig,
@@ -72,6 +75,8 @@ import {
   getRunArtifactsPath,
   getArchonHome,
   isDocker,
+  isWSL,
+  getWSLDistroName,
   checkForUpdate,
   BUNDLED_IS_BINARY,
   BUNDLED_VERSION,
@@ -107,6 +112,7 @@ import * as workflowEventDb from '@archon/core/db/workflow-events';
 import * as messageDb from '@archon/core/db/messages';
 import * as userDb from '@archon/core/db/users';
 import {
+  abandonWorkflow,
   approveWorkflow,
   rejectWorkflow,
   resetWorkflowNodeSessions,
@@ -1291,7 +1297,19 @@ const getHealthRoute = createRoute({
               runningWorkflows: z.number(),
               version: z.string().optional(),
               is_docker: z.boolean(),
+              is_wsl: z.boolean(),
+              wsl_distro: z.string().optional(),
               activePlatforms: z.array(z.string()).optional(),
+              // Schema vintage (#2316) so a bug report can state which Archon build
+              // created this database and which last applied schema to it. Omitted
+              // when unrecorded or unreadable — health must answer regardless.
+              schema: z
+                .object({
+                  createdAppVersion: z.string().nullable(),
+                  appVersion: z.string(),
+                  appliedAt: z.string().nullable(),
+                })
+                .optional(),
             })
             .openapi('HealthResponse'),
         },
@@ -2273,7 +2291,9 @@ export function registerApiRoutes(
         metadata = '{}';
       }
     }
-    return { ...row, metadata };
+    // Bound tool_result outputs in hydration responses — the DB keeps the full
+    // value; only the browser-bound payload is capped (see #2236).
+    return { ...row, metadata: boundMetadataToolOutputs(metadata) };
   }
 
   function toApiWorkflowRun(row: WorkflowRun): ApiWorkflowRun {
@@ -3229,8 +3249,8 @@ export function registerApiRoutes(
       }
       // A `failed` run is terminal per TERMINAL_WORKFLOW_STATUSES but remains
       // resumable, so the user must be able to discard it — only the two
-      // non-resumable terminal states are blocked. Mirrors abandonWorkflow in
-      // workflow-operations.ts so the HTTP route agrees with CLI/chat (#1887).
+      // non-resumable terminal states are blocked (the 400 mapping lives here;
+      // abandonWorkflow re-validates).
       if (run.status === 'completed' || run.status === 'cancelled') {
         return apiError(
           c,
@@ -3238,8 +3258,18 @@ export function registerApiRoutes(
           `Cannot abandon run with status '${run.status}'. Only running, paused, or failed runs can be abandoned.`
         );
       }
-      await workflowDb.cancelWorkflowRun(runId);
-      return c.json({ success: true, message: `Abandoned workflow: ${run.workflow_name}` });
+      // Delegate to the SHARED op — a raw cancelWorkflowRun here previously skipped
+      // the sub-run cascade cancel AND the container reclaim (M2), so a web abandon
+      // orphaned children that CLI/chat abandons cleaned up.
+      const { cascadeFailures, blockedParentRunId } = await abandonWorkflow(runId);
+      let message = `Abandoned workflow: ${run.workflow_name}`;
+      if (cascadeFailures > 0) {
+        message += ` — warning: ${String(cascadeFailures)} sub-run(s) could not be cancelled and may still be running`;
+      }
+      if (blockedParentRunId) {
+        message += ` — parent run ${blockedParentRunId} was blocked on this sub-run and stays paused; resume it to fail the node cleanly or abandon it too`;
+      }
+      return c.json({ success: true, message });
     } catch (error) {
       getLog().error({ err: error, runId }, 'api.workflow_run_abandon_failed');
       return apiError(c, 500, 'Failed to abandon workflow run');
@@ -3261,6 +3291,16 @@ export function registerApiRoutes(
       const approval = isApprovalContext(approvalRaw) ? approvalRaw : undefined;
       if (!approval?.nodeId) {
         return apiError(c, 400, 'Workflow run is paused but missing approval context');
+      }
+      if (approval.type === 'child_workflow') {
+        // Not an approvable gate — the parent resumes automatically when the child
+        // completes. approveWorkflow throws the same redirect; map it to a 400
+        // here so the console gets the message instead of an opaque 500.
+        return apiError(
+          c,
+          400,
+          `Run is paused waiting on sub-run ${approval.childRunId ?? '<unknown>'}. Approve or reject the child run instead.`
+        );
       }
       if (isGateResolved(approval)) {
         // Post-#2075 the run stays 'paused' after approval, so status alone no
@@ -3332,6 +3372,15 @@ export function registerApiRoutes(
       }
       const approvalRaw = run.metadata.approval;
       const approval = isApprovalContext(approvalRaw) ? approvalRaw : undefined;
+      if (approval?.type === 'child_workflow') {
+        // Mirror of the approve route's guard — rejectWorkflow throws the same
+        // redirect; map it to a 400 with the child pointer.
+        return apiError(
+          c,
+          400,
+          `Run is paused waiting on sub-run ${approval.childRunId ?? '<unknown>'}. Reject the child run instead, or abandon this run to discard the whole tree.`
+        );
+      }
       if (approval && isGateResolved(approval)) {
         return apiError(
           c,
@@ -4281,6 +4330,27 @@ export function registerApiRoutes(
       .map(r => r.conversation_id)
       .filter(id => !lockActiveSet.has(id));
     const allActiveIds = [...stats.activeConversationIds, ...backgroundConversationIds];
+    const wslDistro = getWSLDistroName();
+
+    // Health is public (PUBLIC_API_GATE_PREFIXES) and must stay answerable when the
+    // database is degraded, so a failed vintage read is logged and the key omitted
+    // rather than turning the healthcheck into a 500. `createdAt` is deliberately not
+    // exposed — the two version strings plus applied_at are what a bug report needs.
+    let schema:
+      | Pick<SchemaVersionInfo, 'createdAppVersion' | 'appVersion' | 'appliedAt'>
+      | undefined;
+    try {
+      const info = await getSchemaVersion();
+      if (info) {
+        schema = {
+          createdAppVersion: info.createdAppVersion,
+          appVersion: info.appVersion,
+          appliedAt: info.appliedAt,
+        };
+      }
+    } catch (err) {
+      getLog().warn({ err }, 'api.schema_version_read_failed');
+    }
 
     return c.json({
       status: 'ok',
@@ -4293,7 +4363,10 @@ export function registerApiRoutes(
       runningWorkflows: runningWorkflowRows.length,
       version: appVersion,
       is_docker: isDocker(),
+      is_wsl: isWSL(),
+      ...(wslDistro ? { wsl_distro: wslDistro } : {}),
       activePlatforms: activePlatforms ? [...activePlatforms] : ['Web'],
+      ...(schema ? { schema } : {}),
     });
   });
 

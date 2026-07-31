@@ -64,6 +64,14 @@ detect_platform() {
       ;;
   esac
 
+  # Rosetta reports x86_64 even on Apple Silicon. Ask macOS for the physical
+  # architecture before selecting a release asset.
+  if [ "$os" = "darwin" ] \
+    && { [ "$arch" = "x86_64" ] || [ "$arch" = "amd64" ]; } \
+    && [ "$(sysctl -in sysctl.proc_translated 2>/dev/null || true)" = "1" ]; then
+    arch="arm64"
+  fi
+
   case "$arch" in
     x86_64|amd64)
       arch="x64"
@@ -202,6 +210,16 @@ main() {
   # Make executable
   chmod +x "$binary_path"
 
+  # Confirm the release can execute before replacing an existing installation.
+  info "Verifying downloaded binary..."
+  local version_output
+  if ! version_output=$("$binary_path" version 2>&1); then
+    error "Downloaded binary failed its version check:"
+    echo "$version_output" >&2
+    error "Existing installation was left unchanged."
+    exit 1
+  fi
+
   # Install
   info "Installing to $INSTALL_DIR/$BINARY_NAME..."
 
@@ -221,18 +239,19 @@ main() {
 
   success "Installed to $INSTALL_DIR/$BINARY_NAME"
 
-  # Verify installation
-  echo ""
-  info "Verifying installation..."
-  local version_output
-  if version_output=$("$INSTALL_DIR/$BINARY_NAME" version 2>&1); then
-    echo "$version_output"
-    success "Installation complete!"
-  else
-    warn "Binary installed but version check failed:"
-    echo "$version_output"
-    warn "The binary may not work correctly. Please verify manually with: $INSTALL_DIR/$BINARY_NAME version"
+  # Re-run the version check against the INSTALLED path. The probe above ran on the
+  # temp download and its output was cached; printing that after `mv` would report
+  # success without ever executing the file the user will actually invoke — which is
+  # exactly the "installed fine but won't run" failure #2295 reported. See #2338.
+  local installed_output
+  if ! installed_output=$("$INSTALL_DIR/$BINARY_NAME" version 2>&1); then
+    error "Installed binary failed its version check at $INSTALL_DIR/$BINARY_NAME:"
+    echo "$installed_output" >&2
+    exit 1
   fi
+
+  echo "$installed_output"
+  success "Installation complete!"
 
   # Check if in PATH
   if ! command -v "$BINARY_NAME" >/dev/null 2>&1; then
@@ -251,4 +270,10 @@ main() {
   echo ""
 }
 
-main "$@"
+# `${BASH_SOURCE[0]:-$0}` — NOT bare `${BASH_SOURCE[0]}`. Under `curl … | bash` the
+# script arrives on stdin, where BASH_SOURCE[0] is unbound; with `set -u` (above)
+# a bare reference aborts before main() ever runs, so the documented install path
+# fails for every user on every platform. See #2338.
+if [ "${BASH_SOURCE[0]:-$0}" = "$0" ]; then
+  main "$@"
+fi

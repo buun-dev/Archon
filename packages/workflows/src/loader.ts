@@ -10,6 +10,7 @@ import {
   isCancelNode,
   isScriptNode,
   isIncludeNode,
+  isWorkflowNode,
   isPersistableNode,
 } from './schemas';
 import { createLogger } from '@archon/paths';
@@ -25,6 +26,7 @@ import {
   LOOP_NODE_AI_FIELDS,
   LOOP_GROUP_NODE_AI_FIELDS,
   INCLUDE_NODE_IGNORED_FIELDS,
+  WORKFLOW_NODE_IGNORED_FIELDS,
   effortLevelSchema,
   thinkingConfigSchema,
   sandboxSettingsSchema,
@@ -34,8 +36,9 @@ import {
   modelReasoningEffortSchema,
   webSearchModeSchema,
   workflowRequirementSchema,
+  workflowEvidencePolicySchema,
 } from './schemas/workflow';
-import type { WorkflowRequirement } from './schemas/workflow';
+import type { WorkflowRequirement, WorkflowEvidencePolicy } from './schemas/workflow';
 import { workflowNodeHooksSchema } from './schemas/hooks';
 import { z } from '@hono/zod-openapi';
 
@@ -119,6 +122,8 @@ function parseDagNode(raw: unknown, index: number, errors: string[]): DagNode | 
     nonAiNode = { type: 'cancel', fields: BASH_NODE_AI_FIELDS };
   } else if (isIncludeNode(node)) {
     nonAiNode = { type: 'include', fields: INCLUDE_NODE_IGNORED_FIELDS };
+  } else if (isWorkflowNode(node)) {
+    nonAiNode = { type: 'workflow', fields: WORKFLOW_NODE_IGNORED_FIELDS };
   } else if (isApprovalNode(node)) {
     nonAiNode = { type: 'approval', fields: BASH_NODE_AI_FIELDS };
   } else if (isLoopNode(node)) {
@@ -214,10 +219,10 @@ export function validateDagStructure(
   }
 
   // Check $nodeId.output references across EVERY field the executor substitutes at
-  // runtime: when:, and the eight text surfaces that flow through
-  // substituteNodeOutputRefs (prompt, bash, script, approval.message, cancel,
-  // loop.prompt, loop.until_bash, loop_group.until_bash). A dangling ref in any of
-  // them silently substitutes to '' at run time, so all must be validated here.
+  // runtime: when:, and the text surfaces that flow through substituteNodeOutputRefs
+  // (prompt, bash, script, approval.message, cancel, loop.prompt, loop.until_bash,
+  // loop_group.until_bash, workflow.input). A dangling ref in any of them silently
+  // substitutes to '' at run time, so all must be validated here.
   //
   // KEEP IN SYNC (three ref-surface enumerations must agree):
   //   1. this scan (loader validateDagStructure) — validates refs,
@@ -242,6 +247,9 @@ export function validateDagStructure(
     }
     if (isBashNode(node)) sources.push(node.bash);
     if (isScriptNode(node)) sources.push(node.script);
+    // workflow.input is a live ref surface (a data string), scanned verbatim like
+    // bash/script — not prose, so no markdown stripping.
+    if (isWorkflowNode(node) && node.input) sources.push(node.input);
     if (isCancelNode(node)) sources.push(node.cancel);
     if (isApprovalNode(node)) sources.push(node.approval.message);
     if (isLoopNode(node)) {
@@ -288,6 +296,13 @@ export function validateDagStructure(
       const includeInBody = node.loop_group.nodes.find(isIncludeNode);
       if (includeInBody) {
         return `loop_group '${node.id}' body: 'include' is not supported inside a loop_group body`;
+      }
+      // `workflow:` (sub-run) inside a loop_group body is rejected in slice 1 (bounds
+      // the interaction surface — see the plan's NOT Building). A sub-run per
+      // iteration needs the fan-out semantics deferred to slice 2.
+      const workflowInBody = node.loop_group.nodes.find(isWorkflowNode);
+      if (workflowInBody) {
+        return `loop_group '${node.id}' body: 'workflow' (sub-run) is not supported inside a loop_group body`;
       }
       const scopeIds = new Set([...(enclosingIds ?? []), ...ids]);
       const bodyError = validateDagStructure(node.loop_group.nodes, scopeIds);
@@ -592,6 +607,28 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       }
     }
 
+    // Parse workflow-level evidence policy (#2230). Unlike the worktree/container
+    // convenience policies, a malformed block REJECTS the workflow instead of
+    // warn-and-ignore: silently dropping a declared terminal-success gate would
+    // let a run complete ungated — not fail-safe. Same hard-reject posture as
+    // unknown-provider and persist_session capability validation above.
+    let evidencePolicy: WorkflowEvidencePolicy | undefined;
+    if (raw.evidence_policy !== undefined) {
+      const parsedEvidence = workflowEvidencePolicySchema.safeParse(raw.evidence_policy);
+      if (!parsedEvidence.success) {
+        return {
+          workflow: null,
+          error: {
+            filename,
+            error:
+              "Invalid evidence_policy: expected { required: boolean }. When required is true, the run is refused terminal 'completed' unless $ARTIFACTS_DIR/evidence.json exists.",
+            errorType: 'validation_error',
+          },
+        };
+      }
+      evidencePolicy = parsedEvidence.data;
+    }
+
     // Parse mutates_checkout — boolean, omitted means true (run the path-lock guard).
     // Same parse/warn pattern as `interactive` (invalid non-boolean values are dropped).
     // When false, the executor skips the path-lock guard and allows concurrent runs on the same checkout.
@@ -727,6 +764,7 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
         nodes: dagNodes,
         ...(worktreePolicy ? { worktree: worktreePolicy } : {}),
         ...(containerPolicy ? { container: containerPolicy } : {}),
+        ...(evidencePolicy !== undefined ? { evidence_policy: evidencePolicy } : {}),
         ...(tags !== undefined ? { tags } : {}),
         ...(requires !== undefined ? { requires } : {}),
       },
