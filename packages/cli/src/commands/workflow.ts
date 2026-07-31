@@ -62,6 +62,8 @@ import {
   abandonWorkflow,
   getWorkflowStatus,
   resetWorkflowNodeSessions,
+  assertApprovable,
+  assertRejectable,
 } from '@archon/core/operations/workflow-operations';
 import * as conversationDb from '@archon/core/db/conversations';
 import * as codebaseDb from '@archon/core/db/codebases';
@@ -2508,13 +2510,9 @@ export async function workflowApproveCommand(
       if (!run) {
         throw new Error(`Workflow run not found: ${resolvedId}`);
       }
-      // Mirror approveWorkflow's gate so a wrong-status error surfaces
-      // synchronously instead of dying unseen in the child's log.
-      if (run.status !== 'paused') {
-        throw new Error(
-          `Cannot approve run with status '${run.status}'. Only paused runs can be approved.`
-        );
-      }
+      // The SAME gate approveWorkflow enforces — not a copy of one branch of it.
+      // A partial copy acks { ok: true } and lets the child die unseen.
+      assertApprovable(run);
       return run;
     });
     return;
@@ -2634,11 +2632,9 @@ export async function workflowRejectCommand(
       if (!run) {
         throw new Error(`Workflow run not found: ${resolvedId}`);
       }
-      if (run.status !== 'paused') {
-        throw new Error(
-          `Cannot reject run with status '${run.status}'. Only paused runs can be rejected.`
-        );
-      }
+      // The SAME gate rejectWorkflow enforces — not a copy of one branch of it.
+      // A partial copy acks { ok: true } and lets the child die unseen.
+      assertRejectable(run);
       return run;
     });
     return;

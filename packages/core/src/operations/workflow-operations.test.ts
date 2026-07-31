@@ -1,4 +1,5 @@
 import { describe, test, expect, mock, beforeEach } from 'bun:test';
+import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
 
 // ---------------------------------------------------------------------------
 // Mock DB modules before importing the module under test
@@ -67,6 +68,8 @@ const {
   resumeWorkflow,
   abandonWorkflow,
   resetWorkflowNodeSessions,
+  assertApprovable,
+  assertRejectable,
 } = await import('./workflow-operations');
 
 // ---------------------------------------------------------------------------
@@ -652,6 +655,83 @@ describe('rejectWorkflow', () => {
     expect(mockResolveApprovalGate).not.toHaveBeenCalled();
     expect(mockResolveAndCancelApprovalGate).not.toHaveBeenCalled();
     expect(mockCancelWorkflowRun).not.toHaveBeenCalled();
+  });
+});
+
+describe('assertApprovable / assertRejectable — shared precondition gate', () => {
+  const baseRun = {
+    id: 'run-1',
+    status: 'paused',
+    workflow_name: 'assist',
+    working_path: '/tmp/x',
+    conversation_id: 'conv-1',
+    user_message: 'hi',
+    metadata: { approval: { nodeId: 'gate', message: 'Approve?' } },
+  } as unknown as WorkflowRun;
+
+  const withMeta = (metadata: Record<string, unknown>, status = 'paused') =>
+    ({ ...baseRun, status, metadata }) as unknown as WorkflowRun;
+
+  test('assertApprovable returns the approval context on a well-formed paused run', () => {
+    expect(assertApprovable(baseRun).nodeId).toBe('gate');
+  });
+
+  test('assertApprovable rejects a non-paused run', () => {
+    expect(() => assertApprovable(withMeta(baseRun.metadata, 'running'))).toThrow(
+      "Cannot approve run with status 'running'"
+    );
+  });
+
+  test('assertApprovable rejects a missing approval context', () => {
+    expect(() => assertApprovable(withMeta({}))).toThrow(
+      'Workflow run is paused but missing approval context.'
+    );
+  });
+
+  test('assertApprovable redirects a child_workflow-blocked parent to the child run', () => {
+    expect(() =>
+      assertApprovable(
+        withMeta({
+          approval: {
+            nodeId: 'sub',
+            message: 'blocked',
+            type: 'child_workflow',
+            childRunId: 'child-9',
+          },
+        })
+      )
+    ).toThrow('Approve or reject the child run instead: /workflow approve child-9');
+  });
+
+  test('assertApprovable rejects an already-resolved gate', () => {
+    expect(() =>
+      assertApprovable(withMeta({ approval: { nodeId: 'g', message: 'm', resolved: 'approved' } }))
+    ).toThrow('was already approved and is awaiting resume');
+  });
+
+  test('assertRejectable TOLERATES a missing approval context (unlike approve)', () => {
+    expect(assertRejectable(withMeta({}))).toBeUndefined();
+  });
+
+  test('assertRejectable redirects a child_workflow-blocked parent', () => {
+    expect(() =>
+      assertRejectable(
+        withMeta({
+          approval: {
+            nodeId: 'sub',
+            message: 'blocked',
+            type: 'child_workflow',
+            childRunId: 'child-9',
+          },
+        })
+      )
+    ).toThrow('Reject the child run instead: /workflow reject child-9');
+  });
+
+  test('assertRejectable rejects an already-resolved gate', () => {
+    expect(() =>
+      assertRejectable(withMeta({ approval: { nodeId: 'g', message: 'm', resolved: 'rejected' } }))
+    ).toThrow('was already rejected and is awaiting resume');
   });
 });
 

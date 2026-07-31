@@ -3217,7 +3217,7 @@ describe('workflowApproveCommand / workflowRejectCommand / workflowResumeCommand
     working_path: '/distro/only/path',
     conversation_id: 'conv-123',
     user_message: 'hello',
-    metadata: {},
+    metadata: { approval: { nodeId: 'gate', message: 'Approve?' } },
   };
 
   // Mirrors the run-detach tests: pid is required (spawnDetachedWorkflowRun
@@ -3326,6 +3326,98 @@ describe('workflowApproveCommand / workflowRejectCommand / workflowResumeCommand
       spawnSpy.mockRestore();
     }
     expect(spawnCallCount).toBe(0);
+  });
+
+  it('approve --detach refuses a child_workflow-blocked parent and spawns nothing', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      ...pausedRun,
+      metadata: {
+        approval: { nodeId: 'sub', message: 'blocked', type: 'child_workflow', childRunId: 'c-9' },
+      },
+    });
+    const spawnSpy = mockSpawn();
+    try {
+      await expect(
+        workflowApproveCommand('run-123', undefined, undefined, undefined, true)
+      ).rejects.toThrow('Approve or reject the child run instead: /workflow approve c-9');
+      expect(spawnSpy.mock.calls.length).toBe(0);
+    } finally {
+      spawnSpy.mockRestore();
+    }
+  });
+
+  it('approve --detach refuses an already-resolved gate and spawns nothing', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      ...pausedRun,
+      metadata: { approval: { nodeId: 'gate', message: 'Approve?', resolved: 'approved' } },
+    });
+    const spawnSpy = mockSpawn();
+    try {
+      await expect(
+        workflowApproveCommand('run-123', undefined, undefined, undefined, true)
+      ).rejects.toThrow('was already approved and is awaiting resume');
+      expect(spawnSpy.mock.calls.length).toBe(0);
+    } finally {
+      spawnSpy.mockRestore();
+    }
+  });
+
+  it('approve --detach refuses a missing approval context and spawns nothing', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      ...pausedRun,
+      metadata: {},
+    });
+    const spawnSpy = mockSpawn();
+    try {
+      await expect(
+        workflowApproveCommand('run-123', undefined, undefined, undefined, true)
+      ).rejects.toThrow('Workflow run is paused but missing approval context.');
+      expect(spawnSpy.mock.calls.length).toBe(0);
+    } finally {
+      spawnSpy.mockRestore();
+    }
+  });
+
+  it('reject --detach refuses a child_workflow-blocked parent but TOLERATES missing context', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    const paths = await import('@archon/paths');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      ...pausedRun,
+      metadata: {
+        approval: { nodeId: 'sub', message: 'blocked', type: 'child_workflow', childRunId: 'c-9' },
+      },
+    });
+    let spawnSpy = mockSpawn();
+    try {
+      await expect(
+        workflowRejectCommand('run-123', undefined, undefined, undefined, true)
+      ).rejects.toThrow('Reject the child run instead: /workflow reject c-9');
+      expect(spawnSpy.mock.calls.length).toBe(0);
+    } finally {
+      spawnSpy.mockRestore();
+    }
+
+    // reject has no nodeId requirement — a malformed context must still spawn.
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      ...pausedRun,
+      metadata: {},
+    });
+    (paths.getArchonHome as ReturnType<typeof mock>).mockImplementationOnce(() => {
+      throw new Error('no home in test');
+    });
+    spawnSpy = mockSpawn();
+    const savedArgv = process.argv;
+    process.argv = ['bun', '/abs/cli.ts', 'workflow', 'reject', 'run-123', '--detach'];
+    try {
+      await workflowRejectCommand('run-123', undefined, undefined, undefined, true);
+      expect(spawnSpy.mock.calls.length).toBe(1);
+    } finally {
+      process.argv = savedArgv;
+      spawnSpy.mockRestore();
+    }
   });
 
   it('reject --detach spawns a detached child (minus --detach) and performs ZERO writes in the parent', async () => {
