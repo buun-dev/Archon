@@ -74,6 +74,8 @@ import {
   abandonWorkflow,
   getWorkflowStatus,
   resetWorkflowNodeSessions,
+  assertApprovable,
+  assertRejectable,
 } from '@archon/core/operations/workflow-operations';
 import * as conversationDb from '@archon/core/db/conversations';
 import * as codebaseDb from '@archon/core/db/codebases';
@@ -2354,24 +2356,45 @@ async function resolveRunIdArg(runId: string, cwd?: string): Promise<string> {
  * approveWorkflow/rejectWorkflow/resumeWorkflow itself, or the decision would be
  * recorded twice (mirrors workflowRunCommand's detach shape: the parent does nothing).
  *
- * Spawns with the PARENT's cwd, never the run's working_path: the child re-resolves
- * everything by run-id, and a container run's working_path is a distro path the host
- * cannot spawn into (ENOENT → the detach would silently no-op). Reuses upstream's
- * spawnDetachedWorkflowRun, which rebuilds the child command from process.argv.
+ * Spawns with the command's `cwd` (falling back to `process.cwd()`), never the run's
+ * working_path: the child re-resolves everything by run-id, and a container run's
+ * working_path is a distro path the host cannot spawn into (ENOENT → the detach would
+ * silently no-op). Reuses upstream's spawnDetachedWorkflowRun, which rebuilds the child
+ * command from process.argv.
  */
 async function runDetachedControlCommand(
   runId: string,
   action: 'approve' | 'reject' | 'resume',
   json: boolean | undefined,
+  cwd: string | undefined,
   precheck: () => Promise<WorkflowRun>
 ): Promise<void> {
   try {
     const run = await precheck();
-    const logPath = spawnDetachedWorkflowRun(process.cwd(), runId, []);
+    // The caller's --cwd, already resolved by cli.ts — NOT process.cwd(). The
+    // appended --cwd is last-wins on the child's argv, so discarding it here
+    // strands the child in the parent's directory (possibly outside any git
+    // repo) after the parent has already acked success. The run's working_path
+    // is still never a candidate: a container run's working_path is a distro
+    // path the host cannot spawn into, so the child re-resolves by run id.
+    const logPath = spawnDetachedWorkflowRun(cwd ?? process.cwd(), runId, []);
     if (json) {
       console.log(
         JSON.stringify(
-          { ok: true, runId, action, detached: true, workflowName: run.workflow_name, logPath },
+          {
+            ok: true,
+            runId,
+            action,
+            detached: true,
+            // The child is spawned WITHOUT --json (buildDetachedRunCmd strips it),
+            // so it takes the inline path and DRIVES THE RUN ONWARD — approve's
+            // auto-resume, reject's on_reject rework, resume's re-run. This is the
+            // opposite of bare `--json`, which withholds continuation on purpose.
+            // Surfaced so an automation knows it does not own continuation here.
+            continues: true,
+            workflowName: run.workflow_name,
+            logPath,
+          },
           null,
           2
         )
@@ -2445,7 +2468,9 @@ export async function workflowResumeCommand(
   // Composes with --json (structured ack; nothing executes here).
   if (detach) {
     const resolvedId = await resolveRunIdArg(runId, cwd);
-    await runDetachedControlCommand(resolvedId, 'resume', json, () => resumeWorkflowOp(resolvedId));
+    await runDetachedControlCommand(resolvedId, 'resume', json, cwd, () =>
+      resumeWorkflowOp(resolvedId)
+    );
     return;
   }
 
@@ -2603,18 +2628,14 @@ export async function workflowApproveCommand(
   // in the child. Composes with --json (structured ack; nothing executes here).
   if (detach) {
     const resolvedId = await resolveRunIdArg(runId, cwd);
-    await runDetachedControlCommand(resolvedId, 'approve', json, async () => {
+    await runDetachedControlCommand(resolvedId, 'approve', json, cwd, async () => {
       const run = await workflowDb.getWorkflowRun(resolvedId);
       if (!run) {
         throw new Error(`Workflow run not found: ${resolvedId}`);
       }
-      // Mirror approveWorkflow's gate so a wrong-status error surfaces
-      // synchronously instead of dying unseen in the child's log.
-      if (run.status !== 'paused') {
-        throw new Error(
-          `Cannot approve run with status '${run.status}'. Only paused runs can be approved.`
-        );
-      }
+      // The SAME gate approveWorkflow enforces — not a copy of one branch of it.
+      // A partial copy acks { ok: true } and lets the child die unseen.
+      assertApprovable(run);
       return run;
     });
     return;
@@ -2729,16 +2750,14 @@ export async function workflowRejectCommand(
   // mid-rework. The parent only validates read-only. Composes with --json.
   if (detach) {
     const resolvedId = await resolveRunIdArg(runId, cwd);
-    await runDetachedControlCommand(resolvedId, 'reject', json, async () => {
+    await runDetachedControlCommand(resolvedId, 'reject', json, cwd, async () => {
       const run = await workflowDb.getWorkflowRun(resolvedId);
       if (!run) {
         throw new Error(`Workflow run not found: ${resolvedId}`);
       }
-      if (run.status !== 'paused') {
-        throw new Error(
-          `Cannot reject run with status '${run.status}'. Only paused runs can be rejected.`
-        );
-      }
+      // The SAME gate rejectWorkflow enforces — not a copy of one branch of it.
+      // A partial copy acks { ok: true } and lets the child die unseen.
+      assertRejectable(run);
       return run;
     });
     return;

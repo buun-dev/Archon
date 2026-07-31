@@ -259,6 +259,10 @@ bun run cli workflow abandon <run-id>
 #   list, status, runs, get, approve, reject, abandon, resume.
 # For approve/reject/resume, --json records/validates the decision and returns a
 # clean JSON line WITHOUT the inline auto-resume (drive continuation separately).
+# Adding --detach INVERTS that: the child re-invokes without --json, so it takes
+# the inline path and DOES continue the run (just outside your shell). The ack
+# carries `continues: true` so an automation knows it no longer owns continuation.
+bun run cli workflow approve <run-id> --detach --json
 
 # Delete old workflow run records (default: 7 days)
 bun run cli workflow cleanup

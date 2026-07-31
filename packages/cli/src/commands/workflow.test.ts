@@ -3308,7 +3308,7 @@ describe('workflowApproveCommand / workflowRejectCommand / workflowResumeCommand
     working_path: '/distro/only/path',
     conversation_id: 'conv-123',
     user_message: 'hello',
-    metadata: {},
+    metadata: { approval: { nodeId: 'gate', message: 'Approve?' } },
   };
 
   // Mirrors the run-detach tests: pid is required (spawnDetachedWorkflowRun
@@ -3399,6 +3399,75 @@ describe('workflowApproveCommand / workflowRejectCommand / workflowResumeCommand
     });
   });
 
+  it('--detach --json spawns a child WITHOUT --json (so it continues) and says so in the ack', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    const paths = await import('@archon/paths');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({ ...pausedRun });
+    (paths.getArchonHome as ReturnType<typeof mock>).mockImplementationOnce(() => {
+      throw new Error('no home in test');
+    });
+    const spawnSpy = mockSpawn();
+    const savedArgv = process.argv;
+    process.argv = ['bun', '/abs/cli.ts', 'workflow', 'approve', 'run-123', '--detach', '--json'];
+
+    let spawnCmd: string[] = [];
+    try {
+      await workflowApproveCommand('run-123', undefined, true, undefined, true);
+      spawnCmd = (
+        (spawnSpy.mock.calls[0]?.[0] as { cmd: string[] } | undefined)?.cmd ?? []
+      ).slice();
+    } finally {
+      process.argv = savedArgv;
+      spawnSpy.mockRestore();
+    }
+
+    // Both flags are stripped: the child runs the ordinary inline path, which
+    // auto-resumes. That is deliberate — --detach exists to host that execution.
+    expect(spawnCmd).not.toContain('--detach');
+    expect(spawnCmd).not.toContain('--json');
+    // ...so the ack must tell the caller it does NOT own continuation.
+    const parsed = JSON.parse(consoleSpy.mock.calls[0][0] as string) as Record<string, unknown>;
+    expect(parsed).toMatchObject({ ok: true, detached: true, continues: true });
+  });
+
+  it('threads a caller-supplied --cwd to the child instead of the parent process.cwd()', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    const paths = await import('@archon/paths');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({ ...pausedRun });
+    (paths.getArchonHome as ReturnType<typeof mock>).mockImplementationOnce(() => {
+      throw new Error('no home in test');
+    });
+    const spawnSpy = mockSpawn();
+    const savedArgv = process.argv;
+    process.argv = [
+      'bun',
+      '/abs/cli.ts',
+      'workflow',
+      'approve',
+      'run-123',
+      '--cwd',
+      '/caller/repo',
+      '--detach',
+    ];
+
+    let spawnCmd: string[] = [];
+    let spawnOptions: { cwd: string; cmd: string[] } | undefined;
+    try {
+      await workflowApproveCommand('run-123', undefined, undefined, '/caller/repo', true);
+      spawnOptions = spawnSpy.mock.calls[0]?.[0] as { cwd: string; cmd: string[] } | undefined;
+      spawnCmd = (spawnOptions?.cmd ?? []).slice();
+    } finally {
+      process.argv = savedArgv;
+      spawnSpy.mockRestore();
+    }
+
+    expect(spawnOptions?.cwd).toBe('/caller/repo');
+    // buildDetachedRunCmd appends --cwd LAST (parser is last-wins), so the
+    // appended value is what the child actually resolves.
+    const lastCwdIdx = spawnCmd.lastIndexOf('--cwd');
+    expect(spawnCmd[lastCwdIdx + 1]).toBe('/caller/repo');
+  });
+
   it('approve --detach refuses a non-paused run synchronously and spawns nothing', async () => {
     const workflowDb = await import('@archon/core/db/workflows');
     (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
@@ -3417,6 +3486,98 @@ describe('workflowApproveCommand / workflowRejectCommand / workflowResumeCommand
       spawnSpy.mockRestore();
     }
     expect(spawnCallCount).toBe(0);
+  });
+
+  it('approve --detach refuses a child_workflow-blocked parent and spawns nothing', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      ...pausedRun,
+      metadata: {
+        approval: { nodeId: 'sub', message: 'blocked', type: 'child_workflow', childRunId: 'c-9' },
+      },
+    });
+    const spawnSpy = mockSpawn();
+    try {
+      await expect(
+        workflowApproveCommand('run-123', undefined, undefined, undefined, true)
+      ).rejects.toThrow('Approve or reject the child run instead: /workflow approve c-9');
+      expect(spawnSpy.mock.calls.length).toBe(0);
+    } finally {
+      spawnSpy.mockRestore();
+    }
+  });
+
+  it('approve --detach refuses an already-resolved gate and spawns nothing', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      ...pausedRun,
+      metadata: { approval: { nodeId: 'gate', message: 'Approve?', resolved: 'approved' } },
+    });
+    const spawnSpy = mockSpawn();
+    try {
+      await expect(
+        workflowApproveCommand('run-123', undefined, undefined, undefined, true)
+      ).rejects.toThrow('was already approved and is awaiting resume');
+      expect(spawnSpy.mock.calls.length).toBe(0);
+    } finally {
+      spawnSpy.mockRestore();
+    }
+  });
+
+  it('approve --detach refuses a missing approval context and spawns nothing', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      ...pausedRun,
+      metadata: {},
+    });
+    const spawnSpy = mockSpawn();
+    try {
+      await expect(
+        workflowApproveCommand('run-123', undefined, undefined, undefined, true)
+      ).rejects.toThrow('Workflow run is paused but missing approval context.');
+      expect(spawnSpy.mock.calls.length).toBe(0);
+    } finally {
+      spawnSpy.mockRestore();
+    }
+  });
+
+  it('reject --detach refuses a child_workflow-blocked parent but TOLERATES missing context', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    const paths = await import('@archon/paths');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      ...pausedRun,
+      metadata: {
+        approval: { nodeId: 'sub', message: 'blocked', type: 'child_workflow', childRunId: 'c-9' },
+      },
+    });
+    let spawnSpy = mockSpawn();
+    try {
+      await expect(
+        workflowRejectCommand('run-123', undefined, undefined, undefined, true)
+      ).rejects.toThrow('Reject the child run instead: /workflow reject c-9');
+      expect(spawnSpy.mock.calls.length).toBe(0);
+    } finally {
+      spawnSpy.mockRestore();
+    }
+
+    // reject has no nodeId requirement — a malformed context must still spawn.
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      ...pausedRun,
+      metadata: {},
+    });
+    (paths.getArchonHome as ReturnType<typeof mock>).mockImplementationOnce(() => {
+      throw new Error('no home in test');
+    });
+    spawnSpy = mockSpawn();
+    const savedArgv = process.argv;
+    process.argv = ['bun', '/abs/cli.ts', 'workflow', 'reject', 'run-123', '--detach'];
+    try {
+      await workflowRejectCommand('run-123', undefined, undefined, undefined, true);
+      expect(spawnSpy.mock.calls.length).toBe(1);
+    } finally {
+      process.argv = savedArgv;
+      spawnSpy.mockRestore();
+    }
   });
 
   it('reject --detach spawns a detached child (minus --detach) and performs ZERO writes in the parent', async () => {

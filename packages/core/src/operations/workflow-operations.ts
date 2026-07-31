@@ -167,6 +167,96 @@ async function getRunOrThrow(runId: string, logEvent: string): Promise<WorkflowR
   return run;
 }
 
+/**
+ * The four preconditions `approveWorkflow` enforces, as ONE reusable gate.
+ *
+ * Extracted so the CLI's read-only `--detach` precheck validates exactly what the
+ * child will enforce. A partial copy is worse than none: the parent acks
+ * `{ ok: true }` and the child then dies unseen in its log — precisely the failure
+ * `--detach` exists to prevent, on the surface nobody is watching.
+ *
+ * Pure and synchronous (the caller already holds the run), so both the operation
+ * and the CLI precheck can call it without a second DB round-trip.
+ *
+ * Returns the validated context so callers keep today's narrowing — `nodeId` is a
+ * required field on ApprovalContext, so no intersection type is needed.
+ */
+export function assertApprovable(run: WorkflowRun): ApprovalContext {
+  if (run.status !== 'paused') {
+    throw new Error(
+      `Cannot approve run with status '${run.status}'. Only paused runs can be approved.`
+    );
+  }
+  const rawApproval = run.metadata.approval;
+  const approval: ApprovalContext | undefined = isApprovalContext(rawApproval)
+    ? rawApproval
+    : undefined;
+  if (!approval?.nodeId) {
+    throw new Error('Workflow run is paused but missing approval context.');
+  }
+  if (approval.type === 'child_workflow') {
+    // A parent blocked on a `workflow:` sub-run has no approvable gate of its
+    // own — the pause resolves automatically when the child run completes.
+    // Falling through to the generic branch would stamp a node_completed for the
+    // parent's workflow node with empty output (the child's real output is then
+    // discarded on resume) and orphan the still-paused child. Redirect the
+    // operator to the child run, where the actual gate lives.
+    throw new Error(
+      `Run ${run.id} is paused waiting on sub-run ${approval.childRunId ?? '<unknown>'} ` +
+        `('workflow:' node '${approval.nodeId}'). Approve or reject the child run instead` +
+        (approval.childRunId ? `: /workflow approve ${approval.childRunId}` : '.')
+    );
+  }
+  if (isGateResolved(approval)) {
+    // Fast-path friendly error for the common (sequential) case. The run stays
+    // 'paused' after a resolution, so the status check alone no longer blocks a
+    // second approve. This in-memory read can still race a concurrent approve —
+    // the resolveApprovalGate CAS is the real arbiter; a second approve that
+    // slips past this read loses the atomic UPDATE and throws the same way.
+    throw new Error(
+      `Workflow run ${run.id} was already ${String(approval.resolved)} and is awaiting resume.`
+    );
+  }
+  return approval;
+}
+
+/**
+ * The THREE preconditions `rejectWorkflow` enforces. Deliberately NOT the same
+ * gate as `assertApprovable`: reject has no `nodeId` requirement — it falls back
+ * to `approval?.nodeId ?? 'unknown'` when writing its audit event, so a run whose
+ * approval metadata is malformed is still legitimately rejectable. Merging the two
+ * would either break reject or over-permit approve.
+ */
+export function assertRejectable(run: WorkflowRun): ApprovalContext | undefined {
+  if (run.status !== 'paused') {
+    throw new Error(
+      `Cannot reject run with status '${run.status}'. Only paused runs can be rejected.`
+    );
+  }
+  const rawApproval = run.metadata.approval;
+  const approval: ApprovalContext | undefined = isApprovalContext(rawApproval)
+    ? rawApproval
+    : undefined;
+  if (approval?.type === 'child_workflow') {
+    // Same redirect as assertApprovable: the parent's pause is not a rejectable
+    // gate — cancelling the parent here would silently orphan the still-paused
+    // child run. Reject the child (its own gate) or abandon the parent (which
+    // cascade-cancels the subtree) instead.
+    throw new Error(
+      `Run ${run.id} is paused waiting on sub-run ${approval.childRunId ?? '<unknown>'} ` +
+        `('workflow:' node '${approval.nodeId}'). Reject the child run instead` +
+        (approval.childRunId ? `: /workflow reject ${approval.childRunId}` : '.') +
+        ' To discard the whole tree, abandon this run.'
+    );
+  }
+  if (approval && isGateResolved(approval)) {
+    throw new Error(
+      `Workflow run ${run.id} was already ${String(approval.resolved)} and is awaiting resume.`
+    );
+  }
+  return approval;
+}
+
 // ---------------------------------------------------------------------------
 // Operations
 // ---------------------------------------------------------------------------
@@ -291,41 +381,7 @@ export async function approveWorkflow(
   comment?: string
 ): Promise<ApprovalOperationResult> {
   const run = await getRunOrThrow(runId, 'operations.workflow_approve_lookup_failed');
-  if (run.status !== 'paused') {
-    throw new Error(
-      `Cannot approve run with status '${run.status}'. Only paused runs can be approved.`
-    );
-  }
-  const rawApproval = run.metadata.approval;
-  const approval: ApprovalContext | undefined = isApprovalContext(rawApproval)
-    ? rawApproval
-    : undefined;
-  if (!approval?.nodeId) {
-    throw new Error('Workflow run is paused but missing approval context.');
-  }
-  if (approval.type === 'child_workflow') {
-    // A parent blocked on a `workflow:` sub-run has no approvable gate of its
-    // own — the pause resolves automatically when the child run completes.
-    // Falling through to the generic branch would stamp a node_completed for the
-    // parent's workflow node with empty output (the child's real output is then
-    // discarded on resume) and orphan the still-paused child. Redirect the
-    // operator to the child run, where the actual gate lives.
-    throw new Error(
-      `Run ${runId} is paused waiting on sub-run ${approval.childRunId ?? '<unknown>'} ` +
-        `('workflow:' node '${approval.nodeId}'). Approve or reject the child run instead` +
-        (approval.childRunId ? `: /workflow approve ${approval.childRunId}` : '.')
-    );
-  }
-  if (isGateResolved(approval)) {
-    // Fast-path friendly error for the common (sequential) case. The run stays
-    // 'paused' after a resolution, so the status check alone no longer blocks a
-    // second approve. This in-memory read can still race a concurrent approve —
-    // the resolveApprovalGate CAS below is the real arbiter; a second approve
-    // that slips past this read loses the atomic UPDATE and throws the same way.
-    throw new Error(
-      `Workflow run ${runId} was already ${String(approval.resolved)} and is awaiting resume.`
-    );
-  }
+  const approval = assertApprovable(run);
 
   // Whitespace-only comments count as absent (mirrors feedbackProvided below):
   // HTTP/CLI/chat pass the raw comment through since #2074, so '   ' would
@@ -447,35 +503,7 @@ export async function rejectWorkflow(
   reason?: string
 ): Promise<RejectionOperationResult> {
   const run = await getRunOrThrow(runId, 'operations.workflow_reject_lookup_failed');
-  if (run.status !== 'paused') {
-    throw new Error(
-      `Cannot reject run with status '${run.status}'. Only paused runs can be rejected.`
-    );
-  }
-  const rawApproval = run.metadata.approval;
-  const approval: ApprovalContext | undefined = isApprovalContext(rawApproval)
-    ? rawApproval
-    : undefined;
-  if (approval?.type === 'child_workflow') {
-    // Same redirect as approveWorkflow: the parent's pause is not a rejectable
-    // gate — cancelling the parent here would silently orphan the still-paused
-    // child run. Reject the child (its own gate) or abandon the parent (which
-    // cascade-cancels the subtree) instead.
-    throw new Error(
-      `Run ${runId} is paused waiting on sub-run ${approval.childRunId ?? '<unknown>'} ` +
-        `('workflow:' node '${approval.nodeId}'). Reject the child run instead` +
-        (approval.childRunId ? `: /workflow reject ${approval.childRunId}` : '.') +
-        ' To discard the whole tree, abandon this run.'
-    );
-  }
-  if (approval && isGateResolved(approval)) {
-    // Fast-path friendly error, same as approveWorkflow — the run stays 'paused'
-    // after a resolution, so status alone no longer blocks a second reject. The
-    // CAS below is the real arbiter for the concurrent case.
-    throw new Error(
-      `Workflow run ${runId} was already ${String(approval.resolved)} and is awaiting resume.`
-    );
-  }
+  const approval = assertRejectable(run);
   const isWriteBack = approval?.type === 'writeback';
 
   // Engine-level container write-back gate (Phase C): reject means DISCARD the
