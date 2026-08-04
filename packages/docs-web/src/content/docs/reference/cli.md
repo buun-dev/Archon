@@ -206,9 +206,10 @@ Progress events (node start/complete/fail/skip, approval gates) are written to s
 |------|--------|
 | `--cwd <path>` | Target directory (required for most use cases) |
 | `--branch <name>` | Explicit branch name for the worktree |
-| `--from <branch>`, `--from-branch <branch>` | Override base branch (start-point for worktree) |
+| `--from <branch>`, `--from-branch <branch>` | Start-point for the new worktree only -- unlike `--base`, it does not change the PR target |
+| `--base <branch>` | Per-dispatch base override for a single run. Sets **both** the worktree cut-from **and** the PR target (`$BASE_BRANCH`), and outranks `worktree.baseBranch` in config plus the codebase default -- see [Base branch precedence](#base-branch-precedence) below. The branch **must already exist on the remote**; a missing one is a hard error, not a fallback. Combine with `--from` to drive the two separately. Rejected with `--no-worktree`, `--folder`, and workflows pinning `worktree.enabled: false`. |
 | `--no-worktree` | Opt out of isolation -- run directly in live checkout |
-| `--folder` | Register the current non-git directory as a folder project (first use) and run in place -- no worktree. Rejects `--branch`/`--from`. |
+| `--folder` | Register the current non-git directory as a folder project (first use) and run in place -- no worktree. Rejects `--branch`/`--from`/`--base`. |
 | `--container` | Run a **folder project** inside an overlay-isolated Docker container instead of in place (writes land in an overlay, not the live root, until an approval-gated write-back). Folder-only; a repo project errors. Requires the runner image (`bun run build:runner-image`). Pauses `docker stop` the container; `--resume`/`approve`/`reject` rediscover and restart it. See the [Container isolation guide](/guides/container-isolation/) and [configuration](/reference/configuration/#container-isolation-folder-projects). |
 | `--resume` | Resume from last failed run at the working path (skips completed nodes) |
 | `--quiet`, `-q` | Suppress all progress output to stderr |
@@ -225,7 +226,48 @@ Progress events (node start/complete/fail/skip, approval gates) are written to s
 
 **With `--no-worktree`:**
 - Runs in target directory directly (no isolation)
-- Mutually exclusive with `--branch` and `--from`
+- Mutually exclusive with `--branch`, `--from`, and `--base`
+
+#### Base branch precedence
+
+"Base branch" means two things, and by default one flag sets both: the **cut-from**
+(what `git worktree add` branches off) and the **PR target** (`$BASE_BRANCH`, which
+bash nodes pass to `gh pr create --base`). Four sources can supply it, highest first:
+
+| Precedence | Source | Scope |
+|------------|--------|-------|
+| 1 | `--base <branch>` | one dispatch |
+| 2 | `worktree.baseBranch` in `.archon/config.yaml` | the repo |
+| 3 | The registered codebase's stored default branch | the repo |
+| 4 | Git auto-detection (`origin/HEAD`, then `origin/main`) | the repo |
+
+Levels 2--4 are static per repo, so a run that needs a different base than its
+neighbours had to edit config -- global, and racy when several runs dispatch at
+once. `--base` is the per-dispatch level, which is what makes parallel multi-base
+dispatch (epic slices, A/B variants) config-free.
+
+**Driving cut-from and PR target separately.** `--from` overrides only the
+cut-from, so pairing the two flags splits them:
+
+```bash
+# Branch off release/2.0, but open the PR against dev
+archon workflow run implement --from origin/release/2.0 --base dev "Backport the fix"
+```
+
+`--from` is handed to `git worktree add` verbatim, so a remote ref such as
+`origin/release/2.0` works. Note the sync-before-create step refreshes the
+`--base` branch, not the `--from` start point -- pass a remote ref when the local
+copy of the start point may be stale.
+
+**Where `--base` is rejected** (rather than half-applied): with `--no-worktree`,
+against a [folder project](/getting-started/concepts/#folder-projects-non-git-workspaces),
+and against a workflow pinning `worktree.enabled: false`. None of these create a
+worktree, so the flag could only move the PR target -- which would report a base
+no worktree was ever cut from.
+
+**When an existing worktree is adopted** -- `--branch` naming a healthy worktree,
+or `--resume` continuing a prior run -- the cut-from is already fixed, so `--base`
+changes only the PR target. Archon warns in both cases.
 
 **Name Matching:**
 
@@ -250,6 +292,7 @@ Show **active** workflow runs (running and paused) across all worktrees. For ful
 archon workflow status
 archon workflow status --json
 archon workflow status --verbose   # add a per-node summary for each run
+archon workflow status --json --verbose
 ```
 
 ### `workflow runs`
@@ -275,12 +318,24 @@ Show detail for a single run by ID, regardless of status (unlike `status`, which
 ```bash
 archon workflow get <run-id>
 archon workflow get <run-id> --json
-archon workflow get <run-id> --verbose   # add the per-node event summary
+archon workflow get <run-id> --verbose   # add the per-node summary
+archon workflow get <run-id> --json --verbose
 ```
+
+For both commands, `--json --verbose` adds a `nodes` array. Nodes are ordered by the
+first appearance of each node in the deterministically ordered event stream. Every
+entry includes `nodeId` and `state`; nodes with a start event include the original ISO
+`startedAt`, and terminal nodes with both start and end events include `durationMs`.
+Completed nodes may include an `outputPreview`, truncated after 200 characters with
+ASCII `...`, while failed nodes include `error` (or `Unknown error` when none was
+recorded).
+
+Add `--events` to `--json --verbose` to return raw `events` rows instead of `nodes` for
+debugging. Raw events are not the recommended integration surface.
 
 ### `workflow resume`
 
-Resume a failed workflow run. Re-executes the workflow, automatically skipping nodes that completed in the prior run.
+Resume a failed or paused workflow run. Re-executes the workflow, automatically skipping nodes that completed in the prior run.
 
 ```bash
 archon workflow resume <run-id>
@@ -552,6 +607,7 @@ archon version
 | `--quiet`, `-q` | Reduce log verbosity to warnings and errors only |
 | `--verbose`, `-v` | Show debug-level output |
 | `--json` | Output machine-readable JSON (workflow `list`, `status`, `runs`, `get`, and the write commands `approve`/`reject`/`abandon`/`resume`). Implies log suppression so stdout is exactly the JSON payload. |
+| `--events` | With verbose JSON workflow `status`/`get`, return raw event rows instead of ordered node summaries. |
 | `--help`, `-h` | Show help message |
 
 ## Working Directory

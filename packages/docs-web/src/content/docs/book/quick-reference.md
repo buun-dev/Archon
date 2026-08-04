@@ -25,7 +25,7 @@ This chapter collects every CLI command, variable, and YAML option in one place.
 | `archon workflow run <name> --no-worktree "<prompt>"` | Run in the live checkout (no isolation) |
 | `archon workflow run <name> --cwd /path "<prompt>"` | Run against a specific directory |
 | `archon workflow status` | Show status of active workflow runs |
-| `archon workflow resume <run-id>` | Resume a failed workflow run |
+| `archon workflow resume <run-id>` | Resume a failed or paused workflow run |
 | `archon workflow abandon <run-id>` | Abandon a workflow run (running, paused, or failed) |
 | `archon workflow cleanup [days]` | Delete old workflow run records (default: 7 days) |
 
@@ -73,7 +73,7 @@ Variables are substituted at runtime in command bodies and workflow `prompt:` fi
 | `$ARGUMENTS` / `$USER_MESSAGE` | Commands, prompts | The user's whole trigger message (positional `$1`/`$2`/`$3` are not supported) |
 | `$ARTIFACTS_DIR` | Commands, prompts | Absolute path to the workflow run's artifact directory |
 | `$WORKFLOW_ID` | Commands, prompts | The current workflow run ID |
-| `$BASE_BRANCH` | Commands, prompts | Base git branch (auto-detected or set via `worktree.baseBranch`) |
+| `$BASE_BRANCH` | Commands, prompts | Base git branch -- `--base <branch>` (per dispatch), else `worktree.baseBranch`, else the codebase default, else auto-detected ([precedence](/reference/cli/#base-branch-precedence)) |
 | `$DOCS_DIR` | Commands, prompts | Documentation directory path (default: `docs/`) |
 | `$<nodeId>.output` | DAG `when:` conditions, downstream `prompt:` fields | The text output from a completed node |
 

@@ -121,6 +121,7 @@ Commands:
   workflow status            Show status of running/paused workflows
   workflow runs              List recent runs (all statuses) for this project
   workflow get <run-id>      Show detail for a single run (any status)
+  workflow resume <run-id>   Resume a failed or paused run from completed nodes
   workflow search [query]    Search the workflow marketplace
   workflow install <slug>    Install a workflow from the marketplace
   isolation list             List all active worktrees/environments
@@ -157,11 +158,12 @@ Options:
   --base <branch>            Per-dispatch base override for epic slices (worktree cut-from + PR target)
   --no-worktree              Run on branch directly without worktree isolation
   --folder                   Register the current non-git directory as a folder project and run in place
-  --resume                   Resume the most recent failed run of the workflow (mutually exclusive with --branch)
+  --resume                   Resume the most recent failed or paused run of the workflow (mutually exclusive with --branch)
   --spawn                    Open setup wizard in a new terminal window (for setup command)
   --quiet, -q                Reduce log verbosity to warnings and errors only
   --verbose, -v              Show debug-level output
   --json                     Output machine-readable JSON (list/status/get/runs/approve/reject/abandon/resume)
+  --events                   For verbose JSON status/get: output raw event rows instead of node summaries
   --detach                   Run 'workflow run'/'approve'/'reject'/'resume' in a detached background child (returns immediately)
   --all                      For 'workflow runs': list across all projects (ignore cwd scope)
   --status <status>          For 'workflow runs': filter to one status (running, completed, failed, ...)
@@ -185,6 +187,7 @@ Examples:
   archon workflow run archon-assist --detach "Investigate the flaky test"
   archon workflow runs --json
   archon workflow get <run-id> --json
+  archon workflow resume <run-id>
   archon continue fix/issue-42 --workflow archon-smart-pr-review "Review the changes"
   archon skill install
   archon skill install /path/to/project
@@ -286,6 +289,7 @@ async function main(): Promise<number> {
         quiet: { type: 'boolean', short: 'q' },
         verbose: { type: 'boolean', short: 'v' },
         json: { type: 'boolean' },
+        events: { type: 'boolean' },
         'run-id': { type: 'string' },
         type: { type: 'string' },
         data: { type: 'string' },
@@ -585,13 +589,17 @@ async function main(): Promise<number> {
           }
 
           case 'status':
-            await workflowStatusCommand(jsonFlag, values.verbose as boolean | undefined);
+            await workflowStatusCommand(
+              jsonFlag,
+              values.verbose as boolean | undefined,
+              values.events as boolean | undefined
+            );
             break;
 
           case 'get': {
             const getRunId = positionals[2];
             if (!getRunId) {
-              console.error('Usage: archon workflow get <run-id> [--json] [--verbose]');
+              console.error('Usage: archon workflow get <run-id> [--json] [--verbose] [--events]');
               return 1;
             }
             // Propagate the command's exit code so `get <id> && ...` and CI
@@ -600,7 +608,8 @@ async function main(): Promise<number> {
               getRunId,
               jsonFlag,
               values.verbose as boolean | undefined,
-              effectiveCwd
+              effectiveCwd,
+              values.events as boolean | undefined
             );
           }
 
@@ -1049,7 +1058,14 @@ async function main(): Promise<number> {
   }
 }
 
-// Run main and exit with the returned code
+// Exit explicitly so a lingering handle (DB pool, spawned child, timer) can
+// never leave the CLI hanging after its work is done.
+//
+// This is safe for piped output because every machine-readable payload is
+// emitted through `writeStdout()`/`writeJsonLine()` (src/utils/stdout.ts), which
+// resolves only once the bytes have reached the OS. The #2384 truncation
+// happened inside `console.log` at call time — not at exit — so deferring the
+// exit would not have recovered it.
 main()
   .then(exitCode => {
     process.exit(exitCode);

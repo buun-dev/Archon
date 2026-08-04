@@ -265,6 +265,7 @@ COMMENT ON TABLE remote_agent_workflow_runs IS
 CREATE TABLE IF NOT EXISTS remote_agent_workflow_events (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   workflow_run_id UUID NOT NULL REFERENCES remote_agent_workflow_runs(id) ON DELETE CASCADE,
+  event_order BIGINT,
   event_type VARCHAR(50) NOT NULL,
   step_index INTEGER,
   step_name VARCHAR(255),
@@ -280,6 +281,9 @@ CREATE INDEX IF NOT EXISTS idx_workflow_events_type
 -- (WHERE created_at >= $1 ORDER BY created_at ASC).
 CREATE INDEX IF NOT EXISTS idx_workflow_events_created_at
   ON remote_agent_workflow_events(created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_events_run_order
+  ON remote_agent_workflow_events(workflow_run_id, event_order)
+  WHERE event_order IS NOT NULL;
 
 COMMENT ON TABLE remote_agent_workflow_events IS
   'Lean UI-relevant workflow events for observability (step transitions, artifacts, errors)';
@@ -516,6 +520,32 @@ ALTER TABLE remote_agent_user_ai_prefs
 -- 'member' is reserved for future per-resource scoping. Visibility stays open.
 ALTER TABLE remote_agent_users
   ADD COLUMN IF NOT EXISTS role VARCHAR(16) NOT NULL DEFAULT 'admin';
+
+-- Lifecycle ordering (#2359 follow-up): timestamps can tie, especially on
+-- SQLite (one-second precision), so a database-assigned order breaks the tie and
+-- preserves event chronology. `id` cannot serve this role — it is a random UUID,
+-- not monotonic.
+--
+-- Deliberately a plain column plus a sequence DEFAULT, NOT `GENERATED ... AS
+-- IDENTITY`. Adding an identity column REWRITES the whole table under ACCESS
+-- EXCLUSIVE (verified on postgres:18: relfilenode changes), and this is the
+-- largest table in the schema while the schema auto-applies on startup — that is
+-- a boot-time stall proportional to event history. ADD COLUMN with no default is
+-- metadata-only, and SET DEFAULT afterwards applies to future inserts only.
+--
+-- It also keeps both databases honest: existing rows stay NULL on Postgres AND
+-- SQLite, so the COALESCE(event_order, 0) fallback in read queries behaves
+-- identically. An identity column would have back-filled Postgres rows (1, 2,
+-- 3...) while SQLite left them NULL.
+ALTER TABLE remote_agent_workflow_events
+  ADD COLUMN IF NOT EXISTS event_order BIGINT;
+CREATE SEQUENCE IF NOT EXISTS remote_agent_workflow_events_event_order_seq
+  OWNED BY remote_agent_workflow_events.event_order;
+ALTER TABLE remote_agent_workflow_events
+  ALTER COLUMN event_order SET DEFAULT nextval('remote_agent_workflow_events_event_order_seq');
+CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_events_run_order
+  ON remote_agent_workflow_events(workflow_run_id, event_order)
+  WHERE event_order IS NOT NULL;
 
 -- ============================================================================
 -- Schema vintage (#2316)

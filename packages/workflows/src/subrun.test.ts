@@ -61,7 +61,7 @@ import type { WorkflowDefinition } from './schemas/workflow';
 // ---------------------------------------------------------------------------
 // Stateful in-memory store — implements just enough of IWorkflowStore to drive
 // the real run lifecycle (create / pause / resume / complete / fail / cancel),
-// event log (for getCompletedDagNodeOutputs), the run tree (findChildRuns /
+// event log (for DAG resume snapshots), the run tree (findChildRuns /
 // getRunAncestry), and the ancestor-aware path lock.
 // ---------------------------------------------------------------------------
 
@@ -215,18 +215,34 @@ class InMemoryStore implements IWorkflowStore {
     return Promise.resolve();
   };
 
-  getCompletedDagNodeOutputs = (workflowRunId: string): Promise<Map<string, string>> => {
-    const map = new Map<string, string>();
+  getDagResumeSnapshot: IWorkflowStore['getDagResumeSnapshot'] = workflowRunId => {
+    const completedNodeOutputs = new Map<string, string>();
+    const tokens = { input: 0, output: 0 };
     for (const e of this.events) {
       if (
         e.workflow_run_id === workflowRunId &&
         (e.event_type === 'node_completed' || e.event_type === 'node_skipped_prior_success') &&
         typeof e.step_name === 'string'
       ) {
-        map.set(e.step_name, String(e.data?.node_output ?? ''));
+        completedNodeOutputs.set(e.step_name, String(e.data?.node_output ?? ''));
+        const eventTokens = e.data?.tokens;
+        if (
+          e.event_type === 'node_completed' &&
+          typeof eventTokens === 'object' &&
+          eventTokens !== null &&
+          'input' in eventTokens &&
+          'output' in eventTokens &&
+          typeof eventTokens.input === 'number' &&
+          typeof eventTokens.output === 'number' &&
+          Number.isFinite(eventTokens.input) &&
+          Number.isFinite(eventTokens.output)
+        ) {
+          tokens.input += eventTokens.input;
+          tokens.output += eventTokens.output;
+        }
       }
     }
-    return Promise.resolve(map);
+    return Promise.resolve({ completedNodeOutputs, tokens });
   };
 
   getCodebase = (): Promise<null> => Promise.resolve(null);
@@ -276,7 +292,7 @@ function makeProvider() {
     }),
     sendQuery: mock(function* () {
       yield { type: 'assistant', content: 'ai-output' };
-      yield { type: 'result', sessionId: 'sess', cost: 0.01 };
+      yield { type: 'result', sessionId: 'sess', cost: 0.01, tokens: { input: 7, output: 3 } };
     }),
   };
 }
@@ -333,7 +349,7 @@ describe('workflow: sub-run e2e (#2121 Phase 2)', () => {
     else process.env.ARCHON_HOME = originalArchonHome;
   });
 
-  it('runs a gateless child synchronously, threads output + cost, links parent_run_id', async () => {
+  it('runs a gateless child synchronously, threads output + cost + tokens, links parent_run_id', async () => {
     await writeWorkflow(
       'child-plain',
       `
@@ -408,11 +424,19 @@ nodes:
     // Child persisted its terminal summary + cost for the parent to read back.
     expect((child?.metadata as Record<string, unknown>).summary).toBe('ai-output');
     expect((child?.metadata as Record<string, unknown>).total_cost_usd).toBeCloseTo(0.01, 5);
+    expect((child?.metadata as Record<string, unknown>).total_tokens_in).toBe(7);
+    expect((child?.metadata as Record<string, unknown>).total_tokens_out).toBe(3);
     // The sub node wrote node_completed with the child's output (threaded to $sub.output).
     const subCompleted = store.events.find(
       e => e.event_type === 'node_completed' && e.step_name === 'sub'
     );
     expect(subCompleted?.data?.node_output).toBe('ai-output');
+    // ...and with the child's rolled-up usage. Tokens must ride along with cost:
+    // they are the only usage axis every provider reports (#2333), and the child's
+    // own per-node rows are filed under a different workflow_run_id, so this cannot
+    // double count within the parent's stream.
+    expect(subCompleted?.data?.cost_usd).toBeCloseTo(0.01, 5);
+    expect(subCompleted?.data?.tokens).toEqual({ input: 7, output: 3 });
     // Child conversation is shared with the parent.
     expect(child?.conversation_id).toBe('conv-db');
   });

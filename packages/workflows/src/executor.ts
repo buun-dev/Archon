@@ -355,20 +355,28 @@ export function resolveScopeArtifactsDir(
 }
 
 /**
- * Resume payload. `priorCompletedNodes` may only appear together with
- * `preCreatedRun` — passing completed-node outputs without the resumed row
- * would silently inject node-skip state into a freshly-created run. Lock-token
- * rows (used by `dispatchBackgroundWorkflow`) supply `preCreatedRun` alone.
+ * Resume state may only appear together with `preCreatedRun` — passing prior
+ * outputs or usage without the resumed row would silently inject state into a
+ * freshly-created run. Lock-token rows (used by `dispatchBackgroundWorkflow`)
+ * supply `preCreatedRun` alone.
  */
 type ResumePayload =
-  | { preCreatedRun: WorkflowRun; priorCompletedNodes?: Map<string, string> }
-  | { preCreatedRun?: undefined; priorCompletedNodes?: undefined };
+  | {
+      preCreatedRun: WorkflowRun;
+      priorCompletedNodes?: Map<string, string>;
+      priorTokenUsage?: { input: number; output: number };
+    }
+  | {
+      preCreatedRun?: undefined;
+      priorCompletedNodes?: undefined;
+      priorTokenUsage?: undefined;
+    };
 
 /**
  * Optional parameters for {@link executeWorkflow}. All trailing args live here
  * so call sites stay readable as new options accrue.
  *
- * To resume a prior run, obtain `preCreatedRun` + `priorCompletedNodes` from
+ * To resume a prior run, obtain the run, prior outputs, and prior usage from
  * {@link hydrateResumableRun} (or look up via `findResumableRun` and hydrate)
  * and spread them in. The executor never queries the store for a prior run on
  * its own; that decision belongs at the call site.
@@ -379,9 +387,20 @@ export type ExecuteWorkflowOptions = ResumePayload & {
   /**
    * Caller-provided base branch fallback for `$BASE_BRANCH`, normally the
    * codebase's stored `default_branch`. Repo config still wins when
-   * `worktree.baseBranch` is set; git auto-detection remains the last resort.
+   * `worktree.baseBranch` is set, and `baseOverride` wins over both; git
+   * auto-detection remains the last resort.
    */
   baseBranch?: string;
+  /**
+   * Per-dispatch base-branch override (CLI `--base <branch>`), the top
+   * precedence level for `$BASE_BRANCH` — above repo config and the codebase
+   * default. Mirrors `IsolationRequest.baseOverride`, which does the same for
+   * the worktree cut-from, so one flag drives both halves of "base". Passing
+   * the override through `baseBranch` instead would rank it BELOW
+   * `worktree.baseBranch`, so a repo with that config set would cut its
+   * worktree from the override while reporting the configured branch here.
+   */
+  baseOverride?: string;
   /**
    * GitHub issue/PR context. When provided:
    * - Stored in `WorkflowRun.metadata` as `{ github_context }`
@@ -447,8 +466,13 @@ export type ExecuteWorkflowOptions = ResumePayload & {
 export async function hydrateResumableRun(
   deps: WorkflowDeps,
   candidate: WorkflowRun
-): Promise<{ preCreatedRun: WorkflowRun; priorCompletedNodes: Map<string, string> } | null> {
-  const priorCompletedNodes = await deps.store.getCompletedDagNodeOutputs(candidate.id);
+): Promise<{
+  preCreatedRun: WorkflowRun;
+  priorCompletedNodes: Map<string, string>;
+  priorTokenUsage: { input: number; output: number };
+} | null> {
+  const snapshot = await deps.store.getDagResumeSnapshot(candidate.id);
+  const priorCompletedNodes = snapshot.completedNodeOutputs;
   // A gate whose node deliberately writes NO node_completed on pause must still be
   // resumable with zero completed nodes: interactive loops, and a `workflow:` node
   // blocked on a child (#2121 Phase 2) whose child is the very first node.
@@ -470,7 +494,7 @@ export async function hydrateResumableRun(
     { workflowRunId: preCreatedRun.id, priorCompletedCount: priorCompletedNodes.size },
     'workflow.dag_resuming'
   );
-  return { preCreatedRun, priorCompletedNodes };
+  return { preCreatedRun, priorCompletedNodes, priorTokenUsage: snapshot.tokens };
 }
 
 /** Depth cap on the `workflow:` sub-run tree (D9). A node nested deeper fails fast. */
@@ -871,9 +895,11 @@ export async function executeWorkflow(
     parentConversationId,
     preCreatedRun,
     priorCompletedNodes,
+    priorTokenUsage,
     userId,
     source,
     baseBranch: callerBaseBranch,
+    baseOverride: callerBaseOverride,
     execContext = { kind: 'host' },
     container: containerCtx,
   } = opts;
@@ -925,12 +951,17 @@ export async function executeWorkflow(
   };
   const configuredCommandFolder = config.commands.folder;
 
-  // Resolve base branch: config takes priority, then the caller-provided
-  // codebase default, then git auto-detection.
+  // Resolve base branch: the per-dispatch override takes priority, then repo
+  // config, then the caller-provided codebase default, then git auto-detection.
+  // The override must outrank config so `--base` reports the same branch the
+  // worktree was cut from (WorktreeProvider applies the same order).
   // If detection fails, leave empty — substituteWorkflowVariables throws only if $BASE_BRANCH is referenced.
+  const overrideBaseBranch = callerBaseOverride?.trim();
   const fallbackBaseBranch = callerBaseBranch?.trim();
   let baseBranch: string;
-  if (config.baseBranch) {
+  if (overrideBaseBranch) {
+    baseBranch = overrideBaseBranch;
+  } else if (config.baseBranch) {
     baseBranch = config.baseBranch;
   } else if (fallbackBaseBranch) {
     baseBranch = fallbackBaseBranch;
@@ -1067,6 +1098,7 @@ export async function executeWorkflow(
   // preCreatedRun (from hydrateResumableRun) + priorCompletedNodes via opts.
   // When both are absent the executor creates a fresh row below.
   const dagPriorCompletedNodes = priorCompletedNodes;
+  const dagPriorTokenUsage = priorTokenUsage;
   let workflowRun: WorkflowRun | undefined = preCreatedRun;
 
   if (preCreatedRun && priorCompletedNodes !== undefined) {
@@ -1493,7 +1525,8 @@ export async function executeWorkflow(
       // Sub-run closure (#2121 Phase 2): captures executeWorkflow (this module — no
       // import cycle) so a `workflow:` node can spawn a governed child run in-process.
       (childArgs: RunChildWorkflowArgs): Promise<ChildWorkflowOutcome> =>
-        runChildWorkflow(deps, platform, childArgs)
+        runChildWorkflow(deps, platform, childArgs),
+      dagPriorTokenUsage
     );
 
     // executeDagWorkflow throws on fatal errors; check DB status for result

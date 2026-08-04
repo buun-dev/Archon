@@ -112,7 +112,10 @@ function makeStore(overrides: Partial<IWorkflowStore> = {}): IWorkflowStore {
     getWorkflowRunStatus: mock(async () => 'completed' as const),
     createWorkflowEvent: mock(async () => {}),
     findResumableRun: mock(async () => null),
-    getCompletedDagNodeOutputs: mock(async () => new Map()),
+    getDagResumeSnapshot: mock(async () => ({
+      completedNodeOutputs: new Map(),
+      tokens: { input: 0, output: 0 },
+    })),
     resumeWorkflowRun: mock(async () => makeRun()),
     getCodebase: mock(async () => null),
     getCodebaseEnvVars: mock(async () => ({})),
@@ -231,12 +234,14 @@ describe('executeWorkflow', () => {
         {
           preCreatedRun,
           priorCompletedNodes: new Map([['node1', 'out']]),
+          priorTokenUsage: { input: 40, output: 4 },
           execContext: { kind: 'container', containerId: 'cid' },
           container: { envId: 'env-x', writeBack: 'approve', backend },
         }
       );
       // Guard passed → DAG entered (mocked no-op) → run completes.
       expect(mockExecuteDagWorkflow).toHaveBeenCalledTimes(1);
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[23]).toEqual({ input: 40, output: 4 });
       expect(result.success).toBe(true);
     });
   });
@@ -711,6 +716,37 @@ describe('executeWorkflow', () => {
       expect(mockExecuteDagWorkflow.mock.calls[0]?.[10]).toBe('main');
     });
 
+    it('prefers baseOverride over repo config baseBranch', async () => {
+      // The per-dispatch `--base` override is the top precedence level. Without
+      // it ranked above config, a repo that sets `worktree.baseBranch` would cut
+      // its worktree from the override but report the CONFIGURED branch as
+      // $BASE_BRANCH — telling an AI node it works from a branch the worktree
+      // was never cut from, and targeting `gh pr create --base` at the wrong one.
+      const deps = makeDeps();
+      deps.loadConfig = mock(
+        async (): Promise<WorkflowConfig> => ({
+          assistant: 'claude' as const,
+          assistants: { claude: {}, codex: {} },
+          baseBranch: 'main',
+          commands: { folder: '' },
+        })
+      ) as unknown as WorkflowDeps['loadConfig'];
+
+      await executeWorkflow(
+        deps,
+        makePlatform(),
+        'conv-1',
+        '/tmp/worktree',
+        makeWorkflow(),
+        'test message',
+        'db-conv-1',
+        { baseBranch: 'develop', baseOverride: 'epic/foo' }
+      );
+
+      expect(mockGetDefaultBranch).not.toHaveBeenCalled();
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[10]).toBe('epic/foo');
+    });
+
     it('falls back to git auto-detection when config and caller branch are unset', async () => {
       const deps = makeDeps();
 
@@ -843,6 +879,38 @@ describe('executeWorkflow', () => {
         | undefined;
       expect(passedPriors).toBe(priorCompletedNodes);
       // No fresh row created when a preCreatedRun is supplied.
+      expect(store.createWorkflowRun).not.toHaveBeenCalled();
+    });
+
+    it('forwards a hydrated resume snapshot into resumed DAG execution', async () => {
+      const candidate = makeRun({ id: 'failed-run', status: 'failed' });
+      const resumed = makeRun({ id: 'resumed-run', status: 'running' });
+      const completedNodeOutputs = new Map([['node-a', 'first output']]);
+      const tokens = { input: 40, output: 4 };
+      const store = makeStore({
+        getDagResumeSnapshot: mock(async () => ({ completedNodeOutputs, tokens })),
+        resumeWorkflowRun: mock(async () => resumed),
+      });
+      const deps = makeDeps(store);
+
+      const hydrated = await hydrateResumableRun(deps, candidate);
+      expect(hydrated).not.toBeNull();
+      if (!hydrated) throw new Error('Expected resumable workflow to hydrate');
+
+      await executeWorkflow(
+        deps,
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow(),
+        'test message',
+        'db-conv-1',
+        hydrated
+      );
+
+      const dagCall = mockExecuteDagWorkflow.mock.calls[0];
+      expect(dagCall?.[15]).toBe(completedNodeOutputs);
+      expect(dagCall?.[23]).toEqual(tokens);
       expect(store.createWorkflowRun).not.toHaveBeenCalled();
     });
   });
@@ -1618,7 +1686,10 @@ describe('hydrateResumableRun', () => {
     const resumed = makeRun({ id: 'prior-failed', status: 'running' });
     const priorNodes = new Map([['n1', 'out1']]);
     const store = makeStore({
-      getCompletedDagNodeOutputs: mock(async () => priorNodes),
+      getDagResumeSnapshot: mock(async () => ({
+        completedNodeOutputs: priorNodes,
+        tokens: { input: 40, output: 4 },
+      })),
       resumeWorkflowRun: mock(async () => resumed),
     });
     const deps = makeDeps(store);
@@ -1626,13 +1697,17 @@ describe('hydrateResumableRun', () => {
     expect(result).not.toBeNull();
     expect(result?.preCreatedRun).toBe(resumed);
     expect(result?.priorCompletedNodes).toBe(priorNodes);
+    expect(result?.priorTokenUsage).toEqual({ input: 40, output: 4 });
     expect(store.resumeWorkflowRun).toHaveBeenCalledWith('prior-failed');
   });
 
   it('returns null when candidate has no completed nodes and no interactive-loop state', async () => {
     const candidate = makeRun({ id: 'empty-prior', status: 'failed' });
     const store = makeStore({
-      getCompletedDagNodeOutputs: mock(async () => new Map()),
+      getDagResumeSnapshot: mock(async () => ({
+        completedNodeOutputs: new Map(),
+        tokens: { input: 0, output: 0 },
+      })),
     });
     const deps = makeDeps(store);
     const result = await hydrateResumableRun(deps, candidate);
@@ -1649,7 +1724,10 @@ describe('hydrateResumableRun', () => {
     });
     const resumed = makeRun({ id: 'paused-loop', status: 'running' });
     const store = makeStore({
-      getCompletedDagNodeOutputs: mock(async () => new Map()),
+      getDagResumeSnapshot: mock(async () => ({
+        completedNodeOutputs: new Map(),
+        tokens: { input: 0, output: 0 },
+      })),
       resumeWorkflowRun: mock(async () => resumed),
     });
     const deps = makeDeps(store);
@@ -1659,10 +1737,10 @@ describe('hydrateResumableRun', () => {
     expect(store.resumeWorkflowRun).toHaveBeenCalledWith('paused-loop');
   });
 
-  it('propagates DB errors from getCompletedDagNodeOutputs (no silent fallback)', async () => {
+  it('propagates DB errors from getDagResumeSnapshot (no silent fallback)', async () => {
     const candidate = makeRun({ id: 'prior-failed', status: 'failed' });
     const store = makeStore({
-      getCompletedDagNodeOutputs: mock(async () => {
+      getDagResumeSnapshot: mock(async () => {
         throw new Error('DB read failed');
       }),
     });
@@ -1673,7 +1751,10 @@ describe('hydrateResumableRun', () => {
   it('propagates DB errors from resumeWorkflowRun (no silent fallback)', async () => {
     const candidate = makeRun({ id: 'prior-failed', status: 'failed' });
     const store = makeStore({
-      getCompletedDagNodeOutputs: mock(async () => new Map([['n1', 'v1']])),
+      getDagResumeSnapshot: mock(async () => ({
+        completedNodeOutputs: new Map([['n1', 'v1']]),
+        tokens: { input: 0, output: 0 },
+      })),
       resumeWorkflowRun: mock(async () => {
         throw new Error('DB write failed');
       }),

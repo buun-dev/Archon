@@ -136,6 +136,26 @@ function dagNodeTelemetryType(node: DagNode): WorkflowNodeType {
   return 'prompt';
 }
 
+interface RunningTool {
+  toolName: string;
+  startedAt: number;
+}
+
+function findRunningTool(
+  runningTools: Map<string, RunningTool>,
+  toolName: string,
+  toolCallId: string | undefined
+): [string, RunningTool] | undefined {
+  if (toolCallId) {
+    const tool = runningTools.get(toolCallId);
+    return tool ? [toolCallId, tool] : undefined;
+  }
+
+  return Array.from(runningTools.entries())
+    .reverse()
+    .find(([, tool]) => tool.toolName === toolName);
+}
+
 /**
  * Usage totals for the terminal telemetry event. Fields are omitted (not sent
  * as zero) when nothing was reported, so absence in PostHog means "providers
@@ -948,6 +968,7 @@ async function resolveNodeProviderAndModel(
   model: string | undefined;
   options: SendQueryOptions | undefined;
   tier?: TierName;
+  effort?: string;
 }> {
   const configuredProvider: string = node.provider ?? workflowProvider;
   let provider: string = configuredProvider;
@@ -1138,6 +1159,19 @@ async function resolveNodeProviderAndModel(
     nodeConfig,
     assistantConfig
   );
+  // Read POST-routing values only. applyPresetOptions -> routePresetEffort has
+  // already placed effort where the provider actually consumes it — nodeConfig
+  // for providers taking a node-level `effort:`, assistantConfig for Codex's
+  // modelReasoningEffort — and warned + dropped it where unsupported. So both
+  // reads below hold effort that will genuinely be applied.
+  //
+  // Do NOT gate this on caps.effortControl: that flag means "accepts the
+  // node-level effort: field", not "can apply reasoning effort". Codex is
+  // effortControl:false yet applies effort via modelReasoningEffort, so gating
+  // on it would drop a real, applied value from node_started.
+  const assistantEffort = assistantConfig.modelReasoningEffort;
+  const resolvedEffort: string | undefined =
+    nodeConfig.effort ?? (typeof assistantEffort === 'string' ? assistantEffort : undefined);
 
   const options: SendQueryOptions = {
     ...baseOptions,
@@ -1156,7 +1190,7 @@ async function resolveNodeProviderAndModel(
         ? workflowLevelOptions.workflowTier
         : undefined;
 
-  return { provider, model, options, tier };
+  return { provider, model, options, tier, effort: resolvedEffort };
 }
 
 /** Evaluate trigger rule for a node given its upstream states */
@@ -1267,6 +1301,7 @@ async function executeNodeInternal(
   issueContext?: string,
   resolvedModel?: string,
   resolvedTier?: TierName,
+  resolvedEffort?: string,
   stepNamePrefix = '',
   iteration?: number
 ): Promise<NodeExecutionResult> {
@@ -1295,6 +1330,7 @@ async function executeNodeInternal(
         provider,
         model: resolvedModel,
         tier: resolvedTier,
+        ...(resolvedEffort !== undefined ? { effort: resolvedEffort } : {}),
         ...iterationData,
       },
     })
@@ -1314,6 +1350,7 @@ async function executeNodeInternal(
     provider,
     model: resolvedModel,
     tier: resolvedTier,
+    ...(resolvedEffort !== undefined ? { effort: resolvedEffort } : {}),
   });
 
   // Load prompt
@@ -1432,7 +1469,9 @@ async function executeNodeInternal(
   };
   let nodeIdleTimedOut = false;
   const effectiveIdleTimeout = node.idle_timeout ?? STEP_IDLE_TIMEOUT_MS;
-  let lastToolStartedAt: { toolName: string; startedAt: number } | null = null;
+  const runningTools = new Map<string, RunningTool>();
+  let anonymousToolSequence = 0;
+  let lastAnonymousToolCallId: string | undefined;
   // Task ids still live when the stream ended abnormally (idle timeout /
   // subprocess death) — recorded on the node_completed event so an incomplete
   // node never masquerades as a clean success (#2083).
@@ -1542,16 +1581,22 @@ async function executeNodeInternal(
         await logAssistant(logDir, workflowRun.id, msg.content);
       } else if (msg.type === 'tool' && msg.toolName) {
         const now = Date.now();
+        const toolCallId = msg.toolCallId ?? `anonymous-${String(++anonymousToolSequence)}`;
 
-        // Emit tool_completed for the previous tool (fire-and-forget)
-        if (lastToolStartedAt) {
-          const prevTool = lastToolStartedAt;
+        // Providers without stable IDs report sequential tool calls. Preserve their
+        // legacy boundary while allowing identified calls to overlap.
+        const previousTool = lastAnonymousToolCallId
+          ? runningTools.get(lastAnonymousToolCallId)
+          : undefined;
+        if (previousTool && lastAnonymousToolCallId !== undefined) {
           getWorkflowEventEmitter().emit({
             type: 'tool_completed',
             runId: workflowRun.id,
-            toolName: prevTool.toolName,
+            toolName: previousTool.toolName,
             stepName: node.id,
-            durationMs: now - prevTool.startedAt,
+            durationMs: now - previousTool.startedAt,
+            toolCallId: lastAnonymousToolCallId,
+            toolOutcome: 'unknown',
           });
           deps.store
             .createWorkflowEvent({
@@ -1559,8 +1604,10 @@ async function executeNodeInternal(
               event_type: 'tool_completed',
               step_name: stepName,
               data: {
-                tool_name: prevTool.toolName,
-                duration_ms: now - prevTool.startedAt,
+                tool_name: previousTool.toolName,
+                duration_ms: now - previousTool.startedAt,
+                tool_call_id: lastAnonymousToolCallId,
+                tool_outcome: 'unknown',
               },
             })
             .catch((err: Error) => {
@@ -1569,8 +1616,10 @@ async function executeNodeInternal(
                 'workflow_event_persist_failed'
               );
             });
+          runningTools.delete(lastAnonymousToolCallId);
         }
-        lastToolStartedAt = { toolName: msg.toolName, startedAt: now };
+        runningTools.set(toolCallId, { toolName: msg.toolName, startedAt: now });
+        if (!msg.toolCallId) lastAnonymousToolCallId = toolCallId;
 
         // Emit tool_started for the current tool (fire-and-forget)
         getWorkflowEventEmitter().emit({
@@ -1578,6 +1627,7 @@ async function executeNodeInternal(
           runId: workflowRun.id,
           toolName: msg.toolName,
           stepName: node.id,
+          toolCallId,
         });
 
         if (streamingMode === 'stream') {
@@ -1602,6 +1652,7 @@ async function executeNodeInternal(
             data: {
               tool_name: msg.toolName,
               tool_input: msg.toolInput ?? {},
+              tool_call_id: toolCallId,
             },
           })
           .catch((err: Error) => {
@@ -1612,14 +1663,18 @@ async function executeNodeInternal(
           });
       } else if (msg.type === 'tool_result' && msg.toolName) {
         const now = Date.now();
-        if (lastToolStartedAt) {
-          const completedTool = lastToolStartedAt;
+        const completedTool = findRunningTool(runningTools, msg.toolName, msg.toolCallId);
+        if (completedTool) {
+          const [completedToolCallId, tool] = completedTool;
           getWorkflowEventEmitter().emit({
             type: 'tool_completed',
             runId: workflowRun.id,
-            toolName: completedTool.toolName,
+            toolName: tool.toolName,
             stepName: node.id,
-            durationMs: now - completedTool.startedAt,
+            durationMs: now - tool.startedAt,
+            toolCallId: completedToolCallId,
+            ...(msg.toolOutcome !== undefined ? { toolOutcome: msg.toolOutcome } : {}),
+            ...(msg.exitCode !== undefined ? { exitCode: msg.exitCode } : {}),
           });
           deps.store
             .createWorkflowEvent({
@@ -1627,8 +1682,11 @@ async function executeNodeInternal(
               event_type: 'tool_completed',
               step_name: stepName,
               data: {
-                tool_name: completedTool.toolName,
-                duration_ms: now - completedTool.startedAt,
+                tool_name: tool.toolName,
+                duration_ms: now - tool.startedAt,
+                tool_call_id: completedToolCallId,
+                ...(msg.toolOutcome !== undefined ? { tool_outcome: msg.toolOutcome } : {}),
+                ...(msg.exitCode !== undefined ? { exit_code: msg.exitCode } : {}),
               },
             })
             .catch((err: Error) => {
@@ -1637,21 +1695,25 @@ async function executeNodeInternal(
                 'workflow_event_persist_failed'
               );
             });
-          lastToolStartedAt = null;
+          runningTools.delete(completedToolCallId);
+          if (completedToolCallId === lastAnonymousToolCallId) {
+            lastAnonymousToolCallId = undefined;
+          }
         }
         if (streamingMode === 'stream' && platform.sendStructuredEvent) {
           await platform.sendStructuredEvent(conversationId, msg);
         }
       } else if (msg.type === 'result') {
-        // Emit tool_completed for the last tool in the node
-        if (lastToolStartedAt) {
-          const prevTool = lastToolStartedAt;
+        // A terminal result closes every outstanding lifecycle.
+        for (const [toolCallId, prevTool] of runningTools) {
           getWorkflowEventEmitter().emit({
             type: 'tool_completed',
             runId: workflowRun.id,
             toolName: prevTool.toolName,
             stepName: node.id,
             durationMs: Date.now() - prevTool.startedAt,
+            toolCallId,
+            toolOutcome: 'unknown',
           });
           deps.store
             .createWorkflowEvent({
@@ -1661,6 +1723,8 @@ async function executeNodeInternal(
               data: {
                 tool_name: prevTool.toolName,
                 duration_ms: Date.now() - prevTool.startedAt,
+                tool_call_id: toolCallId,
+                tool_outcome: 'unknown',
               },
             })
             .catch((err: Error) => {
@@ -1669,11 +1733,28 @@ async function executeNodeInternal(
                 'workflow_event_persist_failed'
               );
             });
-          lastToolStartedAt = null;
+          runningTools.delete(toolCallId);
         }
         if (msg.sessionId) newSessionId = msg.sessionId;
         if (msg.resumed !== undefined) nodeResumed = msg.resumed;
-        if (msg.tokens) nodeTokens = msg.tokens;
+        if (msg.tokens !== undefined) {
+          // Normalized to `{input, output}` — the ONLY two fields every provider
+          // reports the same way, and therefore the only shape a consumer can read
+          // without knowing which provider produced the row. `total` is
+          // provider-defined and is NOT input + output (Pi folds cacheRead/cacheWrite
+          // into it, OpenCode sums its own per-agent totals); `cost` duplicates the
+          // separately-persisted `cost_usd`. Same NaN guard rationale as the
+          // DAG-level accumulator: a non-finite value must be dropped loudly, not
+          // persisted as a wrong number that gets believed.
+          if (Number.isFinite(msg.tokens.input) && Number.isFinite(msg.tokens.output)) {
+            nodeTokens = { input: msg.tokens.input, output: msg.tokens.output };
+          } else {
+            getLog().warn(
+              { nodeId: node.id, tokens: msg.tokens },
+              'dag_node.usage_tokens_non_finite_ignored'
+            );
+          }
+        }
         if (msg.cost !== undefined) nodeCostUsd = msg.cost;
         if (msg.stopReason !== undefined) nodeStopReason = msg.stopReason;
         if (msg.numTurns !== undefined) nodeNumTurns = msg.numTurns;
@@ -2282,6 +2363,7 @@ async function executeNodeInternal(
         data: {
           duration_ms: duration,
           node_output: nodeOutputText,
+          ...(nodeTokens !== undefined ? { tokens: nodeTokens } : {}),
           ...(nodeCostUsd !== undefined ? { cost_usd: nodeCostUsd } : {}),
           ...(nodeStopReason ? { stop_reason: nodeStopReason } : {}),
           ...(nodeNumTurns !== undefined ? { num_turns: nodeNumTurns } : {}),
@@ -2470,6 +2552,49 @@ async function runSubprocess(
  *  instead of inlined as bash -c arguments, to avoid silent data corruption. */
 const NODE_OUTPUT_FILE_THRESHOLD = 32_768;
 
+/** Maximum UTF-8 bytes retained for successful bash stdout in workflow events. */
+const PERSISTED_BASH_OUTPUT_MAX_BYTES = 32 * 1024;
+
+function utf8SequenceLength(leadByte: number): number {
+  if (leadByte < 0x80) return 1;
+  if (leadByte < 0xe0) return 2;
+  if (leadByte < 0xf0) return 3;
+  return 4;
+}
+
+function formatPersistedBashOutput(output: string): {
+  nodeOutput: string;
+  truncated: boolean;
+  originalBytes?: number;
+} {
+  const outputBytes = Buffer.from(output, 'utf8');
+  if (outputBytes.byteLength <= PERSISTED_BASH_OUTPUT_MAX_BYTES) {
+    return { nodeOutput: output, truncated: false };
+  }
+
+  const marker = `\n\n… [truncated; original output was ${String(outputBytes.byteLength)} bytes]`;
+  const markerBytes = Buffer.byteLength(marker, 'utf8');
+  let headEnd = PERSISTED_BASH_OUTPUT_MAX_BYTES - markerBytes;
+
+  // The byte cap can land inside a multi-byte code point. Inspect the final
+  // sequence in the prefix and drop it when it is incomplete before decoding.
+  let sequenceStart = headEnd - 1;
+  while (sequenceStart >= 0 && (outputBytes[sequenceStart] & 0xc0) === 0x80) {
+    sequenceStart--;
+  }
+  if (sequenceStart >= 0) {
+    const leadByte = outputBytes[sequenceStart];
+    const expectedLength = utf8SequenceLength(leadByte);
+    if (headEnd - sequenceStart < expectedLength) headEnd = sequenceStart;
+  }
+
+  return {
+    nodeOutput: outputBytes.subarray(0, headEnd).toString('utf8') + marker,
+    truncated: true,
+    originalBytes: outputBytes.byteLength,
+  };
+}
+
 /**
  * Execute a bash (shell script) DAG node.
  * Runs the script via `bash -c`, captures stdout as node output.
@@ -2599,12 +2724,25 @@ async function executeBashNode(
     getLog().info({ nodeId: node.id, durationMs: duration }, 'dag_node_completed');
     await logNodeComplete(logDir, workflowRun.id, node.id, '<bash>', { durationMs: duration });
 
+    const persistedOutput = formatPersistedBashOutput(output);
+
     deps.store
       .createWorkflowEvent({
         workflow_run_id: workflowRun.id,
         event_type: 'node_completed',
         step_name: stepName,
-        data: { duration_ms: duration, type: 'bash', node_output: output, ...iterationData },
+        data: {
+          duration_ms: duration,
+          type: 'bash',
+          node_output: persistedOutput.nodeOutput,
+          ...(persistedOutput.truncated
+            ? {
+                node_output_truncated: true,
+                node_output_original_bytes: persistedOutput.originalBytes,
+              }
+            : {}),
+          ...iterationData,
+        },
       })
       .catch((err: Error) => {
         getLog().error(
@@ -3062,12 +3200,51 @@ function buildHonestGateMessage(
 }
 
 /**
+ * Narrow the token usage a loop gate persisted in its approval context (#2333).
+ *
+ * `metadata.approval` is free-form JSON read back from the DB and `isApprovalContext`
+ * only vouches for nodeId/message, so the declared type carries no runtime authority
+ * here: a run paused by a build that predates the field has none, and a malformed or
+ * non-finite value must be dropped rather than persisted onward as a number a
+ * consumer would believe.
+ */
+function readSignaledTokens(
+  raw: unknown,
+  context: { workflowRunId: string; nodeId: string }
+): TokenUsage | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw === 'object') {
+    const { input, output } = raw as { input?: unknown; output?: unknown };
+    if (
+      typeof input === 'number' &&
+      typeof output === 'number' &&
+      Number.isFinite(input) &&
+      Number.isFinite(output)
+    ) {
+      return { input, output };
+    }
+  }
+  getLog().warn({ ...context, tokens: raw }, 'dag_loop.signaled_tokens_invalid_ignored');
+  return undefined;
+}
+
+/**
  * Finalize-on-approve (#2074), shared by executeLoopNode and executeLoopGroupNode:
  * a gate that paused on a signal-bearing iteration, resumed WITHOUT feedback,
  * completes the node from the persisted `signaledOutput` instead of re-running
  * the (expensive) iteration. Sends the user notice and writes/emits the
  * node_completed pair; the caller builds its own return value (the single-node
  * loop also threads the restored sessionId).
+ *
+ * `finalizeTokens` is the usage the pausing invocation actually consumed, carried
+ * across the gate in the approval context (#2333) — without it this path persists a
+ * node_completed reporting no usage for iterations that really ran. Passed by the
+ * single-node loop ONLY: its per-iteration rows carry no tokens, so this row is the
+ * only record. A loop_group omits it — its body nodes persisted their own namespaced
+ * rows (with tokens) before the pause, and those rows survive it, so repeating the
+ * total here would double-count in the one event stream. `cost_usd` and the resolved
+ * model are lost across the same gate; both are part of the single "preserve terminal
+ * provider stats across a gate" fix in #2345.
  */
 async function finalizeLoopFromSignal(
   deps: WorkflowDeps,
@@ -3077,7 +3254,8 @@ async function finalizeLoopFromSignal(
   nodeId: string,
   stepName: string,
   nodeLabel: string,
-  finalizeOutput: string
+  finalizeOutput: string,
+  finalizeTokens?: TokenUsage
 ): Promise<void> {
   // Impossible by construction today (the gate writes signaledOutput whenever
   // completionSignaled is true) — this warn guards a future decoupling so a
@@ -3099,7 +3277,11 @@ async function finalizeLoopFromSignal(
       workflow_run_id: workflowRun.id,
       event_type: 'node_completed',
       step_name: stepName,
-      data: { duration_ms: 0, node_output: finalizeOutput },
+      data: {
+        duration_ms: 0,
+        node_output: finalizeOutput,
+        ...(finalizeTokens !== undefined ? { tokens: finalizeTokens } : {}),
+      },
     })
     .catch((err: Error) => {
       getLog().error(
@@ -3210,6 +3392,14 @@ async function executeLoopGroupNode(
       stepName,
       'Loop-group node',
       finalizeOutput
+      // NO finalizeTokens, deliberately — same double-count reasoning as the
+      // natural-completion group row below. A loop_group's body nodes wrote their own
+      // `<groupId>.<nodeId>` node_completed rows (with tokens) BEFORE the gate paused,
+      // and those rows survive the pause: they are already in the event stream this
+      // finalize row is appended to. Reporting the group total here would make a
+      // consumer summing `data.tokens` count the pausing iteration twice. The plain
+      // `loop` DOES pass it — its per-iteration rows carry no tokens, so its finalize
+      // row is the only record of the usage.
     );
     return { state: 'completed', output: finalizeOutput };
   }
@@ -3559,6 +3749,21 @@ async function executeLoopGroupNode(
           data: {
             duration_ms: duration,
             node_output: lastIterationOutput,
+            // NO `tokens` here, deliberately. Unlike every other node type, a
+            // loop_group's body nodes write their OWN node_completed rows (namespaced
+            // `<groupId>.<nodeId>`, one per iteration) and those already carry the
+            // tokens. Persisting the group total under the SAME field name would make
+            // a consumer summing `data.tokens` across node_completed rows count this
+            // group's usage twice with nothing in the row to mark it as an aggregate.
+            // The leaves are authoritative: they are per-provider (a body node may
+            // override `provider:`, so the group total can mix providers and is
+            // useless for the cross-provider comparison #2333 exists to enable), and
+            // the group total is recoverable by summing the `<groupId>.` prefix.
+            // The RETURN value below still carries `tokens` — that is the run-level
+            // roll-up path, which counts each group exactly once (body results land in
+            // the scoped iteration ctx, never the run ctx).
+            // NOTE: `cost_usd` has this same double-count shape and predates #2333;
+            // it is left as-is rather than silently changed under a token fix.
             ...(loopTotalCostUsd !== undefined ? { cost_usd: loopTotalCostUsd } : {}),
           },
         })
@@ -3642,6 +3847,10 @@ async function executeLoopGroupNode(
         // for honesty; pauseWorkflowRun nulls both on every fresh pause.
         completionSignaled: completionDetected,
         signaledOutput: completionDetected ? lastIterationOutput : null,
+        // NO `signaledTokens` — a loop_group gate has no consumer for it. The body's
+        // own `<groupId>.<nodeId>` rows already persisted this iteration's usage before
+        // the pause, so the finalize path deliberately writes no `tokens` (see the
+        // finalizeLoopFromSignal call above). Only the plain `loop` gate carries it.
       });
       return {
         state: 'completed',
@@ -3822,7 +4031,8 @@ async function executeLoopNode(
   stepNamePrefix = '',
   execContext: ExecutionContext = { kind: 'host' },
   resolvedModel?: string,
-  resolvedTier?: TierName
+  resolvedTier?: TierName,
+  resolvedEffort?: string
 ): Promise<NodeExecutionResult> {
   const loop = node.loop;
   const msgContext = { workflowId: workflowRun.id, nodeName: node.id };
@@ -3858,6 +4068,7 @@ async function executeLoopNode(
         provider: workflowProvider,
         model: resolvedModel,
         tier: resolvedTier,
+        ...(resolvedEffort !== undefined ? { effort: resolvedEffort } : {}),
       },
     })
     .catch((err: Error) => {
@@ -3875,6 +4086,7 @@ async function executeLoopNode(
     provider: workflowProvider,
     model: resolvedModel,
     tier: resolvedTier,
+    ...(resolvedEffort !== undefined ? { effort: resolvedEffort } : {}),
   });
 
   /**
@@ -3954,7 +4166,11 @@ async function executeLoopNode(
       node.id,
       stepName,
       'Loop node',
-      finalizeOutput
+      finalizeOutput,
+      readSignaledTokens(loopGateMeta.signaledTokens, {
+        workflowRunId: workflowRun.id,
+        nodeId: node.id,
+      })
     );
     return { state: 'completed', output: finalizeOutput, sessionId: currentSessionId };
   }
@@ -4166,7 +4382,9 @@ async function executeLoopNode(
       };
 
       const generator = aiClient.sendQuery(finalPrompt, cwd, resumeSessionId, iterationOptions);
-      let lastToolStartedAt: { toolName: string; startedAt: number } | null = null;
+      const runningTools = new Map<string, RunningTool>();
+      let anonymousToolSequence = 0;
+      let lastAnonymousToolCallId: string | undefined;
 
       const effectiveIdleTimeout = node.idle_timeout ?? STEP_IDLE_TIMEOUT_MS;
 
@@ -4221,15 +4439,16 @@ async function executeLoopNode(
           }
           await logAssistant(logDir, workflowRun.id, msg.content);
         } else if (msg.type === 'result') {
-          // Emit tool_completed for the last tool in the iteration
-          if (lastToolStartedAt) {
-            const prevTool = lastToolStartedAt;
+          // A terminal result closes every outstanding lifecycle.
+          for (const [toolCallId, prevTool] of runningTools) {
             getWorkflowEventEmitter().emit({
               type: 'tool_completed',
               runId: workflowRun.id,
               toolName: prevTool.toolName,
               stepName: node.id,
               durationMs: Date.now() - prevTool.startedAt,
+              toolCallId,
+              toolOutcome: 'unknown',
             });
             deps.store
               .createWorkflowEvent({
@@ -4239,12 +4458,14 @@ async function executeLoopNode(
                 data: {
                   tool_name: prevTool.toolName,
                   duration_ms: Date.now() - prevTool.startedAt,
+                  tool_call_id: toolCallId,
+                  tool_outcome: 'unknown',
                 },
               })
               .catch((err: Error) => {
                 logEventStoreError(err, i);
               });
-            lastToolStartedAt = null;
+            runningTools.delete(toolCallId);
           }
           if (msg.sessionId) currentSessionId = msg.sessionId;
           // Overwrite, don't accumulate — a later result in the same iteration
@@ -4330,29 +4551,42 @@ async function executeLoopNode(
           backgroundTasks.update(msg.tasks);
         } else if (msg.type === 'tool' && msg.toolName) {
           const now = Date.now();
+          const toolCallId = msg.toolCallId ?? `anonymous-${String(++anonymousToolSequence)}`;
 
-          // Emit tool_completed for the previous tool
-          if (lastToolStartedAt) {
-            const prevTool = lastToolStartedAt;
+          // Providers without stable IDs report sequential tool calls. Preserve their
+          // legacy boundary while allowing identified calls to overlap.
+          const previousTool = lastAnonymousToolCallId
+            ? runningTools.get(lastAnonymousToolCallId)
+            : undefined;
+          if (previousTool && lastAnonymousToolCallId !== undefined) {
             getWorkflowEventEmitter().emit({
               type: 'tool_completed',
               runId: workflowRun.id,
-              toolName: prevTool.toolName,
+              toolName: previousTool.toolName,
               stepName: node.id,
-              durationMs: now - prevTool.startedAt,
+              durationMs: now - previousTool.startedAt,
+              toolCallId: lastAnonymousToolCallId,
+              toolOutcome: 'unknown',
             });
             deps.store
               .createWorkflowEvent({
                 workflow_run_id: workflowRun.id,
                 event_type: 'tool_completed',
                 step_name: stepName,
-                data: { tool_name: prevTool.toolName, duration_ms: now - prevTool.startedAt },
+                data: {
+                  tool_name: previousTool.toolName,
+                  duration_ms: now - previousTool.startedAt,
+                  tool_call_id: lastAnonymousToolCallId,
+                  tool_outcome: 'unknown',
+                },
               })
               .catch((err: Error) => {
                 logEventStoreError(err, i);
               });
+            runningTools.delete(lastAnonymousToolCallId);
           }
-          lastToolStartedAt = { toolName: msg.toolName, startedAt: now };
+          runningTools.set(toolCallId, { toolName: msg.toolName, startedAt: now });
+          if (!msg.toolCallId) lastAnonymousToolCallId = toolCallId;
 
           // Emit tool_started for the current tool (fire-and-forget)
           getWorkflowEventEmitter().emit({
@@ -4360,6 +4594,7 @@ async function executeLoopNode(
             runId: workflowRun.id,
             toolName: msg.toolName,
             stepName: node.id,
+            toolCallId,
           });
 
           if (platform.getStreamingMode() === 'stream') {
@@ -4389,21 +4624,29 @@ async function executeLoopNode(
               workflow_run_id: workflowRun.id,
               event_type: 'tool_called',
               step_name: stepName,
-              data: { tool_name: msg.toolName, tool_input: toolInput },
+              data: {
+                tool_name: msg.toolName,
+                tool_input: toolInput,
+                tool_call_id: toolCallId,
+              },
             })
             .catch((err: Error) => {
               logEventStoreError(err, i);
             });
         } else if (msg.type === 'tool_result' && msg.toolName) {
           const now = Date.now();
-          if (lastToolStartedAt) {
-            const completedTool = lastToolStartedAt;
+          const completedTool = findRunningTool(runningTools, msg.toolName, msg.toolCallId);
+          if (completedTool) {
+            const [completedToolCallId, tool] = completedTool;
             getWorkflowEventEmitter().emit({
               type: 'tool_completed',
               runId: workflowRun.id,
-              toolName: completedTool.toolName,
+              toolName: tool.toolName,
               stepName: node.id,
-              durationMs: now - completedTool.startedAt,
+              durationMs: now - tool.startedAt,
+              toolCallId: completedToolCallId,
+              ...(msg.toolOutcome !== undefined ? { toolOutcome: msg.toolOutcome } : {}),
+              ...(msg.exitCode !== undefined ? { exitCode: msg.exitCode } : {}),
             });
             deps.store
               .createWorkflowEvent({
@@ -4411,14 +4654,20 @@ async function executeLoopNode(
                 event_type: 'tool_completed',
                 step_name: stepName,
                 data: {
-                  tool_name: completedTool.toolName,
-                  duration_ms: now - completedTool.startedAt,
+                  tool_name: tool.toolName,
+                  duration_ms: now - tool.startedAt,
+                  tool_call_id: completedToolCallId,
+                  ...(msg.toolOutcome !== undefined ? { tool_outcome: msg.toolOutcome } : {}),
+                  ...(msg.exitCode !== undefined ? { exit_code: msg.exitCode } : {}),
                 },
               })
               .catch((err: Error) => {
                 logEventStoreError(err, i);
               });
-            lastToolStartedAt = null;
+            runningTools.delete(completedToolCallId);
+            if (completedToolCallId === lastAnonymousToolCallId) {
+              lastAnonymousToolCallId = undefined;
+            }
           }
           if (platform.sendStructuredEvent) {
             await platform.sendStructuredEvent(conversationId, msg);
@@ -4698,7 +4947,7 @@ async function executeLoopNode(
         `Loop node '${node.id}' completed after ${String(i)} iteration${i > 1 ? 's' : ''}`,
         msgContext
       );
-      // Write node_completed event so resume logic (getCompletedDagNodeOutputs) knows this
+      // Write node_completed event so resume hydration knows this
       // node is done. Without this, a resumed DAG would re-enter the loop node.
       deps.store
         .createWorkflowEvent({
@@ -4708,6 +4957,7 @@ async function executeLoopNode(
           data: {
             duration_ms: Date.now() - iterationStart,
             node_output: lastIterationOutput,
+            ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
             ...(loopTotalCostUsd !== undefined ? { cost_usd: loopTotalCostUsd } : {}),
             ...(loopFinalStopReason ? { stop_reason: loopFinalStopReason } : {}),
             ...(loopTotalNumTurns !== undefined ? { num_turns: loopTotalNumTurns } : {}),
@@ -4815,6 +5065,9 @@ async function executeLoopNode(
         // for honesty; pauseWorkflowRun nulls both on every fresh pause.
         completionSignaled: completionDetected,
         signaledOutput: completionDetected ? lastIterationOutput : null,
+        // Usage consumed up to this gate, so a bare approve (finalize, no re-run)
+        // can persist it on node_completed instead of reporting nothing (#2333).
+        signaledTokens: completionDetected ? (loopTotalTokens ?? null) : null,
         // Read-once command body for command-backed loops: the resumed invocation
         // reuses this snapshot instead of re-reading the file (explicit null for
         // prompt-based loops — same json_patch convention as `sessionId`).
@@ -4991,7 +5244,7 @@ async function executeApprovalNode(
 
     // Build a synthetic PromptNode to reuse executeNodeInternal.
     // Use a distinct ID so the node_completed event written by executeNodeInternal
-    // does not collide with the approval gate's own ID in getCompletedDagNodeOutputs.
+    // does not collide with the approval gate's own ID in the resume snapshot.
     // If we used node.id here, a resumed run would find the event and treat the
     // approval gate as already completed, bypassing the human gate entirely.
     //
@@ -5014,6 +5267,7 @@ async function executeApprovalNode(
       model: resolvedNodeModel,
       options: nodeOptions,
       tier: resolvedTier,
+      effort: resolvedEffort,
     } = await resolveNodeProviderAndModel(
       syntheticNode,
       workflowProvider,
@@ -5048,6 +5302,7 @@ async function executeApprovalNode(
       issueContext,
       resolvedNodeModel,
       resolvedTier,
+      resolvedEffort,
       stepNamePrefix,
       iteration
     );
@@ -5177,7 +5432,7 @@ async function executeWorkflowNode(
   // command/prompt/bash/script nodes (which write their own inside their executor)
   // and unlike approval nodes (written by the approve handler), the workflow node
   // writes node_completed HERE — and ONLY on true completion, never on the paused
-  // branch — so getCompletedDagNodeOutputs skips a truly-finished sub-run on resume
+  // branch — so the resume snapshot skips a truly-finished sub-run on resume
   // but re-runs one still blocked on its child.
   const asCompleted = (outcome: ChildWorkflowOutcome): NodeExecutionResult => {
     if (outcome.output === undefined) {
@@ -5206,6 +5461,12 @@ async function executeWorkflowNode(
           type: 'workflow',
           child_run_id: outcome.childRunId,
           ...(outcome.costUsd !== undefined ? { cost_usd: outcome.costUsd } : {}),
+          // Rolled up from the child run's persisted totals, exactly like cost_usd —
+          // tokens are the axis every provider reports (Codex reports no cost at all),
+          // so dropping them here while keeping cost would hide the one comparable
+          // number. Does not double count WITHIN this run: the child's own per-node
+          // rows are filed under `child_run_id`, a different workflow_run_id.
+          ...(outcome.tokens !== undefined ? { tokens: outcome.tokens } : {}),
         },
       })
       .catch((err: Error) => {
@@ -5235,7 +5496,7 @@ async function executeWorkflowNode(
 
   // Pause the PARENT "blocked on child" — mirrors executeApprovalNode's PAUSE
   // primitives: pause, emit, return {completed, ''} WITHOUT node_completed so the
-  // node re-runs on the parent's resume (getCompletedDagNodeOutputs reads only
+  // node re-runs on the parent's resume (the resume snapshot reads only
   // node_completed). The RESUME side deliberately differs: an approval gate is
   // resolved externally by the approve handler, while this node re-runs and
   // re-inspects its child. Also unlike the approval node, no approval_requested
@@ -5777,6 +6038,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
               options: loopOptions,
               model: resolvedLoopModel,
               tier: resolvedLoopTier,
+              effort: resolvedLoopEffort,
             } = await resolveNodeProviderAndModel(
               node,
               workflowProvider,
@@ -5812,7 +6074,8 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
               stepNamePrefix,
               execContext,
               resolvedLoopModel,
-              resolvedLoopTier
+              resolvedLoopTier,
+              resolvedLoopEffort
             );
             // Loop nodes run every iteration on the same resolved provider, so the
             // result session (if any) is attributable to loopProvider — tag it so a
@@ -5979,6 +6242,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
             model: resolvedNodeModel,
             options: nodeOptions,
             tier: resolvedTier,
+            effort: resolvedEffort,
           } = await resolveNodeProviderAndModel(
             node,
             workflowProvider,
@@ -6124,6 +6388,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                 issueContext,
                 resolvedNodeModel,
                 resolvedTier,
+                resolvedEffort,
                 stepNamePrefix,
                 iteration
               ),
@@ -6873,7 +7138,9 @@ export async function executeDagWorkflow(
    * Phase 2). executor.ts is the sole caller and passes it; other callers (unit
    * tests) may omit it, in which case a `workflow:` node fails fast.
    */
-  runChildWorkflow?: RunChildWorkflowFn
+  runChildWorkflow?: RunChildWorkflowFn,
+  /** Cumulative usage restored from prior node_completed events on resume. */
+  priorTokenUsage?: { input: number; output: number }
 ): Promise<string | undefined> {
   const dagStartTime = Date.now();
 
@@ -6967,7 +7234,7 @@ export async function executeDagWorkflow(
       if (node?.always_run) continue;
       // Re-derive the producer's declared field set from the loaded definition so the
       // strict `$node.output.field` contract (output-ref.ts) is invariant across fresh
-      // vs resumed runs. getCompletedDagNodeOutputs rehydrates text only, so without
+      // vs resumed runs. The resume snapshot rehydrates text only, so without
       // this a declared-optional-absent field would throw instead of resolving to ''
       // and an undeclared key would resolve instead of throwing (#2091). Mirrors the
       // fresh-completion capture above.
@@ -7043,8 +7310,8 @@ export async function executeDagWorkflow(
     priorCompletedNodes,
     lastSequentialSession: undefined,
     totalCostUsd: 0,
-    totalTokensIn: 0,
-    totalTokensOut: 0,
+    totalTokensIn: priorTokenUsage?.input ?? 0,
+    totalTokensOut: priorTokenUsage?.output ?? 0,
     totalLoopIterations: 0,
     stepNamePrefix: '',
   };

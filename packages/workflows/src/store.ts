@@ -14,6 +14,14 @@ import type {
 
 export type { WorkflowNodeSession } from './schemas';
 
+export interface DagResumeSnapshot {
+  completedNodeOutputs: Map<string, string>;
+  tokens: {
+    input: number;
+    output: number;
+  };
+}
+
 /** Composite primary key identifying a single persisted node session row. */
 export interface WorkflowNodeSessionKey {
   workflow_name: string;
@@ -26,6 +34,12 @@ export const WORKFLOW_EVENT_TYPES = [
   'workflow_started',
   'workflow_completed',
   'workflow_failed',
+  // #2348 — written by the resume CAS ONLY when it clears a non-empty
+  // `metadata.error`, carrying that error in `data.error`. It is the audit
+  // record for a failure that resume would otherwise erase (the CLI's SIGTERM
+  // handler records a failure in metadata and nowhere else), NOT a general
+  // "a resume happened" marker: its absence never means the run wasn't resumed.
+  'workflow_resumed',
   'node_started',
   'node_completed',
   'node_failed',
@@ -187,14 +201,13 @@ export interface IWorkflowStore extends IRunTreeStore {
   }): Promise<void>;
 
   /**
-   * Return a map of nodeId → output for all node_completed events
-   * from a prior DAG workflow run. Used for DAG resume: the executor
-   * pre-populates nodeOutputs so completed nodes are skipped on re-run.
+   * Return completed node outputs and cumulative token usage from a prior DAG
+   * workflow run. Used for resume hydration so completed nodes are skipped and
+   * the run-level token tally includes every execution of the run.
    *
-   * Returns an empty map when no completed nodes exist.
    * Throws on DB error — caller (executor.ts) owns the degradation policy.
    */
-  getCompletedDagNodeOutputs(workflowRunId: string): Promise<Map<string, string>>;
+  getDagResumeSnapshot(workflowRunId: string): Promise<DagResumeSnapshot>;
 
   // Per-codebase env vars for workflow node injection
   getCodebaseEnvVars(codebaseId: string): Promise<Record<string, string>>;

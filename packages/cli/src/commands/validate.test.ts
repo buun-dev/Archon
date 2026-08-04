@@ -25,8 +25,13 @@ import { validateWorkflowsCommand } from './validate';
 describe('validateWorkflowsCommand', () => {
   const originalLog = console.log;
   const originalError = console.error;
+  const originalStdoutWrite = process.stdout.write;
   const mockConsoleLog = mock(() => {});
   const mockConsoleError = mock(() => {});
+  // `--json` output goes through writeStdout (process.stdout.write), NOT console.log:
+  // console.log silently drops the remainder of a short write on a pipe, truncating
+  // JSON with exit 0 (#2384). Capture the real channel or this asserts on nothing.
+  let stdout: string[] = [];
 
   beforeEach(() => {
     mockDiscoverWorkflowsWithConfig.mockClear();
@@ -34,6 +39,16 @@ describe('validateWorkflowsCommand', () => {
     mockLoadConfig.mockClear();
     mockConsoleLog.mockClear();
     mockConsoleError.mockClear();
+    stdout = [];
+    process.stdout.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
+      stdout.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8'));
+      // writeStdout awaits this callback — never resolving would hang the test.
+      const done = rest.find(arg => typeof arg === 'function') as
+        | ((error?: Error | null) => void)
+        | undefined;
+      done?.(null);
+      return true;
+    }) as typeof process.stdout.write;
     console.log = mockConsoleLog;
     console.error = mockConsoleError;
     mockLoadRepoConfig.mockResolvedValue(null);
@@ -62,11 +77,12 @@ describe('validateWorkflowsCommand', () => {
     const exitCode = await validateWorkflowsCommand('/tmp/repo', undefined, true);
 
     expect(exitCode).toBe(1);
-    expect(JSON.stringify(mockConsoleLog.mock.calls)).toContain('@custom');
+    expect(stdout.join('')).toContain('@custom');
   });
 
   afterEach(() => {
     console.log = originalLog;
     console.error = originalError;
+    process.stdout.write = originalStdoutWrite;
   });
 });

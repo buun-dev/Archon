@@ -3157,6 +3157,19 @@ describe('WorktreeProvider', () => {
       expect(syncWorkspaceSpy).not.toHaveBeenCalled();
     });
 
+    test('throws actionable error when no remote is configured', async () => {
+      getDefaultRemoteSpy.mockResolvedValue(null);
+
+      const localProvider = new WorktreeProvider(async () => ({ baseBranch: 'main' }));
+      const creation = localProvider.create(baseRequest);
+
+      await expect(creation).rejects.toThrow(
+        /no git remote is configured.*git remote add origin URL.*--no-worktree/s
+      );
+      await expect(creation).rejects.not.toThrow(/multiple remotes|worktree\.remote/s);
+      expect(syncWorkspaceSpy).not.toHaveBeenCalled();
+    });
+
     test('uses custom remote for same-repo PR fetch and tracking', async () => {
       const prRequest: PRIsolationRequest = {
         codebaseId: 'cb-123',
