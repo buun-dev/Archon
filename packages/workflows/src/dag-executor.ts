@@ -28,6 +28,7 @@ import type {
 } from '@archon/providers/types';
 import {
   CONTAINER_ENV_DENYLIST,
+  redactSecrets,
   remapContainerPath,
   assertHostSpawnCwdSafe,
 } from '@archon/providers/types';
@@ -2535,7 +2536,25 @@ async function runSubprocess(
       cwd: options.cwd,
       env: options.env,
     });
-    return execFileAsync('docker', dockerArgs, { timeout: options.timeout });
+    // Env is delivered as `-e NAME=value` argv, and execFile's rejection message is
+    // the whole argv — so a failed exec carries every delivered credential in
+    // `err.message`, which callers persist verbatim into the node's error field, the
+    // run's chat message, and the detached-run log. Sanitize at the throw site: one
+    // wrap covers every downstream reader instead of each of them remembering to.
+    try {
+      return await execFileAsync('docker', dockerArgs, { timeout: options.timeout });
+    } catch (err) {
+      // Redact in place rather than via sanitizeError(): callers classify this
+      // rejection by reading `killed` (timeout) and `message` (ENOENT/EACCES) off
+      // the original object, and returning a fresh Error would silently drop those
+      // and turn every timeout into a generic failure.
+      const e = err as Error & { stdout?: string; stderr?: string };
+      e.message = redactSecrets(e.message);
+      if (e.stack) e.stack = redactSecrets(e.stack);
+      if (typeof e.stdout === 'string') e.stdout = redactSecrets(e.stdout);
+      if (typeof e.stderr === 'string') e.stderr = redactSecrets(e.stderr);
+      throw e;
+    }
   }
   // Host spawn: fail fast if a container-style cwd (e.g. the WSL worktree /home/…)
   // reached a host execContext — on win32 it would resolve drive-relative and
