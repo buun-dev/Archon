@@ -1,9 +1,26 @@
 import { describe, it, expect, mock, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from 'fs';
 import { symlink as fsSymlink } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import * as realPaths from '@archon/paths';
+
+// Windows only permits symlink creation for an elevated process or with Developer
+// Mode enabled, so the symlink case below is a capability question, not a platform
+// question. Probe by attempting the real operation: `process.platform === 'win32'`
+// would ALSO skip on the CI windows-latest runner, which CAN create symlinks and
+// currently covers this test — a platform guard would silently drop that coverage.
+const canSymlink = (() => {
+  const probeDir = mkdtempSync(join(tmpdir(), 'archon-symlink-probe-'));
+  try {
+    symlinkSync(join(probeDir, 'target'), join(probeDir, 'link'));
+    return true;
+  } catch {
+    return false;
+  } finally {
+    rmSync(probeDir, { recursive: true, force: true });
+  }
+})();
 
 // Mock only the logger so test output stays clean. All other @archon/paths
 // exports (findMarkdownFilesRecursive, getHomeCommandsPath, etc.) use real
@@ -68,7 +85,7 @@ describe('loadCommandPrompt — home-scope resolution', () => {
     if (result.success) expect(result.content).toBe('Personal helper body');
   });
 
-  it('resolves a symlinked home command and reads target content', async () => {
+  it.skipIf(!canSymlink)('resolves a symlinked home command and reads target content', async () => {
     const sourceDir = mkdtempSync(join(tmpdir(), 'archon-command-source-'));
     try {
       writeFileSync(join(sourceDir, 'linked.md'), 'Linked body');

@@ -5,9 +5,27 @@
  * with BUNDLED_IS_BINARY=true, which conflicts with other test files.
  */
 import { describe, test, expect, mock, beforeEach, afterAll, spyOn } from 'bun:test';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { mkdtempSync, rmSync, symlinkSync } from 'node:fs';
 import { createMockLogger } from '../test/mocks/logger';
+
+// Windows only permits symlink creation for an elevated process or with Developer
+// Mode enabled, so the broken-symlink case below is a capability question, not a
+// platform question. Probe by attempting the real operation: a
+// `process.platform === 'win32'` guard would ALSO skip on the CI windows-latest
+// runner, which CAN create symlinks and currently covers this test.
+const canSymlink = (() => {
+  const probeDir = mkdtempSync(join(tmpdir(), 'archon-symlink-probe-'));
+  try {
+    symlinkSync(join(probeDir, 'target'), join(probeDir, 'link'));
+    return true;
+  } catch {
+    return false;
+  } finally {
+    rmSync(probeDir, { recursive: true, force: true });
+  }
+})();
 
 const mockLogger = createMockLogger();
 
@@ -245,12 +263,10 @@ describe('pathKind', () => {
     expect(resolver.pathKind('/definitely/does/not/exist/anywhere/12345')).toBe('missing');
   });
 
-  test('returns "missing" for a broken symlink without throwing', async () => {
+  test.skipIf(!canSymlink)('returns "missing" for a broken symlink without throwing', () => {
     // statSync follows symlinks by default — broken targets raise ENOENT,
     // which must be caught and reported as 'missing' so the resolver's
     // "file does not exist" path fires instead of an uncaught exception.
-    const { mkdtempSync, symlinkSync, rmSync } = await import('node:fs');
-    const { tmpdir } = await import('node:os');
     const dir = mkdtempSync(join(tmpdir(), 'archon-pathkind-'));
     const link = join(dir, 'broken-link');
     try {
