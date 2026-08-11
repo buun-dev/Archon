@@ -1,4 +1,4 @@
-import { dirname } from 'path';
+import { dirname, join } from 'path';
 import { existsSync, mkdirSync, renameSync, rmSync } from 'fs';
 import {
   createLogger,
@@ -164,8 +164,8 @@ export async function downloadWebDist(
   rmSync(tmpDir, { recursive: true, force: true });
   mkdirSync(tmpDir, { recursive: true });
 
-  // Extract tarball using tar (available on macOS/Linux)
-  const proc = Bun.spawn(['tar', 'xzf', '-', '-C', tmpDir, '--strip-components=1'], {
+  // Extract tarball using tar (see resolveTarBin for why Windows pins the binary)
+  const proc = Bun.spawn([resolveTarBin(), 'xzf', '-', '-C', tmpDir, '--strip-components=1'], {
     stdin: new Uint8Array(tarballBuffer),
     stderr: 'pipe',
   });
@@ -199,6 +199,23 @@ export async function downloadWebDist(
 function cleanupAndThrow(tmpDir: string, message: string): never {
   rmSync(tmpDir, { recursive: true, force: true });
   throw new Error(message);
+}
+
+/**
+ * Resolve the `tar` binary. On Windows this must be pinned rather than left to
+ * PATH: Windows ships bsdtar at System32\tar.exe, which accepts a drive-letter
+ * path, but Git for Windows puts GNU tar on PATH at Git\usr\bin, and GNU tar
+ * cannot open one — it mangles `-C C:\Users\…` into `C\:\\Users\\…` and exits 2.
+ * Which one wins therefore depends on the PATH of whichever shell launched
+ * Archon, so `archon serve` extracted fine from cmd and failed from Git Bash.
+ * Non-Windows keeps the bare name (the POSIX `tar` is the right one).
+ */
+function resolveTarBin(): string {
+  if (process.platform !== 'win32') return 'tar';
+  const systemTar = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'tar.exe');
+  // Pre-1803 Windows has no bundled tar; fall back to PATH rather than failing
+  // on a path we know does not exist.
+  return existsSync(systemTar) ? systemTar : 'tar';
 }
 
 /**
