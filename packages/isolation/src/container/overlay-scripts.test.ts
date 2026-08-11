@@ -34,13 +34,22 @@ import { buildApplyScript, buildSummaryScript } from './overlay';
 // non-symlink case still runs on Windows.
 const isWin = process.platform === 'win32';
 // FIFO creation needs `mkfifo` (POSIX) — detected once so a missing tool is an
-// explicit skip, never a silent pass (R2-F6).
+// explicit skip, never a silent pass (R2-F6). Probe by RUNNING the tool exactly
+// the way the test below does: `sh -c 'command -v mkfifo'` answers a DIFFERENT
+// question on Windows, where `sh` resolves out of Git\bin but `mkfifo` ships only
+// in Git\usr\bin — which is not on the machine PATH. The shell lookup then says
+// yes and the shell-less execFileSync says "Executable not found in $PATH",
+// failing the very case the guard exists to skip. (`mkfifo --version` would be a
+// GNU-only probe and would wrongly skip on BSD/macOS, so create a real fifo.)
 const hasMkfifo = (() => {
+  const probeDir = mkdtempSync(join(tmpdir(), 'archon-mkfifo-probe-'));
   try {
-    execFileSync('sh', ['-c', 'command -v mkfifo'], { stdio: 'ignore' });
+    execFileSync('mkfifo', [join(probeDir, 'pipe')], { stdio: 'ignore' });
     return true;
   } catch {
     return false;
+  } finally {
+    rmSync(probeDir, { recursive: true, force: true });
   }
 })();
 
