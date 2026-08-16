@@ -3726,7 +3726,11 @@ async function executeLoopGroupNode(
         );
         await runSubprocess(execContext, groupBashPath, ['-c', substitutedBash], {
           cwd,
-          timeout: SUBPROCESS_DEFAULT_TIMEOUT,
+          // Honor the node's own timeout, exactly as the ordinary bash/script paths do
+          // (see the `node.timeout ?? SUBPROCESS_DEFAULT_TIMEOUT` resolution above). A loop
+          // predicate that runs a real gate could not previously declare a budget, so it was
+          // SIGTERMed at 120s with `code: null` — reported as "failed before execution".
+          timeout: node.timeout ?? SUBPROCESS_DEFAULT_TIMEOUT,
           // Archon-managed env only (no process.env spread) — runSubprocess
           // layers the host env for host runs, or delivers ONLY this bag into
           // the container. Configured project env spreads FIRST so the reserved
@@ -4927,7 +4931,11 @@ async function executeLoopNode(
         );
         await runSubprocess(execContext, loopBashPath, ['-c', substitutedBash], {
           cwd,
-          timeout: SUBPROCESS_DEFAULT_TIMEOUT,
+          // Honor the node's own timeout, exactly as the ordinary bash/script paths do
+          // (see the `node.timeout ?? SUBPROCESS_DEFAULT_TIMEOUT` resolution above). A loop
+          // predicate that runs a real gate could not previously declare a budget, so it was
+          // SIGTERMed at 120s with `code: null` — reported as "failed before execution".
+          timeout: node.timeout ?? SUBPROCESS_DEFAULT_TIMEOUT,
           // Archon-managed env only (no process.env spread) — runSubprocess
           // layers the host env for host runs, or delivers ONLY this bag into
           // the container. Configured project env (managed per-project vars +
