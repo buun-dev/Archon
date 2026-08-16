@@ -331,6 +331,7 @@ export type ScriptNode = z.infer<typeof scriptNodeSchema> & {
  */
 export const loopNodeSchema = dagNodeBaseSchema.extend({
   loop: loopNodeConfigSchema,
+  timeout: z.number().optional(),
 });
 
 /** DAG node that runs an AI prompt in a loop until a completion condition is met */
@@ -377,6 +378,7 @@ export const loopGroupNodeConfigSchema: z.ZodType<LoopGroupNodeConfig> = loopCon
  */
 export const loopGroupNodeSchema = dagNodeBaseSchema.extend({
   loop_group: loopGroupNodeConfigSchema,
+  timeout: z.number().optional(),
 });
 
 /** DAG node that runs a multi-node sub-DAG in a loop until a completion condition is met */
@@ -825,6 +827,17 @@ export const dagNodeSchema = dagNodeBaseSchema
       });
     }
 
+    // Loop / loop_group node validations
+    if (hasLoop || hasLoopGroup) {
+      if (data.timeout !== undefined && (data.timeout <= 0 || !isFinite(data.timeout))) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "'timeout' must be a positive number (ms)",
+          path: ['timeout'],
+        });
+      }
+    }
+
     // idle_timeout must be finite and positive
     if (
       data.idle_timeout !== undefined &&
@@ -955,7 +968,12 @@ export const dagNodeSchema = dagNodeBaseSchema
     // fields are the ones LOOP_GROUP_NODE_AI_FIELDS declares unsupported: they ride along
     // here but the loader warns about and ignores them at runtime.
     if (data.loop_group !== undefined) {
-      return { ...base, ...aiOnly, loop_group: data.loop_group } as LoopGroupNode;
+      return {
+        ...base,
+        ...aiOnly,
+        loop_group: data.loop_group,
+        ...(data.timeout !== undefined ? { timeout: data.timeout } : {}),
+      } as LoopGroupNode;
     }
     // loop — guaranteed by superRefine to be defined at this point.
     // Unlike the rest of aiOnly (dropped for loops — model/provider inherit from
@@ -968,6 +986,7 @@ export const dagNodeSchema = dagNodeBaseSchema
       ...base,
       ...(data.pi !== undefined ? { pi: data.pi } : {}),
       loop: data.loop,
+      ...(data.timeout !== undefined ? { timeout: data.timeout } : {}),
     } as LoopNode;
   })
   .openapi('DagNode');

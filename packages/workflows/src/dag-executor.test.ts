@@ -5725,6 +5725,118 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       );
     });
 
+    it('applies the node timeout to a loop until_bash subprocess', async () => {
+      // A loop node declaring timeout: 600_000 must NOT be capped at
+      // SUBPROCESS_DEFAULT_TIMEOUT. Parsed through the real schema (not a hand-built
+      // DagNode literal) so the assertion proves the whole chain: schema -> transform
+      // -> executor, not just the executor's fallback expression.
+      const node = dagNodeSchema.parse({
+        id: 'my-loop',
+        timeout: 600_000,
+        loop: {
+          prompt: 'Do a task.',
+          until: 'NEVER_EMITTED',
+          until_bash: 'true',
+          max_iterations: 1,
+        },
+      });
+
+      // runSubprocess is local/unexported — spy on the module boundary it actually
+      // calls (@archon/git's execFileAsync), same pattern as dag-executor.test.ts's
+      // script-injection test above.
+      const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({ stdout: '', stderr: '' });
+      try {
+        mockSendQueryDag.mockImplementation(function* () {
+          yield { type: 'assistant', content: 'working on it' };
+          yield { type: 'result', sessionId: 'loop-timeout-session' };
+        });
+
+        const mockDeps = createMockDeps();
+        const platform = createMockPlatform();
+        const workflowRun = makeWorkflowRun();
+
+        await executeDagWorkflow(
+          mockDeps,
+          platform,
+          'conv-dag',
+          testDir,
+          { name: 'dag-loop-timeout', nodes: [node] },
+          workflowRun,
+          'claude',
+          undefined,
+          join(testDir, 'artifacts'),
+          join(testDir, 'logs'),
+          'main',
+          'docs/',
+          minimalConfig
+        );
+
+        const untilBashCall = execSpy.mock.calls.find(c => (c[1] as string[])[0] === '-c') as
+          | [string, string[], { timeout: number }]
+          | undefined;
+        expect(untilBashCall).toBeDefined();
+        // Assert on the options object handed to runSubprocess for the until_bash invocation.
+        const opts = untilBashCall?.[2];
+        expect(opts?.timeout).toBe(600_000);
+      } finally {
+        execSpy.mockRestore();
+      }
+    });
+
+    it('falls back to the 120s default when a loop node declares no timeout', async () => {
+      // Pins the `??` fallback the fix depends on: a loop node with NO declared timeout
+      // must still get SUBPROCESS_DEFAULT_TIMEOUT (120000), not undefined or 0. Guards
+      // against a future edit that replaces `node.timeout ?? SUBPROCESS_DEFAULT_TIMEOUT`
+      // with a bare `node.timeout`, which would silently break every undeclared-timeout
+      // loop in every workflow.
+      const node = dagNodeSchema.parse({
+        id: 'my-loop-no-timeout',
+        loop: {
+          prompt: 'Do a task.',
+          until: 'NEVER_EMITTED',
+          until_bash: 'true',
+          max_iterations: 1,
+        },
+      });
+
+      const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({ stdout: '', stderr: '' });
+      try {
+        mockSendQueryDag.mockImplementation(function* () {
+          yield { type: 'assistant', content: 'working on it' };
+          yield { type: 'result', sessionId: 'loop-default-timeout-session' };
+        });
+
+        const mockDeps = createMockDeps();
+        const platform = createMockPlatform();
+        const workflowRun = makeWorkflowRun();
+
+        await executeDagWorkflow(
+          mockDeps,
+          platform,
+          'conv-dag',
+          testDir,
+          { name: 'dag-loop-default-timeout', nodes: [node] },
+          workflowRun,
+          'claude',
+          undefined,
+          join(testDir, 'artifacts'),
+          join(testDir, 'logs'),
+          'main',
+          'docs/',
+          minimalConfig
+        );
+
+        const untilBashCall = execSpy.mock.calls.find(c => (c[1] as string[])[0] === '-c') as
+          | [string, string[], { timeout: number }]
+          | undefined;
+        expect(untilBashCall).toBeDefined();
+        const opts = untilBashCall?.[2];
+        expect(opts?.timeout).toBe(120_000);
+      } finally {
+        execSpy.mockRestore();
+      }
+    });
+
     it('completes on <promise>COMPLETE</promise> signal in first iteration', async () => {
       mockSendQueryDag.mockImplementation(function* () {
         yield { type: 'assistant', content: 'Did the task. <promise>COMPLETE</promise>' };
@@ -13839,6 +13951,60 @@ describe('executeDagWorkflow -- loop_group node', () => {
     expect(finalCount).toBe(2);
     // The group's output is the terminal body node's (bump) last-iteration stdout.
     expect(result).toContain('iter 2');
+  });
+
+  it('applies the node timeout to a loop_group until_bash subprocess', async () => {
+    // Mirrors 'applies the node timeout to a loop until_bash subprocess' above, for the
+    // loop_group predicate call site (groupBashPath). The body node is AI-only (prompt),
+    // not bash, so the ONLY execFileAsync call in this test is the until_bash invocation
+    // itself — no need to disambiguate it from a body bash node's own subprocess call.
+    const node = dagNodeSchema.parse({
+      id: 'my-group',
+      timeout: 600_000,
+      loop_group: {
+        until: 'NEVER_EMITTED',
+        until_bash: 'true',
+        max_iterations: 1,
+        nodes: [{ id: 'work', prompt: 'Do a task.', depends_on: [] }],
+      },
+    });
+
+    const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({ stdout: '', stderr: '' });
+    try {
+      mockSendQueryDag.mockImplementation(function* () {
+        yield { type: 'assistant', content: 'working on it' };
+        yield { type: 'result', sessionId: 'group-timeout-session' };
+      });
+
+      const mockDeps = createMockDeps();
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('lg-timeout');
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-lg',
+        testDir,
+        { name: 'lg-timeout', nodes: [node] },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      const untilBashCall = execSpy.mock.calls.find(c => (c[1] as string[])[0] === '-c') as
+        | [string, string[], { timeout: number }]
+        | undefined;
+      expect(untilBashCall).toBeDefined();
+      const opts = untilBashCall?.[2];
+      expect(opts?.timeout).toBe(600_000);
+    } finally {
+      execSpy.mockRestore();
+    }
   });
 
   it('INSTANCE 4: single-node body degenerates like loop: and completes in 1 iteration', async () => {
