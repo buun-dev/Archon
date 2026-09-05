@@ -1,9 +1,13 @@
 name: Marketplace Lint
 
 on:
+  workflow_dispatch:
   pull_request:
     paths:
       - 'packages/docs-web/src/data/marketplace.ts'
+
+env:
+  BUN_VERSION: '1.4.0'
 
 jobs:
   lint:
@@ -14,7 +18,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: ${{ env.BUN_VERSION }}
 
       - name: Install dependencies
         run: bun install --frozen-lockfile

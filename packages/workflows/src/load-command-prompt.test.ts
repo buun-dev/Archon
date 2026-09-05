@@ -1,5 +1,5 @@
 import { describe, it, expect, mock, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from 'fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, unlinkSync } from 'fs';
 import { symlink as fsSymlink } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -11,14 +11,21 @@ import * as realPaths from '@archon/paths';
 // would ALSO skip on the CI windows-latest runner, which CAN create symlinks and
 // currently covers this test — a platform guard would silently drop that coverage.
 const canSymlink = (() => {
-  const probeDir = mkdtempSync(join(tmpdir(), 'archon-symlink-probe-'));
+  // Cleaned up with a non-recursive unlink on a single path: a module-scope probe runs
+  // before any test, so it cannot use trackTempRoots (which registers an afterEach), and
+  // a recursive rmSync is what the cleanup-drift guard exists to refuse.
+  const link = join(tmpdir(), `archon-symlink-probe-${process.pid}-${Date.now()}`);
   try {
-    symlinkSync(join(probeDir, 'target'), join(probeDir, 'link'));
+    symlinkSync(join(tmpdir(), 'archon-symlink-probe-target'), link);
     return true;
   } catch {
     return false;
   } finally {
-    rmSync(probeDir, { recursive: true, force: true });
+    try {
+      unlinkSync(link);
+    } catch {
+      // The symlink was never created — nothing to remove.
+    }
   }
 })();
 
@@ -46,6 +53,7 @@ mock.module('@archon/paths', () => ({
 
 import { loadCommandPrompt } from './executor-shared';
 import type { WorkflowDeps } from './deps';
+import { formatPackagedResourceReference } from './packaged-workflow';
 
 // Minimal deps stub — loadCommandPrompt only calls loadConfig.
 function makeDeps(loadDefaultCommands = true): WorkflowDeps {
@@ -144,5 +152,49 @@ describe('loadCommandPrompt — home-scope resolution', () => {
 
     expect(result.success).toBe(false);
     if (!result.success) expect(result.reason).toBe('empty_file');
+  });
+
+  it('resolves repo and home packaged commands with the same local basename', async () => {
+    const repoCommandDir = join(
+      repoRoot,
+      '.archon',
+      'workflows',
+      'team-pack',
+      'release',
+      'commands'
+    );
+    const homeCommandDir = join(archonHome, 'workflows', 'personal-pack', 'daily', 'commands');
+    mkdirSync(repoCommandDir, { recursive: true });
+    mkdirSync(homeCommandDir, { recursive: true });
+    writeFileSync(join(repoCommandDir, 'shared.md'), 'REPO PACKAGED');
+    writeFileSync(join(homeCommandDir, 'shared.md'), 'HOME PACKAGED');
+
+    const repoName = formatPackagedResourceReference(
+      { source: 'project', pack: 'team-pack', workflow: 'release' },
+      'shared'
+    );
+    const homeName = formatPackagedResourceReference(
+      { source: 'global', pack: 'personal-pack', workflow: 'daily' },
+      'shared'
+    );
+    const repoResult = await loadCommandPrompt(makeDeps(false), repoRoot, repoName);
+    const homeResult = await loadCommandPrompt(makeDeps(false), repoRoot, homeName);
+
+    expect(repoResult.success && repoResult.content).toBe('REPO PACKAGED');
+    expect(homeResult.success && homeResult.content).toBe('HOME PACKAGED');
+  });
+
+  it('does not fall through when the owning packaged command is missing', async () => {
+    const otherCommandDir = join(archonHome, 'workflows', 'same-pack', 'same-workflow', 'commands');
+    mkdirSync(otherCommandDir, { recursive: true });
+    writeFileSync(join(otherCommandDir, 'shared.md'), 'WRONG SCOPE');
+    const projectName = formatPackagedResourceReference(
+      { source: 'project', pack: 'same-pack', workflow: 'same-workflow' },
+      'shared'
+    );
+
+    const result = await loadCommandPrompt(makeDeps(false), repoRoot, projectName);
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.reason).toBe('not_found');
   });
 });

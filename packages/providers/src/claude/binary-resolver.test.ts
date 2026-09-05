@@ -7,7 +7,8 @@
 import { describe, test, expect, mock, beforeEach, afterAll, spyOn } from 'bun:test';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { mkdtempSync, rmSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, symlinkSync, unlinkSync } from 'node:fs';
+import { trackTempRoots } from '@archon/paths/test-utils';
 import { createMockLogger } from '../test/mocks/logger';
 
 // Windows only permits symlink creation for an elevated process or with Developer
@@ -16,14 +17,21 @@ import { createMockLogger } from '../test/mocks/logger';
 // `process.platform === 'win32'` guard would ALSO skip on the CI windows-latest
 // runner, which CAN create symlinks and currently covers this test.
 const canSymlink = (() => {
-  const probeDir = mkdtempSync(join(tmpdir(), 'archon-symlink-probe-'));
+  // Cleaned up with a non-recursive unlink on a single path: a module-scope probe runs
+  // before any test, so it cannot use trackTempRoots (which registers an afterEach), and
+  // a recursive rmSync is what the cleanup-drift guard exists to refuse.
+  const link = join(tmpdir(), `archon-symlink-probe-${process.pid}-${Date.now()}`);
   try {
-    symlinkSync(join(probeDir, 'target'), join(probeDir, 'link'));
+    symlinkSync(join(tmpdir(), 'archon-symlink-probe-target'), link);
     return true;
   } catch {
     return false;
   } finally {
-    rmSync(probeDir, { recursive: true, force: true });
+    try {
+      unlinkSync(link);
+    } catch {
+      // The symlink was never created — nothing to remove.
+    }
   }
 })();
 
@@ -37,6 +45,15 @@ mock.module('@archon/paths', () => ({
 
 import * as resolver from './binary-resolver';
 import { CLAUDE_BINARY_NAME } from './binary-resolver';
+
+async function rejectionMessage(promise: Promise<unknown>): Promise<string> {
+  try {
+    await promise;
+  } catch (error) {
+    return (error as Error).message;
+  }
+  throw new Error('Expected promise to reject');
+}
 
 describe('resolveClaudeBinaryPath (binary mode)', () => {
   const originalEnv = process.env.CLAUDE_BIN_PATH;
@@ -70,8 +87,32 @@ describe('resolveClaudeBinaryPath (binary mode)', () => {
     process.env.CLAUDE_BIN_PATH = '/nonexistent/cli.js';
     pathKindSpy = spyOn(resolver, 'pathKind').mockReturnValue('missing');
 
-    await expect(resolver.resolveClaudeBinaryPath()).rejects.toThrow(
-      'CLAUDE_BIN_PATH is set to "/nonexistent/cli.js" but the file does not exist'
+    expect(await rejectionMessage(resolver.resolveClaudeBinaryPath())).toBe(
+      'CLAUDE_BIN_PATH is set to "/nonexistent/cli.js" but the file does not exist.\n' +
+        'Please verify the path points to the Claude Code executable (native binary\n' +
+        'from the curl/PowerShell installer, or cli.js from an npm global install).'
+    );
+  });
+
+  test('names the autodetected binary when CLAUDE_BIN_PATH is stale without using it', async () => {
+    const candidate = join(homedir(), '.local', 'bin', CLAUDE_BINARY_NAME);
+    process.env.CLAUDE_BIN_PATH = '/stale/claude';
+    pathKindSpy = spyOn(resolver, 'pathKind').mockImplementation((path: string) =>
+      path === candidate ? 'file' : 'missing'
+    );
+
+    expect(await rejectionMessage(resolver.resolveClaudeBinaryPath())).toBe(
+      'CLAUDE_BIN_PATH is set to "/stale/claude" but the file does not exist.\n' +
+        'Please verify the path points to the Claude Code executable (native binary\n' +
+        'from the curl/PowerShell installer, or cli.js from an npm global install).\n\n' +
+        'A Claude Code binary was found at ' +
+        candidate +
+        '.\n' +
+        'Update CLAUDE_BIN_PATH to that path, or remove CLAUDE_BIN_PATH to let Archon detect it.'
+    );
+    expect(mockLogger.info).not.toHaveBeenCalledWith(
+      expect.objectContaining({ binaryPath: candidate }),
+      'claude.binary_resolved'
     );
   });
 
@@ -91,8 +132,31 @@ describe('resolveClaudeBinaryPath (binary mode)', () => {
   test('throws when config claudeBinaryPath file does not exist', async () => {
     pathKindSpy = spyOn(resolver, 'pathKind').mockReturnValue('missing');
 
-    await expect(resolver.resolveClaudeBinaryPath('/nonexistent/cli.js')).rejects.toThrow(
-      'assistants.claude.claudeBinaryPath is set to "/nonexistent/cli.js" but the file does not exist'
+    expect(await rejectionMessage(resolver.resolveClaudeBinaryPath('/nonexistent/cli.js'))).toBe(
+      'assistants.claude.claudeBinaryPath is set to "/nonexistent/cli.js" but the file does not exist.\n' +
+        'Please verify the path points to the Claude Code executable (native binary\n' +
+        'from the curl/PowerShell installer, or cli.js from an npm global install).'
+    );
+  });
+
+  test('names the autodetected binary when claudeBinaryPath is stale without using it', async () => {
+    const candidate = join(homedir(), '.local', 'bin', CLAUDE_BINARY_NAME);
+    pathKindSpy = spyOn(resolver, 'pathKind').mockImplementation((path: string) =>
+      path === candidate ? 'file' : 'missing'
+    );
+
+    expect(await rejectionMessage(resolver.resolveClaudeBinaryPath('/stale/config/claude'))).toBe(
+      'assistants.claude.claudeBinaryPath is set to "/stale/config/claude" but the file does not exist.\n' +
+        'Please verify the path points to the Claude Code executable (native binary\n' +
+        'from the curl/PowerShell installer, or cli.js from an npm global install).\n\n' +
+        'A Claude Code binary was found at ' +
+        candidate +
+        '.\n' +
+        'Update assistants.claude.claudeBinaryPath to that path, or remove claudeBinaryPath to let Archon detect it.'
+    );
+    expect(mockLogger.info).not.toHaveBeenCalledWith(
+      expect.objectContaining({ binaryPath: candidate }),
+      'claude.binary_resolved'
     );
   });
 
@@ -221,6 +285,30 @@ describe('resolveClaudeBinaryPath (binary mode)', () => {
     await expect(promise).rejects.toThrow(`does not contain ${CLAUDE_BINARY_NAME}`);
   });
 
+  test('adds the autodetected binary to a configured-directory error without using it', async () => {
+    const dir = '/some/empty/dir';
+    const candidate = join(homedir(), '.local', 'bin', CLAUDE_BINARY_NAME);
+    pathKindSpy = spyOn(resolver, 'pathKind').mockImplementation((path: string) => {
+      if (path === dir) return 'directory';
+      if (path === candidate) return 'file';
+      return 'missing';
+    });
+
+    expect(await rejectionMessage(resolver.resolveClaudeBinaryPath(dir))).toBe(
+      `assistants.claude.claudeBinaryPath is set to "${dir}", which is a directory, but it does not contain ${CLAUDE_BINARY_NAME}.\n` +
+        'Please point this setting at the Claude Code executable itself (native binary\n' +
+        'from the curl/PowerShell installer, or cli.js from an npm global install).\n\n' +
+        'A Claude Code binary was found at ' +
+        candidate +
+        '.\n' +
+        'Update assistants.claude.claudeBinaryPath to that path, or remove claudeBinaryPath to let Archon detect it.'
+    );
+    expect(mockLogger.info).not.toHaveBeenCalledWith(
+      expect.objectContaining({ binaryPath: candidate }),
+      'claude.binary_resolved'
+    );
+  });
+
   test('throws a directory-specific error when CLAUDE_BIN_PATH is a directory missing the expected executable', async () => {
     const dir = '/some/empty/dir';
     process.env.CLAUDE_BIN_PATH = dir;
@@ -235,6 +323,8 @@ describe('resolveClaudeBinaryPath (binary mode)', () => {
 });
 
 describe('pathKind', () => {
+  const trackTempRoot = trackTempRoots();
+
   test('returns "file" for a real file', async () => {
     const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
     const { tmpdir } = await import('node:os');
@@ -267,13 +357,9 @@ describe('pathKind', () => {
     // statSync follows symlinks by default — broken targets raise ENOENT,
     // which must be caught and reported as 'missing' so the resolver's
     // "file does not exist" path fires instead of an uncaught exception.
-    const dir = mkdtempSync(join(tmpdir(), 'archon-pathkind-'));
+    const dir = trackTempRoot(mkdtempSync(join(tmpdir(), 'archon-pathkind-')));
     const link = join(dir, 'broken-link');
-    try {
-      symlinkSync(join(dir, 'nonexistent-target'), link);
-      expect(resolver.pathKind(link)).toBe('missing');
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+    symlinkSync(join(dir, 'nonexistent-target'), link);
+    expect(resolver.pathKind(link)).toBe('missing');
   });
 });

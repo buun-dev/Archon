@@ -328,9 +328,16 @@ export class ContainerProvider implements IIsolationProvider {
           'the base branch. Use worktree isolation for PR workflows.'
       );
     }
-    if (request.workflowType === 'task' && request.fromBranch) {
+    // `--from` now rides on the task's branch selection (upstream's TaskBranchSelection),
+    // so the same refusal reads it there. `kind: 'existing'` is a different request —
+    // continuing a branch, not cutting from a start point — and is not refused here.
+    const taskFromBranch =
+      request.workflowType === 'task' && request.taskBranch?.kind === 'new'
+        ? request.taskBranch.fromBranch
+        : undefined;
+    if (taskFromBranch) {
       throw new Error(
-        `Container isolation cannot cut from an explicit start point (--from ${request.fromBranch}): ` +
+        `Container isolation cannot cut from an explicit start point (--from ${taskFromBranch}): ` +
           'sandbox.sh up cuts only from the base branch.'
       );
     }

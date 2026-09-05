@@ -1,6 +1,7 @@
 import { describe, test, expect } from 'bun:test';
 import { ContainerProvider } from './container';
 import type { IsolationRequest } from '../types';
+import { toBranchName } from '@archon/git';
 
 /**
  * Fake runners so create() is unit-testable without a real WSL distro / docker
@@ -50,10 +51,10 @@ describe('ContainerProvider.create', () => {
     expect(env.execContext.workdir).toBe('/work');
     expect(env.execContext.pathMap?.some(m => m.containerPrefix === '/work')).toBe(true);
     expect(env.execContext.pathMap?.some(m => m.containerPrefix === '/archon-meta')).toBe(true);
-    expect(env.branchName).toBe('sandbox/task-my-task');
+    expect(env.branchName).toBe(toBranchName('sandbox/task-my-task'));
     expect(env.project).toBe('archon-marphob-page-task-my-task');
     // Resolved base snapshotted for a fixed-base resume (PR#1).
-    expect(env.baseBranch).toBe('main');
+    expect(env.baseBranch).toBe(toBranchName('main'));
   });
 
   test('resolves the container id via `docker compose -p <project> ps -q agent`', async () => {
@@ -122,7 +123,7 @@ describe('ContainerProvider.create', () => {
         ...BASE_REQ,
         workflowType: 'task',
         identifier: 't',
-        fromBranch: 'feature-x',
+        taskBranch: { kind: 'new', fromBranch: toBranchName('feature-x') },
       } as IsolationRequest)
     ).rejects.toThrow(/from|start.point/i);
   });
@@ -195,7 +196,7 @@ describe('ContainerProvider.reattach (resume / D8 recovery)', () => {
     expect(env.execContext.workdir).toBe('/work');
     expect(env.execContext.pathMap?.some(m => m.containerPrefix === '/archon-meta')).toBe(true);
     expect(env.project).toBe('archon-marphob-page-task-x');
-    expect(env.branchName).toBe('sandbox/task-x');
+    expect(env.branchName).toBe(toBranchName('sandbox/task-x'));
     // reattach must NOT re-run the sandbox `up` (no re-provision on resume).
     expect(calls.sandbox.find(a => a[0] === 'up')).toBeUndefined();
   });
