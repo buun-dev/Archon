@@ -10,21 +10,22 @@
  * the distro FS) is invoked through `wsl.exe`.
  *
  * create() resolves the compose `agent` service to a concrete container id and
- * returns a container `ExecutionContext` (containerId + workdir `/work` + a
- * host↔container pathMap), so upstream's `runSubprocess`/`buildContainerSpawn`
- * drive node execution unchanged. We deliberately do NOT adopt the folder
+ * returns a container `ExecutionContext` (containerId + execUser) — the worktree
+ * and the run meta dir are bind-mounted at their host paths, so there is no
+ * second name to carry. Matches upstream's `ExecutionContext` shape exactly, so
+ * its `runSubprocess`/`buildContainerSpawn` drive node execution unchanged. We
+ * deliberately do NOT adopt the folder
  * `ContainerBackend`/overlay/write-back — this is an execution substrate for a
  * git worktree, not a folder review-buffer.
  *
  * Addressing (from `compose.yml.tmpl`): compose project `archon-<repo>-<slug>`,
- * service `agent`, in-container workdir `/work` (the bind-mounted worktree).
+ * service `agent`, in-container workdir set per run to the worktree's host path
+ * (compose's `working_dir`, bind-mounted at that same path on both sides).
  */
 
 import { createHash } from 'crypto';
-import { join } from 'path';
 
 import { execFileAsync, toBranchName, getDefaultBranch, toRepoPath } from '@archon/git';
-import { getArchonWorkspacesPath } from '@archon/paths';
 import type {
   ExecutionContext,
   WriteBackApplySummary,
@@ -48,16 +49,10 @@ import { isPRIsolationRequest } from '../types';
  * self-locates via `${BASH_SOURCE[0]}`, so a copy breaks its `SANDBOX_DIR`.
  */
 const SANDBOX_SH = '/mnt/c/Users/Buun/.archon/sandbox/sandbox.sh';
-/** In-container workdir (the bind-mounted worktree). Exported: the CLI re-threads it on resume. */
-export const CONTAINER_WORKDIR = '/work';
-/** In-container mount of the run meta dir (artifacts + logs). See compose.yml.tmpl. */
-export const CONTAINER_META_DIR = '/archon-meta';
 /** Base dir under which sandbox.sh places each repo's worktrees, one subdir per repo. */
 const WORKTREE_ROOT_BASE = '/home/bunny/archon/worktrees';
 /** Container runs as uid 1000 (compose `user: "1000:1000"`); `docker exec` must match. */
 const CONTAINER_EXEC_USER = '1000';
-/** sandbox.sh hardcodes the host meta dir under this owner (`_meta_dir`). */
-const META_OWNER = 'buun-dev';
 
 /** `sandbox.sh up` provisions (uv sync + install + alembic + playwright); be generous. */
 const SANDBOX_UP_TIMEOUT_MS = 20 * 60 * 1000;
@@ -152,8 +147,6 @@ export interface ContainerProviderDeps {
   runSandbox?: SandboxRunner;
   /** Docker CLI runner (tests inject a fake; prod runs the Windows `docker` CLI). */
   docker?: DockerRunner;
-  /** Host workspaces base for the meta-dir pathMap entry. Defaults to getArchonWorkspacesPath(). */
-  workspacesPath?: string;
 }
 
 export class ContainerProvider implements IIsolationProvider {
@@ -162,14 +155,12 @@ export class ContainerProvider implements IIsolationProvider {
   private readonly loadConfig: RepoConfigLoader;
   private readonly runSandbox: SandboxRunner;
   private readonly docker: DockerRunner;
-  private readonly workspacesPath: string;
 
   constructor(deps: ContainerProviderDeps = {}) {
     this.loadConfig =
       deps.loadConfig ?? ((): Promise<WorktreeCreateConfig | null> => Promise.resolve(null));
     this.runSandbox = deps.runSandbox ?? defaultRunSandbox;
     this.docker = deps.docker ?? defaultDocker;
-    this.workspacesPath = deps.workspacesPath ?? getArchonWorkspacesPath();
   }
 
   async create(request: IsolationRequest): Promise<IsolatedEnvironment> {
@@ -194,7 +185,7 @@ export class ContainerProvider implements IIsolationProvider {
     );
 
     const containerId = await this.resolveContainerId(project);
-    return this.buildEnv(repo, slug, workingPath, project, containerId, request, baseBranch);
+    return this.buildEnv(slug, workingPath, project, containerId, request, baseBranch);
   }
 
   /**
@@ -208,7 +199,7 @@ export class ContainerProvider implements IIsolationProvider {
     const { repo, slug } = repoSlugFromWorkingPath(envId);
     const project = composeProjectFor(repo, slug);
     const containerId = await this.resolveContainerId(project);
-    return this.buildEnv(repo, slug, envId, project, containerId);
+    return this.buildEnv(slug, envId, project, containerId);
   }
 
   /**
@@ -278,7 +269,7 @@ export class ContainerProvider implements IIsolationProvider {
     const project = composeProjectFor(repo, slug);
     if (!(await this.composeAgentRunning(project))) return null;
     const containerId = await this.resolveContainerId(project);
-    return this.buildEnv(repo, slug, envId, project, containerId);
+    return this.buildEnv(slug, envId, project, containerId);
   }
 
   async list(codebaseId: string): Promise<IsolatedEnvironment[]> {
@@ -308,9 +299,7 @@ export class ContainerProvider implements IIsolationProvider {
       const slug = name.slice(prefix.length);
       const containerId = await this.resolveContainerId(name).catch(() => '');
       if (!containerId) continue;
-      envs.push(
-        this.buildEnv(repo, slug, `${WORKTREE_ROOT_BASE}/${repo}/${slug}`, name, containerId)
-      );
+      envs.push(this.buildEnv(slug, `${WORKTREE_ROOT_BASE}/${repo}/${slug}`, name, containerId));
     }
     return envs;
   }
@@ -396,14 +385,8 @@ export class ContainerProvider implements IIsolationProvider {
     }
   }
 
-  /** Host meta dir for the pathMap — mirrors sandbox.sh's `_meta_dir` (fixed owner). */
-  private hostMetaDir(repo: string): string {
-    return join(this.workspacesPath, META_OWNER, repo);
-  }
-
-  /** Assemble the ContainerEnvironment for a repo/slug/workingPath/containerId. */
+  /** Assemble the ContainerEnvironment for a slug/workingPath/containerId. */
   private buildEnv(
-    repo: string,
     slug: string,
     workingPath: string,
     project: string,
@@ -411,17 +394,13 @@ export class ContainerProvider implements IIsolationProvider {
     request?: IsolationRequest,
     baseBranch?: string
   ): ContainerEnvironment {
+    // The worktree and the run meta dir are bind-mounted at their host paths, so a
+    // path means one thing on either side of the boundary and there is nothing to
+    // remap. Matches upstream's container context exactly.
     const execContext: Extract<ExecutionContext, { kind: 'container' }> = {
       kind: 'container',
       containerId,
       execUser: CONTAINER_EXEC_USER,
-      workdir: CONTAINER_WORKDIR,
-      // Two mounts diverge from the host cwd: the worktree (/work) and the run
-      // meta dir (/archon-meta). Remapping both makes every forwarded path resolve.
-      pathMap: [
-        { hostPrefix: workingPath, containerPrefix: CONTAINER_WORKDIR },
-        { hostPrefix: this.hostMetaDir(repo), containerPrefix: CONTAINER_META_DIR },
-      ],
     };
     return {
       id: workingPath,

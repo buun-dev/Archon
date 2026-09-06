@@ -81,8 +81,6 @@ export {
   ContainerProvider,
   composeProjectFor,
   composeProjectFromWorkingPath,
-  CONTAINER_WORKDIR,
-  CONTAINER_META_DIR,
 } from './providers/container';
 export type { ContainerProviderDeps } from './providers/container';
 

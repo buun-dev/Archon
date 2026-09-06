@@ -30,7 +30,7 @@ const BASE_REQ = {
 } as const;
 
 describe('ContainerProvider.create', () => {
-  test('brings up the WSL sandbox and returns a container execContext at /work', async () => {
+  test('brings up the WSL sandbox and returns a container execContext', async () => {
     const { calls, runSandbox, docker } = makeRunners();
     const provider = new ContainerProvider({ runSandbox, docker, loadConfig: async () => null });
 
@@ -48,9 +48,6 @@ describe('ContainerProvider.create', () => {
     if (env.provider !== 'container') throw new Error('expected a container environment');
     expect(env.execContext.kind).toBe('container');
     expect(env.execContext.containerId).toBe('container-abc');
-    expect(env.execContext.workdir).toBe('/work');
-    expect(env.execContext.pathMap?.some(m => m.containerPrefix === '/work')).toBe(true);
-    expect(env.execContext.pathMap?.some(m => m.containerPrefix === '/archon-meta')).toBe(true);
     expect(env.branchName).toBe(toBranchName('sandbox/task-my-task'));
     expect(env.project).toBe('archon-marphob-page-task-my-task');
     // Resolved base snapshotted for a fixed-base resume (PR#1).
@@ -193,11 +190,30 @@ describe('ContainerProvider.reattach (resume / D8 recovery)', () => {
     expect(env.provider).toBe('container');
     if (env.provider !== 'container') throw new Error('expected a container environment');
     expect(env.execContext.containerId).toBe('cid-resumed');
-    expect(env.execContext.workdir).toBe('/work');
-    expect(env.execContext.pathMap?.some(m => m.containerPrefix === '/archon-meta')).toBe(true);
     expect(env.project).toBe('archon-marphob-page-task-x');
     expect(env.branchName).toBe(toBranchName('sandbox/task-x'));
     // reattach must NOT re-run the sandbox `up` (no re-provision on resume).
     expect(calls.sandbox.find(a => a[0] === 'up')).toBeUndefined();
+  });
+});
+
+describe('ContainerProvider — execution context shape', () => {
+  // Same-path mounting removes the reason workdir and pathMap existed. Upstream's
+  // container context has neither, and this asserts the fork's matches: the whole
+  // point of the change is that the two stop diverging.
+  test('carries no workdir and no pathMap', async () => {
+    const { runSandbox, docker } = makeRunners();
+    const provider = new ContainerProvider({ runSandbox, docker, loadConfig: async () => null });
+
+    const env = await provider.create({
+      ...BASE_REQ,
+      workflowType: 'task',
+      identifier: 'shape-check',
+    } as IsolationRequest);
+
+    expect(env.provider).toBe('container');
+    if (env.provider !== 'container') throw new Error('expected a container environment');
+    expect(env.execContext.kind).toBe('container');
+    expect(Object.keys(env.execContext).sort()).toEqual(['containerId', 'execUser', 'kind']);
   });
 });

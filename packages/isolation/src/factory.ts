@@ -43,7 +43,7 @@ export function resetIsolationProvider(): void {
  * `isolation.provider` config.
  *
  * `'container'` builds a FRESH ContainerProvider per dispatch — it carries a
- * run-specific containerId + pathMap, so it must not be the reusable singleton.
+ * run-specific containerId, so it must not be the reusable singleton.
  * Anything else (undefined / `'worktree'`) returns the shared WorktreeProvider
  * from {@link getIsolationProvider} (host execution, byte-identical to today).
  */
