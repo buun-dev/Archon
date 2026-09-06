@@ -2684,13 +2684,17 @@ async function runWorkflowWithOwnedSource(
           // user: a bind target Docker has to create itself would be owned by root.
           let mounts: { sourceMount: string; artifactsMount: string } | undefined;
           if (preparedSource) {
-            const { artifactsDir } = await resolveProjectPaths(
+            const { artifactsDir, hostPaths } = await resolveProjectPaths(
               createWorkflowDeps(),
               folderCodebase.defaultCwd,
               preparedSource.runId,
               folderCodebase.id
             );
-            await mkdir(artifactsDir, { recursive: true });
+            // The engine creates the bind target itself, so it opens the host-visible
+            // form. This call passes no `nodeVisibility`, so `hostPaths` is undefined
+            // and the fallback returns the same string; written this way so it stays
+            // correct if that changes.
+            await mkdir(hostPaths?.artifactsDir ?? artifactsDir, { recursive: true });
             // Read-only source and read-write artifacts, both at the same absolute path
             // inside the container, so a path means one thing on either side of the
             // boundary.
@@ -4200,8 +4204,11 @@ async function buildLeaveBehind(run: WorkflowRun): Promise<LeaveBehind> {
   const artifactsRoot = archonPaths.resolveRunStorageRoot(run, codebase);
   if (artifactsRoot) {
     try {
-      const artifactsDir = archonPaths.getRunArtifactsDirForRoot(artifactsRoot, run.id);
-      leaveBehind.artifactFiles = listArtifactFiles(artifactsDir);
+      // Host-visible by construction: derived from the persisted `output_root`, which
+      // stays host-visible even on a run whose nodes saw `/mnt/c` names. The CLI walks
+      // it on the host, so that is the form it needs.
+      const hostArtifactsDir = archonPaths.getRunArtifactsDirForRoot(artifactsRoot, run.id);
+      leaveBehind.artifactFiles = listArtifactFiles(hostArtifactsDir);
     } catch (error) {
       getLog().debug({ err: error as Error }, 'cli.workflow_get_artifact_walk_failed');
     }

@@ -101,7 +101,7 @@ async function readArtifactOwner(metaPath: string): Promise<ArtifactOwner | unde
  * try/catch so an artifact write never fails an otherwise-successful node.
  */
 export async function writeNodeArtifact(
-  artifactsDir: string,
+  hostArtifactsDir: string,
   params: Omit<NodeArtifact, 'path' | 'size'>,
   outputText: string
 ): Promise<NodeArtifact> {
@@ -109,7 +109,7 @@ export async function writeNodeArtifact(
   // represented in the inferred TypeScript primitives, so enforce them at the
   // durable constructor before creating either sidecar.
   const parsedParams = nodeArtifactWriteParamsSchema.parse(params);
-  const nodesDir = join(artifactsDir, NODES_SUBDIR);
+  const nodesDir = join(hostArtifactsDir, NODES_SUBDIR);
   await mkdir(nodesDir, { recursive: true });
   const owner: ArtifactOwner = {
     nodeId: parsedParams.nodeId,
@@ -132,7 +132,7 @@ export async function writeNodeArtifact(
   }
 
   const relPath = join(NODES_SUBDIR, `${stem}.md`);
-  await writeFile(join(artifactsDir, relPath), outputText, 'utf8');
+  await writeFile(join(hostArtifactsDir, relPath), outputText, 'utf8');
   const meta: NodeArtifact = {
     nodeId: parsedParams.nodeId,
     outputType: parsedParams.outputType,

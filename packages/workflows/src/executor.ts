@@ -275,9 +275,9 @@ async function resolveUserGithubEnvForWorkflow(
  * A resume must not keep a readable credential after it has been disconnected
  * or after fresh credential resolution fails.
  */
-async function clearManagedProviderCredentialFiles(artifactsDir: string): Promise<void> {
+async function clearManagedProviderCredentialFiles(hostArtifactsDir: string): Promise<void> {
   for (const relativePath of MANAGED_PROVIDER_CREDENTIAL_RELATIVE_PATHS) {
-    await rm(join(artifactsDir, relativePath), { force: true });
+    await rm(join(hostArtifactsDir, relativePath), { force: true });
   }
 }
 
@@ -2455,10 +2455,15 @@ export async function executeWorkflow(
     artifactsRoot,
     stateDir,
     outputRoot,
+    hostPaths,
     identityResolution,
   } = await resolveProjectPaths(deps, cwd, workflowRun.id, codebaseId, {
     persistedOutputRoot: workflowRun.output_root,
   });
+  // The engine opens these itself; nodes get the node-visible fields above.
+  // `hostPaths` is undefined on a host run, so these are the same strings.
+  const hostArtifactsDir = hostPaths?.artifactsDir ?? artifactsDir;
+  const hostStateDir = hostPaths?.stateDir ?? stateDir;
 
   // Record the resolved root ONCE, so every later reader (artifact routes, CLI)
   // addresses this run's output by a durable pointer instead of re-deriving it
@@ -2570,19 +2575,26 @@ export async function executeWorkflow(
   // too so `$STATE_DIR` is usable from the first node without an mkdir, and an
   // unwritable state dir fails the run rather than silently degrading.
   try {
-    await mkdir(artifactsDir, { recursive: true });
-    await mkdir(stateDir, { recursive: true });
+    await mkdir(hostArtifactsDir, { recursive: true });
+    await mkdir(hostStateDir, { recursive: true });
     if (scopeArtifactsDir) await mkdir(scopeArtifactsDir, { recursive: true });
   } catch (error) {
     const err = error as NodeJS.ErrnoException;
+    // Report the paths the engine actually tried to create, not their node-visible
+    // names — otherwise a container run blames a path no mkdir was issued against.
     getLog().error(
-      { err, artifactsDir, stateDir, workflowRunId: workflowRun.id },
+      {
+        err,
+        artifactsDir: hostArtifactsDir,
+        stateDir: hostStateDir,
+        workflowRunId: workflowRun.id,
+      },
       'workflow.artifacts_dir_create_failed'
     );
     await sendCriticalMessage(
       platform,
       conversationId,
-      `❌ **Workflow failed**: Could not create artifacts directory \`${artifactsDir}\`: ${err.message}`
+      `❌ **Workflow failed**: Could not create artifacts directory \`${hostArtifactsDir}\`: ${err.message}`
     );
     await requireTerminalStatusWrite(
       deps.store.failWorkflowRun(
@@ -2841,7 +2853,7 @@ export async function executeWorkflow(
   // keeps the no-key path byte-for-byte unchanged (resolveUserProviderEnvForWorkflow
   // returns empty bags when the feature is disabled or no userId is present).
   try {
-    await clearManagedProviderCredentialFiles(artifactsDir);
+    await clearManagedProviderCredentialFiles(hostArtifactsDir);
   } catch (error) {
     const err = error as Error;
     const message = `Could not safely prepare provider credentials: ${err.message}`;
@@ -3157,6 +3169,7 @@ export async function executeWorkflow(
         workflowProvider: resolvedProvider,
         workflowModel: resolvedModel,
         artifactsDir,
+        ...(hostPaths ? { hostArtifactsDir: hostPaths.artifactsDir } : {}),
         stateDir,
         logDir,
         baseBranch,

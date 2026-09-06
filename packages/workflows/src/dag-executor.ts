@@ -7,7 +7,14 @@
  */
 import { existsSync, mkdirSync, writeFileSync } from 'fs';
 import { readFile } from 'fs/promises';
-import { basename, isAbsolute, join as joinPath, resolve as resolvePath, sep } from 'path';
+import {
+  basename,
+  isAbsolute,
+  join as joinPath,
+  posix as posixPath,
+  resolve as resolvePath,
+  sep,
+} from 'path';
 import { execFileAsync, resolveBashPath } from '@archon/git';
 import { isEffortRung } from '@archon/paths/effort';
 import { discoverScriptsForCwd } from './script-discovery';
@@ -1357,6 +1364,14 @@ function shellQuote(value: string): string {
 }
 
 /**
+ * Path segments, under a run's artifacts dir, of the engine-owned node-output spill
+ * child. Shared because `shellQuoteOrFile` builds the same location twice — once to
+ * write through the host name, once to emit through the node name — and a file
+ * written at one spelling but referenced at another is a silently broken `$(cat …)`.
+ */
+const SPILL_SEGMENTS = ['.archon', 'node-output-spills'] as const;
+
+/**
  * Write `value` to `<dir>/<filename>`, creating `dir` as needed. Returns the full
  * path on success, or `undefined` after logging on any failure (permission, disk
  * space, etc.) — callers own their own fallback; this never throws.
@@ -1381,18 +1396,33 @@ function writeSpillFile(dir: string, filename: string, value: string): string | 
  * Shell-quote a value for bash, or write it under the run artifact directory's
  * engine-owned spill child and return a $(cat ...) reference when the value exceeds
  * the inline size threshold.
+ *
+ * One file, two audiences. The ENGINE writes the spill, so the directory it creates
+ * must be host-visible; the `$(cat ...)` reference is read by a NODE, so the path in
+ * the emitted bash must be node-visible — a node cannot open `C:\...`. They are the
+ * same string on a host run (`hostArtifactsDir` undefined), where the emitted text is
+ * therefore unchanged.
  */
 function shellQuoteOrFile(
   value: string,
   nodeId: string,
   field: string | undefined,
-  artifactsDir: string | undefined
+  artifactsDir: string | undefined,
+  hostArtifactsDir?: string
 ): string {
   if (artifactsDir && value.length > NODE_OUTPUT_FILE_THRESHOLD) {
-    const spillDir = joinPath(artifactsDir, '.archon', 'node-output-spills');
+    const spillDir = joinPath(hostArtifactsDir ?? artifactsDir, ...SPILL_SEGMENTS);
     const filename = field ? `${nodeId}.${field}.nodeoutput` : `${nodeId}.nodeoutput`;
     const filePath = writeSpillFile(spillDir, filename, value);
-    if (filePath) return `$(cat ${shellQuote(filePath)})`;
+    if (filePath) {
+      // A node-visible artifactsDir is a POSIX path, so join it as one: `joinPath` would
+      // hand a Linux node backslashes. No translation happens here — `toNodeVisiblePath`
+      // still runs exactly once per run, in `composeRunPaths`.
+      const nodePath = hostArtifactsDir
+        ? posixPath.join(artifactsDir, ...SPILL_SEGMENTS, filename)
+        : filePath;
+      return `$(cat ${shellQuote(nodePath)})`;
+    }
     return shellQuote(value); // fallback: inline (pre-file-spill behavior)
   }
   return shellQuote(value);
@@ -1426,13 +1456,16 @@ function requiredOutputRefError(
  * @param requiredContext - Makes unavailable whole-output refs fail with the owning
  *   decision surface named. Used by `until_bash`; other callers keep the legacy empty
  *   fallback. Field refs remain strict in either mode.
+ * @param hostArtifactsDir - Host-visible form of `artifactsDir`, for the spill file the
+ *   engine writes. Omit on a host run, where the two are the same string.
  */
 export function substituteNodeOutputRefs(
   prompt: string,
   nodeOutputs: Map<string, NodeOutput>,
   escapedForBash = false,
   artifactsDir?: string,
-  requiredContext?: RequiredOutputRefContext
+  requiredContext?: RequiredOutputRefContext,
+  hostArtifactsDir?: string
 ): string {
   return prompt.replace(
     /\$([a-zA-Z_][a-zA-Z0-9_-]*)\.output(?:\.([a-zA-Z_][a-zA-Z0-9_]*))?/g,
@@ -1503,7 +1536,7 @@ export function substituteNodeOutputRefs(
             'failed branch.'
         );
         return escapedForBash
-          ? shellQuoteOrFile(nodeOutput.output, nodeId, undefined, artifactsDir)
+          ? shellQuoteOrFile(nodeOutput.output, nodeId, undefined, artifactsDir, hostArtifactsDir)
           : nodeOutput.output;
       }
       // No-silent-drop field access (resolveNodeOutputField): prefers the parsed
@@ -1532,7 +1565,9 @@ export function substituteNodeOutputRefs(
       // null as canonical JSON so downstream tools like jq get one JSON literal),
       // with the bash-escaping decision staying here at the call site.
       const text = canonicalValueText(value);
-      return escapedForBash ? shellQuoteOrFile(text, nodeId, field, artifactsDir) : text;
+      return escapedForBash
+        ? shellQuoteOrFile(text, nodeId, field, artifactsDir, hostArtifactsDir)
+        : text;
     }
   );
 }
@@ -3506,7 +3541,7 @@ function utf8SequenceLength(leadByte: number): number {
  */
 function formatPersistedNodeOutput(
   output: string,
-  artifactsDir: string,
+  hostArtifactsDir: string,
   spillKey: string
 ): {
   nodeOutput: string;
@@ -3535,7 +3570,9 @@ function formatPersistedNodeOutput(
     if (headEnd - sequenceStart < expectedLength) headEnd = sequenceStart;
   }
 
-  const spillDir = joinPath(artifactsDir, '.archon', 'node-output-spills', 'persisted');
+  // Engine-only on both ends: the engine writes the spill, and `spillPath` travels in
+  // the persisted event's `_spill_path` metadata, which only the host reads back.
+  const spillDir = joinPath(hostArtifactsDir, ...SPILL_SEGMENTS, 'persisted');
   const spillPath = writeSpillFile(spillDir, `${spillKey}.nodeoutput`, output);
 
   return {
@@ -3721,6 +3758,7 @@ async function executeBashNode(
     cwd,
     workflowRun,
     artifactsDir,
+    hostArtifactsDir,
     stateDir,
     logDir,
     baseBranch,
@@ -3774,7 +3812,14 @@ async function executeBashNode(
     undefined,
     { shellSafe: true, stateDir }
   );
-  const finalScript = substituteNodeOutputRefs(substitutedScript, nodeOutputs, true, artifactsDir);
+  const finalScript = substituteNodeOutputRefs(
+    substitutedScript,
+    nodeOutputs,
+    true,
+    artifactsDir,
+    undefined,
+    hostArtifactsDir
+  );
 
   const timeout = node.timeout ?? SUBPROCESS_DEFAULT_TIMEOUT;
   // Archon-managed env only — runSubprocess adds the host env for host runs and
@@ -3861,7 +3906,11 @@ async function executeBashNode(
     getLog().info({ nodeId: node.id, durationMs: duration }, 'dag_node_completed');
     await logNodeComplete(logDir, workflowRun.id, node.id, '<bash>', { durationMs: duration });
 
-    const persistedOutput = formatPersistedNodeOutput(output, artifactsDir, stepName);
+    const persistedOutput = formatPersistedNodeOutput(
+      output,
+      hostArtifactsDir ?? artifactsDir,
+      stepName
+    );
 
     deps.store
       .createWorkflowEvent({
@@ -4044,6 +4093,7 @@ async function executeScriptNode(
     cwd,
     workflowRun,
     artifactsDir,
+    hostArtifactsDir,
     stateDir,
     logDir,
     baseBranch,
@@ -4294,7 +4344,11 @@ async function executeScriptNode(
     getLog().info({ nodeId: node.id, durationMs: duration }, 'dag_node_completed');
     await logNodeComplete(logDir, workflowRun.id, node.id, '<script>', { durationMs: duration });
 
-    const persistedOutput = formatPersistedNodeOutput(output, artifactsDir, stepName);
+    const persistedOutput = formatPersistedNodeOutput(
+      output,
+      hostArtifactsDir ?? artifactsDir,
+      stepName
+    );
 
     deps.store
       .createWorkflowEvent({
@@ -4646,6 +4700,7 @@ async function executeLoopGroupNode(
     cwd,
     workflowRun,
     artifactsDir,
+    hostArtifactsDir,
     stateDir,
     logDir,
     baseBranch,
@@ -4875,7 +4930,8 @@ async function executeLoopGroupNode(
           resumedScope,
           true, // escapedForBash
           artifactsDir,
-          { consumerId: node.id, field: 'loop_group.until_bash' }
+          { consumerId: node.id, field: 'loop_group.until_bash' },
+          hostArtifactsDir
         );
         const resumedBashPath = resolveBashPath();
         try {
@@ -5102,6 +5158,7 @@ async function executeLoopGroupNode(
       aiProfile: ctx.aiProfile,
       workflowPreset: ctx.workflowPreset,
       artifactsDir: ctx.artifactsDir,
+      ...(ctx.hostArtifactsDir ? { hostArtifactsDir: ctx.hostArtifactsDir } : {}),
       stateDir: ctx.stateDir,
       logDir: ctx.logDir,
       baseBranch: ctx.baseBranch,
@@ -5351,7 +5408,8 @@ async function executeLoopGroupNode(
           scopedNodeOutputs,
           true, // escapedForBash
           artifactsDir,
-          { consumerId: node.id, field: 'loop_group.until_bash' }
+          { consumerId: node.id, field: 'loop_group.until_bash' },
+          hostArtifactsDir
         );
         await runSubprocess(execContext, groupBashPath, ['-c', substitutedBash], {
           cwd,
@@ -5717,6 +5775,7 @@ async function executeLoopNode(
     cwd,
     workflowRun,
     artifactsDir,
+    hostArtifactsDir,
     stateDir,
     logDir,
     baseBranch,
@@ -6974,7 +7033,8 @@ async function executeLoopNode(
           nodeOutputs,
           true, // escapedForBash
           artifactsDir,
-          { consumerId: node.id, field: 'loop.until_bash' }
+          { consumerId: node.id, field: 'loop.until_bash' },
+          hostArtifactsDir
         );
         await runSubprocess(execContext, loopBashPath, ['-c', substitutedBash], {
           cwd,
@@ -9418,6 +9478,7 @@ async function executeComposeFanOutNode(
         aiProfile: ctx.aiProfile,
         workflowPreset: ctx.workflowPreset,
         artifactsDir: ctx.artifactsDir,
+        ...(ctx.hostArtifactsDir ? { hostArtifactsDir: ctx.hostArtifactsDir } : {}),
         stateDir: ctx.stateDir,
         logDir: ctx.logDir,
         baseBranch: ctx.baseBranch,
@@ -9709,6 +9770,15 @@ interface RunInputs {
   aiProfile?: ResolvedAiProfile;
   workflowPreset?: ModelAliasPreset;
   artifactsDir: string;
+  /**
+   * The host-visible form of `artifactsDir`, for the engine's OWN filesystem access.
+   * Undefined when `artifactsDir` is already host-visible, which is every host run —
+   * so every reader spells it `ctx.hostArtifactsDir ?? ctx.artifactsDir` and a host
+   * run is unaffected. A container run's `artifactsDir` is node-visible (`/mnt/c/...`)
+   * and the engine is a Windows process, so opening it directly writes to a stray
+   * `C:\mnt\c\...` tree that nothing ever reads.
+   */
+  hostArtifactsDir?: string;
   /**
    * `$STATE_DIR` — the per-PROJECT cross-run state directory (#2200), shared by
    * every workflow in the project and pre-created by the executor. A run-level
@@ -10061,7 +10131,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
               ): ReturnType<typeof formatPersistedNodeOutput> =>
                 formatPersistedNodeOutput(
                   priorCompletedNodes.get(node.id)?.output ?? '',
-                  ctx.artifactsDir,
+                  ctx.hostArtifactsDir ?? ctx.artifactsDir,
                   stepName
                 );
               if (node.always_run) {
@@ -11016,7 +11086,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
             sessionId: output.sessionId,
           };
           try {
-            await writeNodeArtifact(ctx.artifactsDir, meta, output.output);
+            await writeNodeArtifact(ctx.hostArtifactsDir ?? ctx.artifactsDir, meta, output.output);
           } catch (err) {
             getLog().warn(
               { err: err as Error, nodeId, workflowRunId: ctx.workflowRun.id },
@@ -11616,6 +11686,7 @@ export async function executeDagWorkflow(
     workflowProvider,
     workflowModel,
     artifactsDir,
+    hostArtifactsDir,
     stateDir,
     logDir,
     baseBranch,
@@ -11844,6 +11915,7 @@ export async function executeDagWorkflow(
     aiProfile,
     workflowPreset,
     artifactsDir,
+    ...(hostArtifactsDir ? { hostArtifactsDir } : {}),
     stateDir,
     logDir,
     baseBranch,
@@ -12231,7 +12303,10 @@ export async function executeDagWorkflow(
   // stable across resume, so a failed run resumed after evidence.json is
   // produced re-enters here with all nodes prior-completed and completes.
   if (workflow.evidence_policy?.required === true) {
-    const evidencePath = joinPath(artifactsDir, 'evidence.json');
+    // The ENGINE checks presence, so it looks at the host-visible path — the same file
+    // the node created through its own name for that directory. The message already
+    // says "the host artifacts directory", so the reported path matches its wording.
+    const evidencePath = joinPath(hostArtifactsDir ?? artifactsDir, 'evidence.json');
     if (!existsSync(evidencePath)) {
       const failMsg =
         `DAG workflow '${workflow.name}' failed the evidence marker gate: ` +

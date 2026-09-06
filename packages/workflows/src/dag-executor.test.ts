@@ -1579,6 +1579,53 @@ describe('substituteNodeOutputRefs -- large output file substitution', () => {
     expect(result).not.toContain('$(cat ');
     expect(result).toBe(`echo '${largeOutput}'`);
   });
+
+  // A spill has ONE file and TWO names. The engine writes it, so the directory it
+  // creates must be host-visible; the `$(cat ...)` it emits is executed by a node, so
+  // that path must be node-visible. The pair below pins the correspondence from both
+  // ends — a refactor that repoints either half alone breaks one of them.
+  //
+  // The node-visible form is the shape `toNodeVisiblePath` produces for a Windows host
+  // path, spelled as a literal so this suite does not depend on the mocked
+  // `@archon/paths`.
+  const NODE_ARTIFACTS_DIR = '/mnt/c/Users/runner/.archon/artifacts/runs/run-1';
+
+  it('host run: the emitted reference names exactly the file that was written', async () => {
+    const largeOutput = 'x'.repeat(33_000);
+    const outputs = new Map([['a', makeOutput('completed', largeOutput)]]);
+
+    const result = substituteNodeOutputRefs('echo $a.output', outputs, true, tempDir);
+
+    // No host/node split: one name, used for both the write and the reference.
+    const hostSpill = spillPath(tempDir, 'a.nodeoutput');
+    expect(result).toBe(`echo $(cat '${hostSpill}')`);
+    expect(await readFile(hostSpill, 'utf-8')).toBe(largeOutput);
+  });
+
+  it('container run: writes under the host dir, emits the node-visible path', async () => {
+    const largeOutput = 'x'.repeat(33_000);
+    const outputs = new Map([['a', makeOutput('completed', largeOutput)]]);
+
+    const result = substituteNodeOutputRefs(
+      'echo $a.output',
+      outputs,
+      true,
+      NODE_ARTIFACTS_DIR, // what a node sees
+      undefined,
+      tempDir // what the engine writes through
+    );
+
+    // The engine wrote a real file, under the HOST name...
+    expect(await readFile(spillPath(tempDir, 'a.nodeoutput'), 'utf-8')).toBe(largeOutput);
+    // ...and the bash a node executes names that same file by its NODE name. Pinned as
+    // a literal because the separator is the point: joining a `/mnt/c` path with
+    // `path.join` on Windows yields backslashes a Linux node cannot open.
+    expect(result).toBe(
+      "echo $(cat '/mnt/c/Users/runner/.archon/artifacts/runs/run-1/.archon/node-output-spills/a.nodeoutput')"
+    );
+    // No host-only path leaks into text that runs inside the container.
+    expect(result).not.toContain(tempDir);
+  });
 });
 
 describe('substituteNodeOutputRefs -- structuredOutput preference', () => {
