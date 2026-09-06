@@ -2459,6 +2459,7 @@ export async function executeWorkflow(
     identityResolution,
   } = await resolveProjectPaths(deps, cwd, workflowRun.id, codebaseId, {
     persistedOutputRoot: workflowRun.output_root,
+    nodeVisibility: execContext.kind === 'container' ? 'wsl' : 'host',
   });
   // The engine opens these itself; nodes get the node-visible fields above.
   // `hostPaths` is undefined on a host run, so these are the same strings.

@@ -202,23 +202,51 @@ mock.module('@archon/paths', () => ({
 }));
 
 // Mock @archon/isolation (getIsolationProvider moved here from @archon/core)
+const mockGetIsolationProvider = mock(() => ({
+  create: mock(() =>
+    Promise.resolve({
+      provider: 'worktree',
+      id: '/test/path',
+      workingPath: '/test/path',
+      branchName: 'test-branch',
+      status: 'active',
+      createdAt: new Date(),
+      metadata: { adopted: false },
+    })
+  ),
+  healthCheck: mock(() => Promise.resolve(true)),
+}));
+// A trackable mock of its own -- NOT merged through from the real module -- so a
+// test can tell "workflow.ts calls selectIsolationProvider" apart from "workflow.ts
+// calls getIsolationProvider directly" (the dropped-call bug this restores). Non-
+// container delegates to the same getIsolationProvider mock every other test
+// asserts against; 'container' returns a distinct container-shaped provider.
+const mockSelectIsolationProvider = mock((providerType?: string) =>
+  providerType === 'container'
+    ? {
+        providerType: 'container' as const,
+        create: mock(() =>
+          Promise.resolve({
+            provider: 'container',
+            id: '/test/path',
+            workingPath: '/test/path',
+            branchName: 'test-branch',
+            status: 'active',
+            createdAt: new Date(),
+            metadata: { adopted: false },
+            execContext: { kind: 'container' as const, containerId: 'test-container' },
+            project: 'archon-test-project',
+          })
+        ),
+        healthCheck: mock(() => Promise.resolve(true)),
+      }
+    : mockGetIsolationProvider()
+);
 mock.module('@archon/isolation', () => ({
   configureIsolation: mock(() => undefined),
   classifyIsolationError: (error: Error) => error.message,
-  getIsolationProvider: mock(() => ({
-    create: mock(() =>
-      Promise.resolve({
-        provider: 'worktree',
-        id: '/test/path',
-        workingPath: '/test/path',
-        branchName: 'test-branch',
-        status: 'active',
-        createdAt: new Date(),
-        metadata: { adopted: false },
-      })
-    ),
-    healthCheck: mock(() => Promise.resolve(true)),
-  })),
+  getIsolationProvider: mockGetIsolationProvider,
+  selectIsolationProvider: mockSelectIsolationProvider,
   resolveFolderBackend: mockResolveFolderBackend,
 }));
 
@@ -3013,6 +3041,50 @@ describe('workflowRunCommand', () => {
           fromBranch: 'feature/extract-adapters',
         },
       })
+    );
+  });
+
+  // Regression coverage for the dropped `selectIsolationProvider` call (Task 6):
+  // a repo config declaring `isolation.provider: container` must actually reach
+  // selectIsolationProvider, not silently fall through to the worktree default.
+  // Before the restore this call site called getIsolationProvider() directly, and
+  // no test could tell the two apart -- see `mockSelectIsolationProvider` above.
+  it('selects the container isolation provider when repo config asks for it', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+    const conversationDb = await import('@archon/core/db/conversations');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    const core = await import('@archon/core');
+    const isolation = await import('@archon/isolation');
+
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'assist', description: 'Help' })],
+      errors: [],
+    });
+    (conversationDb.getOrCreateConversation as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'conv-123',
+    });
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'cb-123',
+      default_cwd: '/test/path',
+    });
+    (core.loadRepoConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      isolation: { provider: 'container' },
+    });
+    (conversationDb.updateConversation as ReturnType<typeof mock>).mockResolvedValueOnce(undefined);
+    (executeWorkflow as ReturnType<typeof mock>).mockResolvedValueOnce({
+      success: true,
+      workflowRunId: 'run-123',
+    });
+
+    await workflowRunCommand('/test/path', 'assist', 'hello');
+
+    const selectIsolationProviderMock = isolation.selectIsolationProvider as ReturnType<
+      typeof mock
+    >;
+    expect(selectIsolationProviderMock).toHaveBeenLastCalledWith(
+      'container',
+      expect.objectContaining({ loadConfig: expect.any(Function) })
     );
   });
 

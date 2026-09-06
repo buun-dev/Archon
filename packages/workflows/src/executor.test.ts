@@ -493,6 +493,67 @@ describe('executeWorkflow', () => {
   });
 
   // -------------------------------------------------------------------------
+  // Node visibility wiring (Task 6): executor.ts threads execContext.kind into
+  // resolveProjectPaths' nodeVisibility option. The container-execContext tests
+  // above exercise that line without checking its result, so an inverted
+  // ternary there would pass silently -- these two assert both arms.
+  // -------------------------------------------------------------------------
+
+  describe('node visibility wiring', () => {
+    it('threads nodeVisibility: "wsl" into path resolution for a container run', async () => {
+      const preCreatedRun = makeRun({
+        id: 'crun-vis',
+        metadata: { isolation: 'container', isolation_env_id: 'env-vis' },
+      });
+      const backend = {
+        suspend: mock(async () => {}),
+        finalize: mock(async () => ({ requiresApproval: false })),
+        applyChanges: mock(async () => ({ filesApplied: 0, filesDeleted: 0, warnings: [] })),
+        discardChanges: mock(async () => {}),
+      };
+
+      await executeWorkflow(
+        makeDeps(),
+        makePlatform(),
+        'conv-1',
+        '/tmp/ops',
+        makeWorkflow(),
+        'msg',
+        'db-conv-1',
+        {
+          preCreatedRun,
+          priorCompletedNodes: new Map([['node1', { output: 'out' }]]),
+          execContext: { kind: 'container', containerId: 'cid' },
+          container: { envId: 'env-vis', writeBack: 'approve', backend },
+        }
+      );
+
+      // composeRunPaths only populates hostPaths -- and therefore hostArtifactsDir
+      // on the dag-executor call -- when nodeVisibility !== 'host'. Its presence
+      // here is the observable proof the container arm of the ternary ran.
+      const dagCallArgs = mockExecuteDagWorkflow.mock.calls[0]?.[0];
+      expect(typeof dagCallArgs?.hostArtifactsDir).toBe('string');
+    });
+
+    it('leaves nodeVisibility at "host" for a plain (non-container) run', async () => {
+      await executeWorkflow(
+        makeDeps(),
+        makePlatform(),
+        'conv-1',
+        '/tmp/ops',
+        makeWorkflow(),
+        'msg',
+        'db-conv-1'
+      );
+
+      // No hostPaths on a host run, so hostArtifactsDir is never added to the
+      // dag-executor call at all -- an inverted ternary would put it here instead.
+      const dagCallArgs = mockExecuteDagWorkflow.mock.calls[0]?.[0];
+      expect(dagCallArgs?.hostArtifactsDir).toBeUndefined();
+    });
+  });
+
+  // -------------------------------------------------------------------------
   // Adopted-run directory on resume (#2747)
   // -------------------------------------------------------------------------
 

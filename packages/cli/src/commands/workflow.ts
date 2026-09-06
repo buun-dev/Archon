@@ -34,7 +34,8 @@ import {
 } from '@archon/workflows/model-validation';
 import {
   configureIsolation,
-  getIsolationProvider,
+  selectIsolationProvider,
+  isContainerEnvironment,
   resolveFolderBackend,
   classifyIsolationError,
 } from '@archon/isolation';
@@ -2738,12 +2739,23 @@ async function runWorkflowWithOwnedSource(
       return repoConfig?.worktree ?? null;
     });
 
-    const provider = getIsolationProvider();
+    // Repo-kind container isolation is opt-in via `.archon/config.yaml`
+    // isolation.provider: container. Default (worktree) is byte-identical to a host run.
+    const repoIsolationConfig = await loadRepoConfig(codebase.default_cwd);
+    const provider = selectIsolationProvider(repoIsolationConfig?.isolation?.provider, {
+      loadConfig: async (repoPath: string) => {
+        const repoConfig = await loadRepoConfig(repoPath);
+        return repoConfig?.worktree ?? null;
+      },
+    });
+    const wantsContainerIsolation = provider.providerType === 'container';
 
-    // Check for existing worktree (only when explicit --branch)
-    const existingEnv = options.branchName
-      ? await isolationDb.findActiveByWorkflow(codebase.id, 'task', options.branchName)
-      : undefined;
+    // Check for existing worktree (only when explicit --branch). Container runs skip
+    // this: `sandbox.sh up` is idempotent, and reuse-by-branch returns no execContext.
+    const existingEnv =
+      !wantsContainerIsolation && options.branchName
+        ? await isolationDb.findActiveByWorkflow(codebase.id, 'task', options.branchName)
+        : undefined;
 
     if (existingEnv && (await provider.healthCheck(existingEnv.working_path))) {
       if (options.fromBranch) {
@@ -2845,6 +2857,12 @@ async function runWorkflowWithOwnedSource(
 
       workingCwd = isolatedEnv.workingPath;
       isolationEnvId = envRecord.id;
+      // Container envs carry their own execContext (containerId + execUser); the
+      // executor threads it into node visibility and per-node exec. Worktree envs
+      // leave execContext at its 'host' default.
+      if (isContainerEnvironment(isolatedEnv)) {
+        execContext = isolatedEnv.execContext;
+      }
       getLog().info({ path: workingCwd }, 'worktree_created');
     }
   } else if (options.noWorktree) {
