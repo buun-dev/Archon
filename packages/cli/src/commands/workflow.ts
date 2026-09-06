@@ -2843,12 +2843,17 @@ async function runWorkflowWithOwnedSource(
         description: `CLI workflow: ${workflowName}`,
       });
 
-      // Track in database
+      // Track in database. The provider the row records is the one that CREATED the
+      // env, not a constant: `reconcileGhosts` skips the host stat only for rows whose
+      // provider is host-invisible (`isHostVisibleEnv`), and a container env's
+      // `working_path` is a distro path. Recorded as 'worktree' it gets host-stat'd,
+      // resolves drive-relative on Windows, finds nothing, and is marked `destroyed`
+      // the moment no live run owns it.
       const envRecord = await isolationDb.create({
         codebase_id: codebase.id,
         workflow_type: 'task',
         workflow_id: branchIdentifier,
-        provider: 'worktree',
+        provider: provider.providerType,
         working_path: isolatedEnv.workingPath,
         branch_name: isolatedEnv.branchName,
         created_by_platform: 'cli',

@@ -203,6 +203,7 @@ mock.module('@archon/paths', () => ({
 
 // Mock @archon/isolation (getIsolationProvider moved here from @archon/core)
 const mockGetIsolationProvider = mock(() => ({
+  providerType: 'worktree' as const,
   create: mock(() =>
     Promise.resolve({
       provider: 'worktree',
@@ -248,6 +249,12 @@ mock.module('@archon/isolation', () => ({
   getIsolationProvider: mockGetIsolationProvider,
   selectIsolationProvider: mockSelectIsolationProvider,
   resolveFolderBackend: mockResolveFolderBackend,
+  // Called unconditionally on the create path. Bun's `mock.module` REPLACES a
+  // module's exports when it has not been loaded yet and only PATCHES when it has,
+  // so omitting a used export works or throws `TypeError` purely on import order.
+  // Mirrors the real predicate rather than a constant, so the container-provider
+  // test still takes the container branch.
+  isContainerEnvironment: (env: { provider?: string }) => env.provider === 'container',
 }));
 
 // Mock the @archon/core modules
@@ -3085,6 +3092,14 @@ describe('workflowRunCommand', () => {
     expect(selectIsolationProviderMock).toHaveBeenLastCalledWith(
       'container',
       expect.objectContaining({ loadConfig: expect.any(Function) })
+    );
+
+    // ...and the env row records the provider that actually created it. A hardcoded
+    // 'worktree' here makes `reconcileGhosts` host-stat a distro path and destroy the
+    // row once no live run owns it.
+    const isolationDb = await import('@archon/core/db/isolation-environments');
+    expect(isolationDb.create).toHaveBeenLastCalledWith(
+      expect.objectContaining({ provider: 'container' })
     );
   });
 
