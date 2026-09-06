@@ -354,6 +354,16 @@ async function isFolderCodebase(
   }
 }
 
+/**
+ * Where this run's nodes execute, as far as path resolution is concerned.
+ *
+ * `'host'` — nodes see the same filesystem the engine does. Host-visible IS
+ * node-visible and nothing is converted.
+ * `'wsl'` — nodes execute inside the WSL2 distro (a repo-kind container run), where
+ * the engine's `C:\...` paths do not resolve.
+ */
+export type NodeVisibility = 'host' | 'wsl';
+
 /** The run-scoped output directories plus the project root they hang off. */
 export interface ResolvedProjectPaths {
   artifactsDir: string;
@@ -365,6 +375,16 @@ export interface ResolvedProjectPaths {
   stateDir: string;
   /** The project root persisted to `workflow_runs.output_root`. */
   outputRoot: string;
+  /**
+   * Host-visible forms of the engine paths above, for the engine's OWN filesystem
+   * access. Set only when `nodeVisibility` is `'wsl'`; `undefined` means the fields
+   * above are already host-visible, which is every host run.
+   *
+   * The fields above are always NODE-visible. That direction is deliberate: 28 sites
+   * substitute them into node text and 8 open them as files, so defaulting to
+   * node-visible makes the larger population correct without touching it.
+   */
+  hostPaths?: { artifactsDir: string; stateDir: string; logDir: string };
   /**
    * How the run's project identity was determined (#2304). Three states; collapsing
    * any two is a correctness bug:
@@ -413,7 +433,7 @@ export async function resolveProjectPaths(
   cwd: string,
   workflowRunId: string,
   codebaseId?: string,
-  opts?: { persistedOutputRoot?: string | null }
+  opts?: { persistedOutputRoot?: string | null; nodeVisibility?: NodeVisibility }
 ): Promise<ResolvedProjectPaths> {
   if (opts?.persistedOutputRoot) {
     // The engine only ever persists an in-tree root, so an out-of-tree value is
@@ -425,7 +445,8 @@ export async function resolveProjectPaths(
     if (archonPaths.isInsideArchonHome(opts.persistedOutputRoot)) {
       return composeRunPaths(
         archonPaths.getStoragePathsForRoot(opts.persistedOutputRoot),
-        workflowRunId
+        workflowRunId,
+        opts.nodeVisibility
       );
     }
     getLog().error(
@@ -501,7 +522,8 @@ export async function resolveProjectPaths(
   return {
     ...composeRunPaths(
       archonPaths.getProjectStoragePaths(key ?? { kind: 'cwd', cwd }),
-      workflowRunId
+      workflowRunId,
+      opts?.nodeVisibility
     ),
     identityResolution,
   };
@@ -510,15 +532,34 @@ export async function resolveProjectPaths(
 /** Project-level roots → the run-scoped view the executor threads downstream. */
 function composeRunPaths(
   storage: archonPaths.ProjectStoragePaths,
-  workflowRunId: string
+  workflowRunId: string,
+  nodeVisibility: NodeVisibility = 'host'
 ): ResolvedProjectPaths {
-  return {
+  const base: ResolvedProjectPaths = {
     artifactsDir: archonPaths.getRunArtifactsDirForRoot(storage.root, workflowRunId),
     workflowSourceDir: archonPaths.getRunWorkflowSourceDirForRoot(storage.root, workflowRunId),
     logDir: storage.logsDir,
     artifactsRoot: storage.artifactsRoot,
     stateDir: storage.stateRoot,
     outputRoot: storage.root,
+  };
+  if (nodeVisibility === 'host') return base;
+
+  // Only the three that reach node text convert. `workflowSourceDir` and
+  // `artifactsRoot` are engine-only — the frozen source is not mounted into a
+  // repo-kind container, and `artifactsRoot` is read by the host when listing a
+  // finished run. `outputRoot` must stay host-visible: resolveProjectPaths guards a
+  // persisted root with isInsideArchonHome, which a /mnt/c value fails.
+  return {
+    ...base,
+    artifactsDir: archonPaths.toNodeVisiblePath(base.artifactsDir),
+    stateDir: archonPaths.toNodeVisiblePath(base.stateDir),
+    logDir: archonPaths.toNodeVisiblePath(base.logDir),
+    hostPaths: {
+      artifactsDir: base.artifactsDir,
+      stateDir: base.stateDir,
+      logDir: base.logDir,
+    },
   };
 }
 

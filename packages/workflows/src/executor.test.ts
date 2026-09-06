@@ -3,7 +3,7 @@
  * Covers concurrent-run guards, model/provider resolution, and resume logic
  * that the inner dag-executor.test.ts cannot reach.
  */
-import { describe, it, expect, mock, beforeEach, spyOn } from 'bun:test';
+import { describe, it, expect, mock, beforeEach, afterEach, spyOn } from 'bun:test';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'path';
@@ -88,6 +88,15 @@ function fakeGetProjectStoragePaths(
   return fakeStoragePathsForRoot(root);
 }
 
+// The real implementation, not a fake: the whole point of the node-visibility
+// tests below is proving the actual Windows-drive-letter -> /mnt/<drive> rewrite,
+// which a hand-rolled fake could quietly get wrong.
+import { toNodeVisiblePath as realToNodeVisiblePath } from '../../paths/src/wsl-path';
+
+// Hoisted so the node-visibility tests can swap in a drive-lettered storage root
+// (the fake tree above is rooted at WS, which has none) and restore it after.
+const mockGetProjectStoragePaths = mock(fakeGetProjectStoragePaths);
+
 mock.module('@archon/paths', () => ({
   createLogger: mock(() => mockLogger),
   parseOwnerRepo: mock(() => null),
@@ -96,8 +105,9 @@ mock.module('@archon/paths', () => ({
   getProjectLogsPath: mock(() => '/tmp/logs'),
   getProjectArtifactsPath: mock(() => '/tmp/artifacts-root'),
   resolveProjectStorageKey: mock(fakeResolveProjectStorageKey),
-  getProjectStoragePaths: mock(fakeGetProjectStoragePaths),
+  getProjectStoragePaths: mockGetProjectStoragePaths,
   getStoragePathsForRoot: mock(fakeStoragePathsForRoot),
+  toNodeVisiblePath: mock(realToNodeVisiblePath),
   // The fake tree is rooted at WS, so that is this suite's ARCHON_HOME.
   isInsideArchonHome: mock((candidate: string) => candidate.startsWith(WS)),
   slugifyFolderName: mock((name: string) => name),
@@ -4644,6 +4654,66 @@ describe('resolveProjectPaths', () => {
       expect(result.identityResolution).toBeUndefined();
       // The resolved paths still come from the persisted root, not from a fresh lookup.
       expect(result.outputRoot).toBe(wsPath('acme', 'original'));
+    });
+  });
+
+  describe('resolveProjectPaths — node visibility', () => {
+    const CWD = '/repos/nodevis';
+
+    // A container run executes in the WSL2 distro, where the engine's own `C:\...`
+    // paths do not resolve. The FIELDS become node-visible so all 28 substitution
+    // sites are correct without knowing about containers; `hostPaths` carries what
+    // the engine needs for its own mkdir and reads.
+    it('a host run leaves paths alone and sets no hostPaths', async () => {
+      const paths = await resolveProjectPaths(makeDeps(), CWD, 'run-host-1');
+
+      expect(paths.hostPaths).toBeUndefined();
+      expect(paths.artifactsDir).toContain('artifacts');
+      expect(paths.artifactsDir).not.toStartWith('/mnt/');
+    });
+
+    describe('on a drive-lettered storage root', () => {
+      // The fake tree above is rooted at WS ('/tmp/ws'), which has no drive
+      // letter, so toNodeVisiblePath would return it unchanged and these
+      // assertions would hold vacuously. Override the storage root for just
+      // these tests to a literal drive-lettered fixture -- not anything
+      // platform-derived, so the tests behave the same on Linux CI.
+      const DRIVE_ROOT = 'C:\\Users\\Test\\ArchonHome\\_cwd\\nodevis';
+
+      beforeEach(() => {
+        mockGetProjectStoragePaths.mockImplementation(() => fakeStoragePathsForRoot(DRIVE_ROOT));
+      });
+
+      afterEach(() => {
+        mockGetProjectStoragePaths.mockImplementation(fakeGetProjectStoragePaths);
+      });
+
+      it('a wsl run exposes node-visible fields and host-visible siblings', async () => {
+        const paths = await resolveProjectPaths(makeDeps(), CWD, 'run-wsl-1', undefined, {
+          nodeVisibility: 'wsl',
+        });
+
+        // The three engine paths that reach node text (executor-shared.ts:744-748).
+        expect(paths.artifactsDir).toStartWith('/mnt/');
+        expect(paths.stateDir).toStartWith('/mnt/');
+        expect(paths.logDir).toStartWith('/mnt/');
+
+        // What the engine itself opens. A filesystem call left on the node-visible
+        // field would try to mkdir '/mnt/c/...' on Windows and create a stray C:\mnt\c.
+        expect(paths.hostPaths?.artifactsDir).toMatch(/^[A-Za-z]:/);
+        expect(paths.hostPaths?.stateDir).toMatch(/^[A-Za-z]:/);
+        expect(paths.hostPaths?.logDir).toMatch(/^[A-Za-z]:/);
+      });
+
+      it('outputRoot stays host-visible on a wsl run', async () => {
+        const paths = await resolveProjectPaths(makeDeps(), CWD, 'run-wsl-2', undefined, {
+          nodeVisibility: 'wsl',
+        });
+
+        // resolveProjectPaths guards a persisted root with isInsideArchonHome, which a
+        // /mnt/c value fails. output_root is engine bookkeeping and never reaches a node.
+        expect(paths.outputRoot).not.toStartWith('/mnt/');
+      });
     });
   });
 });
