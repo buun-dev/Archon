@@ -1628,6 +1628,92 @@ describe('substituteNodeOutputRefs -- large output file substitution', () => {
   });
 });
 
+// The cross-iteration sibling of the pair above. `$LOOP_PREV` spills through the same
+// `shellQuoteOrFile`, so it owes the same correspondence: the file the engine wrote is
+// the file the emitted `$(cat ...)` names. It regressed differently — the caller passed
+// only the NODE-visible dir, and `mkdirSync('/mnt/c/...')` on Windows SUCCEEDS into a
+// drive-relative stray tree, so the write appeared to work, the inline fallback never
+// fired, and `$(cat <missing>)` handed a loop predicate the empty string without
+// failing the script.
+describe('substituteLoopPrevRefs -- large output file substitution', () => {
+  let tempDir: string;
+
+  const spillPath = (artifactsDir: string, filename: string): string =>
+    join(artifactsDir, '.archon', 'node-output-spills', filename);
+
+  beforeEach(async () => {
+    tempDir = join(tmpdir(), `archon-test-loop-prev-spill-${Date.now()}`);
+    await mkdir(tempDir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    await removeTempTree(tempDir);
+  });
+
+  const NODE_ARTIFACTS_DIR = '/mnt/c/Users/runner/.archon/artifacts/runs/run-1';
+
+  it('host run: the emitted reference names exactly the file that was written', async () => {
+    const largeOutput = 'x'.repeat(33_000);
+    const prev = new Map([['work', makeOutput('completed', largeOutput)]]);
+
+    const result = substituteLoopPrevRefs('echo $LOOP_PREV.work.output', prev, true, tempDir);
+
+    // No host/node split: one name, used for both the write and the reference.
+    const hostSpill = spillPath(tempDir, 'work.nodeoutput');
+    expect(result).toBe(`echo $(cat '${hostSpill}')`);
+    expect(await readFile(hostSpill, 'utf-8')).toBe(largeOutput);
+  });
+
+  it('container run: writes under the host dir, emits the node-visible path', async () => {
+    const largeOutput = 'x'.repeat(33_000);
+    const prev = new Map([['work', makeOutput('completed', largeOutput)]]);
+
+    const result = substituteLoopPrevRefs(
+      'echo $LOOP_PREV.work.output',
+      prev,
+      true,
+      NODE_ARTIFACTS_DIR, // what a node sees
+      undefined,
+      undefined,
+      tempDir // what the engine writes through
+    );
+
+    // The engine wrote a real file, under the HOST name...
+    expect(await readFile(spillPath(tempDir, 'work.nodeoutput'), 'utf-8')).toBe(largeOutput);
+    // ...and the bash a node executes names that same file by its NODE name. Pinned as
+    // a literal because the separator is the point: joining a `/mnt/c` path with
+    // `path.join` on Windows yields backslashes a Linux node cannot open.
+    expect(result).toBe(
+      "echo $(cat '/mnt/c/Users/runner/.archon/artifacts/runs/run-1/.archon/node-output-spills/work.nodeoutput')"
+    );
+    // No host-only path leaks into text that runs inside the container.
+    expect(result).not.toContain(tempDir);
+  });
+
+  it('container run: a field spill keeps the same correspondence', async () => {
+    const largeValue = 'y'.repeat(33_000);
+    const prev = new Map([
+      ['work', makeOutput('completed', '', { report: largeValue }, ['report'])],
+    ]);
+
+    const result = substituteLoopPrevRefs(
+      'echo $LOOP_PREV.work.output.report',
+      prev,
+      true,
+      NODE_ARTIFACTS_DIR,
+      undefined,
+      undefined,
+      tempDir
+    );
+
+    expect(await readFile(spillPath(tempDir, 'work.report.nodeoutput'), 'utf-8')).toBe(largeValue);
+    expect(result).toBe(
+      "echo $(cat '/mnt/c/Users/runner/.archon/artifacts/runs/run-1/.archon/node-output-spills/work.report.nodeoutput')"
+    );
+    expect(result).not.toContain(tempDir);
+  });
+});
+
 describe('substituteNodeOutputRefs -- structuredOutput preference', () => {
   it('prefers structuredOutput.field over JSON.parse(output)', () => {
     // Pi-shape: prose output text with structuredOutput populated by tryParseStructuredOutput.

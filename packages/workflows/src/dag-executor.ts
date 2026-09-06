@@ -1416,8 +1416,8 @@ function shellQuoteOrFile(
     const filePath = writeSpillFile(spillDir, filename, value);
     if (filePath) {
       // A node-visible artifactsDir is a POSIX path, so join it as one: `joinPath` would
-      // hand a Linux node backslashes. No translation happens here — `toNodeVisiblePath`
-      // still runs exactly once per run, in `composeRunPaths`.
+      // hand a Linux node backslashes. No translation happens here — this joins the
+      // already-converted form; `toNodeVisiblePath` runs only at run setup.
       const nodePath = hostArtifactsDir
         ? posixPath.join(artifactsDir, ...SPILL_SEGMENTS, filename)
         : filePath;
@@ -1629,6 +1629,11 @@ function collectLoopBodyNodeIds(
  *
  * When `knownBodyIds` is undefined (raw callers with no static set) the seam stays fully
  * lenient — every absent ref resolves to '', preserving the pre-#2142 behavior.
+ *
+ * @param outputFileDir - NODE-visible spill directory: the base of the `$(cat ...)` path
+ *   the node executes. Same as {@link substituteNodeOutputRefs}'s `artifactsDir`.
+ * @param hostOutputFileDir - Host-visible form of `outputFileDir`, for the spill file the
+ *   engine writes. Omit on a host run, where the two are the same string.
  */
 export function substituteLoopPrevRefs(
   prompt: string,
@@ -1636,7 +1641,8 @@ export function substituteLoopPrevRefs(
   escapedForBash = false,
   outputFileDir?: string,
   knownBodyIds?: ReadonlySet<string>,
-  directBodyIds?: ReadonlySet<string>
+  directBodyIds?: ReadonlySet<string>,
+  hostOutputFileDir?: string
 ): string {
   // Fast path: no refs to resolve. When refs ARE present but the map is empty/undefined
   // (iteration 1 — no prior iteration), we still run the replace so each ref resolves to
@@ -1684,7 +1690,7 @@ export function substituteLoopPrevRefs(
       }
       if (!field) {
         return escapedForBash
-          ? shellQuoteOrFile(nodeOutput.output, nodeId, undefined, outputFileDir)
+          ? shellQuoteOrFile(nodeOutput.output, nodeId, undefined, outputFileDir, hostOutputFileDir)
           : nodeOutput.output;
       }
       const resolution = resolveNodeOutputField(nodeOutput, nodeId, field);
@@ -1692,7 +1698,9 @@ export function substituteLoopPrevRefs(
       const value = resolution.value;
       if (typeof value === 'number' || typeof value === 'boolean') return String(value);
       const text = canonicalValueText(value);
-      return escapedForBash ? shellQuoteOrFile(text, nodeId, field, outputFileDir) : text;
+      return escapedForBash
+        ? shellQuoteOrFile(text, nodeId, field, outputFileDir, hostOutputFileDir)
+        : text;
     }
   );
 }
@@ -5125,7 +5133,8 @@ async function executeLoopGroupNode(
         userInputForIter,
         artifactsDir,
         knownBodyIds,
-        directBodyIds
+        directBodyIds,
+        hostArtifactsDir
       )
     );
     // Re-layer from the (possibly substituted) body nodes — runLayers walks ctx.layers,
@@ -5385,13 +5394,20 @@ async function executeLoopGroupNode(
         // direct body ids belong to this scope; refs owned by an enclosing group were
         // already resolved while preparing this nested group, and descendant ids are not
         // present in this group's per-iteration output map.
+        // Spills go under the run's artifacts dir, like every other `shellQuoteOrFile`
+        // caller — `logDir` was the odd one out and wrong twice over: it is the
+        // PROJECT-level logs directory, so two concurrent runs of this workflow would
+        // collide on the same un-run-scoped `<nodeId>.<field>.nodeoutput`; and it is
+        // host-visible, so the `$(cat ...)` a container node executes named a `C:\`
+        // path it cannot open.
         const prevResolvedBash = substituteLoopPrevRefs(
           group.until_bash,
           prevSnapshot,
           true,
-          logDir,
+          artifactsDir,
           directBodyIds,
-          directBodyIds
+          directBodyIds,
+          hostArtifactsDir
         );
         const { prompt: bashPrompt } = substituteWorkflowVariables(
           prevResolvedBash,
@@ -5694,6 +5710,12 @@ async function executeLoopGroupNode(
  * against): a ref to an outer-direct id resolves now, a ref owned by a nested group is left
  * intact for that inner group's own pass, and a ref to nothing is a typo. Both omitted by
  * raw callers, which then skip the typo/nested classification entirely (fully lenient).
+ *
+ * `outputFileDir`/`hostOutputFileDir` are the node/host pair for over-threshold spills,
+ * forwarded unchanged to {@link substituteLoopPrevRefs} — the same pair `shellQuoteOrFile`
+ * takes. Pass BOTH on a container run: the engine writes through the host name and the
+ * node reads the node name, and passing only the node-visible form makes the engine
+ * `mkdir` a stray drive-relative tree on Windows without failing.
  */
 export function applyLoopPrevToBodyNode(
   node: DagNode,
@@ -5701,7 +5723,8 @@ export function applyLoopPrevToBodyNode(
   loopUserInput: string,
   outputFileDir?: string,
   knownBodyIds?: ReadonlySet<string>,
-  directBodyIds?: ReadonlySet<string>
+  directBodyIds?: ReadonlySet<string>,
+  hostOutputFileDir?: string
 ): DagNode {
   // Substitute $LOOP_USER_INPUT (user free-text) and $LOOP_PREV.* refs.
   // Resolve $LOOP_PREV FIRST, then splice $LOOP_USER_INPUT — so user input containing a
@@ -5724,7 +5747,8 @@ export function applyLoopPrevToBodyNode(
       escapedForBash,
       outputFileDir,
       knownBodyIds,
-      directBodyIds
+      directBodyIds,
+      hostOutputFileDir
     );
     if (skipUserInput) return prevResolved;
     const userInputForField = escapedForBash ? shellQuote(loopUserInput) : loopUserInput;
