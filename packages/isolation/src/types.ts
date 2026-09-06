@@ -184,15 +184,16 @@ export interface WorktreeEnvironment extends IsolatedEnvironmentBase {
 /**
  * Container isolation environment — the WSL sandbox substrate. Carries the
  * container {@link ExecutionContext} the engine threads into every node so
- * bash/script/AI exec runs `docker exec <containerId> -w /work`, plus the compose
- * `project` used to re-address the stack on resume/teardown. Unlike a worktree
+ * bash/script/AI exec runs `docker exec <containerId> -w <workingPath>`, plus the
+ * compose `project` used to re-address the stack on resume/teardown. Unlike a worktree
  * env its `workingPath` is a distro path the Windows host cannot stat (see
- * `isHostVisibleEnv`).
+ * `isHostVisibleEnv`) — but the container mounts it at that same path, so one string
+ * addresses it on both sides and nothing translates it.
  */
 export interface ContainerEnvironment extends IsolatedEnvironmentBase {
   provider: 'container';
   branchName: BranchName;
-  /** Container execution context (containerId + workdir /work + host↔container pathMap). */
+  /** Container execution context — `containerId` and `execUser`, nothing more. */
   execContext: Extract<ExecutionContext, { kind: 'container' }>;
   /** Compose project `archon-<repo>-<slug>` — re-addresses the stack on resume/teardown. */
   project: string;
