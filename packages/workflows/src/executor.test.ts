@@ -4722,13 +4722,15 @@ describe('resolveProjectPaths', () => {
     const CWD = '/repos/nodevis';
 
     // A container run executes in the WSL2 distro, where the engine's own `C:\...`
-    // paths do not resolve. The FIELDS become node-visible so all 28 substitution
-    // sites are correct without knowing about containers; `hostPaths` carries what
-    // the engine needs for its own mkdir and reads.
-    it('a host run leaves paths alone and sets no hostPaths', async () => {
+    // paths do not resolve. `artifactsDir`/`stateDir` become node-visible so all 28
+    // substitution sites are correct without knowing about containers; `hostPaths`
+    // carries what the engine needs for its own mkdir and reads. `logDir` goes the
+    // other way -- see the `on a drive-lettered storage root` tests below.
+    it('a host run leaves paths alone and sets no hostPaths or nodePaths', async () => {
       const paths = await resolveProjectPaths(makeDeps(), CWD, 'run-host-1');
 
       expect(paths.hostPaths).toBeUndefined();
+      expect(paths.nodePaths).toBeUndefined();
       expect(paths.artifactsDir).toContain('artifacts');
       expect(paths.artifactsDir).not.toStartWith('/mnt/');
     });
@@ -4754,16 +4756,32 @@ describe('resolveProjectPaths', () => {
           nodeVisibility: 'wsl',
         });
 
-        // The three engine paths that reach node text (executor-shared.ts:744-748).
+        // The two engine paths that reach node text directly (executor-shared.ts:744-748).
         expect(paths.artifactsDir).toStartWith('/mnt/');
         expect(paths.stateDir).toStartWith('/mnt/');
-        expect(paths.logDir).toStartWith('/mnt/');
 
         // What the engine itself opens. A filesystem call left on the node-visible
         // field would try to mkdir '/mnt/c/...' on Windows and create a stray C:\mnt\c.
         expect(paths.hostPaths?.artifactsDir).toMatch(/^[A-Za-z]:/);
         expect(paths.hostPaths?.stateDir).toMatch(/^[A-Za-z]:/);
-        expect(paths.hostPaths?.logDir).toMatch(/^[A-Za-z]:/);
+      });
+
+      it('logDir stays host-visible on a wsl run, with a node-visible sibling for delivery', async () => {
+        const paths = await resolveProjectPaths(makeDeps(), CWD, 'run-wsl-1b', undefined, {
+          nodeVisibility: 'wsl',
+        });
+
+        // The opposite direction from artifactsDir/stateDir: the engine's ~32 log
+        // writes, and its transcript read back through getRunLogPathForRoot(outputRoot,
+        // ...), both need the host form -- converting logDir here would split writer
+        // and reader onto different filesystems (a container run's `archon run get`
+        // would return nothing).
+        expect(paths.logDir).toMatch(/^[A-Za-z]:/);
+        expect(paths.logDir).not.toStartWith('/mnt/');
+
+        // The node-visible form exists only as an explicit sibling, for the 3
+        // buildExecNodeEnvironment delivery sites -- never in place of logDir itself.
+        expect(paths.nodePaths?.logDir).toStartWith('/mnt/');
       });
 
       it('outputRoot stays host-visible on a wsl run', async () => {

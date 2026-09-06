@@ -3761,6 +3761,7 @@ async function executeBashNode(
     hostArtifactsDir,
     stateDir,
     logDir,
+    nodeLogDir,
     baseBranch,
     docsDir,
     nodeOutputs,
@@ -3848,7 +3849,7 @@ async function executeBashNode(
     ...buildExecNodeEnvironment({
       artifactsDir,
       stateDir,
-      logDir,
+      logDir: nodeLogDir ?? logDir,
       workflowId: workflowRun.id,
       baseBranch,
       userMessage: workflowRun.user_message,
@@ -4096,6 +4097,7 @@ async function executeScriptNode(
     hostArtifactsDir,
     stateDir,
     logDir,
+    nodeLogDir,
     baseBranch,
     docsDir,
     nodeOutputs,
@@ -4187,7 +4189,7 @@ async function executeScriptNode(
     ...buildExecNodeEnvironment({
       artifactsDir,
       stateDir,
-      logDir,
+      logDir: nodeLogDir ?? logDir,
       workflowId: workflowRun.id,
       baseBranch,
       userMessage: workflowRun.user_message,
@@ -5161,6 +5163,7 @@ async function executeLoopGroupNode(
       ...(ctx.hostArtifactsDir ? { hostArtifactsDir: ctx.hostArtifactsDir } : {}),
       stateDir: ctx.stateDir,
       logDir: ctx.logDir,
+      ...(ctx.nodeLogDir ? { nodeLogDir: ctx.nodeLogDir } : {}),
       baseBranch: ctx.baseBranch,
       docsDir: ctx.docsDir,
       configuredCommandFolder: undefined,
@@ -9481,6 +9484,7 @@ async function executeComposeFanOutNode(
         ...(ctx.hostArtifactsDir ? { hostArtifactsDir: ctx.hostArtifactsDir } : {}),
         stateDir: ctx.stateDir,
         logDir: ctx.logDir,
+        ...(ctx.nodeLogDir ? { nodeLogDir: ctx.nodeLogDir } : {}),
         baseBranch: ctx.baseBranch,
         docsDir: ctx.docsDir,
         configuredCommandFolder: ctx.configuredCommandFolder,
@@ -9785,7 +9789,20 @@ interface RunInputs {
    * invariant like `artifactsDir`; forwarded unchanged into loop_group bodies.
    */
   stateDir: string;
+  /**
+   * Always host-visible, even for a container run — the engine's ~32 log writes
+   * (`logNodeStart/Complete/Error/Skip`, `logWorkflowStart/Error/Complete`, …) read
+   * and write it directly. See `nodeLogDir` for the node-visible sibling.
+   */
   logDir: string;
+  /**
+   * Node-visible form of `logDir`, for the 2 `buildExecNodeEnvironment` call sites
+   * (`executeBashNode`, `executeScriptNode`) that deliver it to a node as
+   * `$LOG_DIR`. Undefined when `logDir` is already node-visible, which is every
+   * host run — so a reader spells it `ctx.nodeLogDir ?? ctx.logDir`, the same
+   * fallback shape as `hostArtifactsDir` in the opposite direction.
+   */
+  nodeLogDir?: string;
   baseBranch: string;
   docsDir: string;
   configuredCommandFolder?: string;
@@ -11689,6 +11706,7 @@ export async function executeDagWorkflow(
     hostArtifactsDir,
     stateDir,
     logDir,
+    nodeLogDir,
     baseBranch,
     docsDir,
     config,
@@ -11918,6 +11936,7 @@ export async function executeDagWorkflow(
     ...(hostArtifactsDir ? { hostArtifactsDir } : {}),
     stateDir,
     logDir,
+    ...(nodeLogDir ? { nodeLogDir } : {}),
     baseBranch,
     docsDir,
     configuredCommandFolder,
