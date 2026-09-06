@@ -374,7 +374,7 @@ export interface ResolvedProjectPaths {
    * `artifactsDir`/`stateDir` below. The populations point the other way: ~32
    * engine writes (`logWorkflowStart/Error/Complete`, `logNodeStart/Complete/
    * Error/Skip`, `logAssistant`, `logTool`, `logWatchdogReset`, …, all landing in
-   * `logger.ts`'s `mkdir`/`appendFile`) against 3 node deliveries
+   * `logger.ts`'s `mkdir`/`appendFile`) against 2 node deliveries
    * (`buildExecNodeEnvironment`'s `$LOG_DIR`), so defaulting to host-visible makes
    * the larger population correct without touching it — the same counting rule
    * that put `artifactsDir`/`stateDir` the other way, applied to this field. The
@@ -382,7 +382,7 @@ export interface ResolvedProjectPaths {
    * `getRunLogPathForRoot(outputRoot, ...)`, which stays host-visible by contract;
    * converting `logDir` here would split writer and reader onto different
    * filesystems (a container run's `archon run get` would return nothing). See
-   * `nodePaths.logDir` for the node-visible form, produced only for the 3
+   * `nodePaths.logDir` for the node-visible form, produced only for the 2
    * delivery sites.
    */
   logDir: string;
@@ -406,8 +406,13 @@ export interface ResolvedProjectPaths {
    */
   hostPaths?: { artifactsDir: string; stateDir: string };
   /**
-   * Node-visible form of `logDir`, for the 3 `buildExecNodeEnvironment` sites that
-   * deliver it to a node as `$LOG_DIR` (a documented `bash:`/`script:` contract).
+   * Node-visible form of `logDir`, for the 2 `buildExecNodeEnvironment` sites that
+   * deliver it to a node as `$LOG_DIR` (a documented `bash:`/`script:` contract):
+   * `executeBashNode` and `executeScriptNode`, both in `dag-executor.ts`. The third
+   * caller of `buildExecNodeEnvironment`, `dry-run.ts:718`, is deliberately NOT one
+   * of them: `dry-run.ts` has no container concept at all — no `nodeVisibility`, no
+   * `execContext` — its `logDir` is always a local temp dir and its nodes run through
+   * a plain `execFileAsync`, so host-visible IS node-visible there by construction.
    * Set only when `nodeVisibility` is `'wsl'`; `undefined` means `logDir` above is
    * already node-visible, which is every host run. The inverse sibling of
    * `hostPaths`, for the one field whose majority audience is the engine itself
@@ -2480,6 +2485,19 @@ export async function executeWorkflow(
     }
   }
 
+  // Where this run's nodes execute, as far as path resolution is concerned.
+  //
+  // `container` implies `wsl` HERE, and only here: the only backend that produces a
+  // container `execContext` on this fork is the repo-kind `ContainerProvider`, which
+  // runs a WSL2 distro under a Windows engine. Upstream's folder `ContainerBackend`
+  // satisfies the same `kind === 'container'` predicate but mounts at the host
+  // absolute path and needs no conversion — it is inert here only because
+  // `toNodeVisiblePath` passes non-drive-letter paths straight through. A second
+  // container backend on Windows would inherit WSL semantics silently; when one
+  // arrives, have the provider signal its path visibility rather than inferring it
+  // from `kind`.
+  const nodeVisibility: NodeVisibility = execContext.kind === 'container' ? 'wsl' : 'host';
+
   // Resolve external artifact, log, and state directories. A resumed run
   // carries its `output_root` and short-circuits identity resolution entirely.
   const {
@@ -2494,14 +2512,14 @@ export async function executeWorkflow(
     identityResolution,
   } = await resolveProjectPaths(deps, cwd, workflowRun.id, codebaseId, {
     persistedOutputRoot: workflowRun.output_root,
-    nodeVisibility: execContext.kind === 'container' ? 'wsl' : 'host',
+    nodeVisibility,
   });
   // The engine opens these itself; nodes get the node-visible fields above.
   // `hostPaths` is undefined on a host run, so these are the same strings.
   const hostArtifactsDir = hostPaths?.artifactsDir ?? artifactsDir;
   const hostStateDir = hostPaths?.stateDir ?? stateDir;
   // `logDir` above is already host-visible (the engine's own writes use it
-  // directly); `nodePaths` carries the node-visible sibling for the 3
+  // directly); `nodePaths` carries the node-visible sibling for the 2
   // `buildExecNodeEnvironment` delivery sites. Undefined on a host run.
   const nodeLogDir = nodePaths?.logDir;
 
@@ -2695,7 +2713,24 @@ export async function executeWorkflow(
           `Cannot adopt run '${effectiveAdoptedFromRunId}': its persisted output root is outside ARCHON_HOME and cannot be re-derived, so its artifact directory cannot be addressed.`
         );
       }
-      adoptedRunDir = archonPaths.getRunArtifactsDirForRoot(adoptedRoot, effectiveAdoptedFromRunId);
+      // Node-visible outright, with no host sibling: `$ADOPTED_RUN_DIR` is
+      // DELIVERY-ONLY. Its every consumer hands it to a node — prompt substitution
+      // (`executor-shared.ts`) and the `ADOPTED_RUN_DIR` env var
+      // (`exec-environment.ts`, via `currentAdoptedRunDir()` at the two
+      // `buildExecNodeEnvironment` sites) — and the engine never opens it, so unlike
+      // `artifactsDir` it needs no `hostPaths` split. The adopted run's persisted
+      // `output_root` stays host-visible (it is the engine's own bookkeeping, and
+      // `resolveRunStorageRoot`'s ARCHON_HOME containment check above rejects a
+      // `/mnt/c` value); only this derived node-facing string converts. Second and
+      // last `toNodeVisiblePath` call site — the other is `composeRunPaths`.
+      const adoptedHostRunDir = archonPaths.getRunArtifactsDirForRoot(
+        adoptedRoot,
+        effectiveAdoptedFromRunId
+      );
+      adoptedRunDir =
+        nodeVisibility === 'wsl'
+          ? archonPaths.toNodeVisiblePath(adoptedHostRunDir)
+          : adoptedHostRunDir;
     }
     if (!isContinuation) {
       try {
