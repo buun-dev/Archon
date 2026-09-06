@@ -60,6 +60,9 @@ export {
 } from './archon-paths';
 export type { ProjectStorageKey, ProjectStoragePaths } from './archon-paths';
 
+// WSL path translation
+export { toNodeVisiblePath } from './wsl-path';
+
 // Detached workflow install identity
 export {
   DETACHED_INSTALL_CONTEXT_KEYS,
