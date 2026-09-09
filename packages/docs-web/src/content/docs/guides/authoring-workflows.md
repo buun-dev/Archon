@@ -187,7 +187,7 @@ nodes:
   - id: implement
     command: implement-changes
     depends_on: [investigate, plan]
-    trigger_rule: none_failed_min_one_success  # Run if at least one dep succeeded
+    trigger_rule: none_failed_min_one_success  # Join successful and condition-skipped branches
 
   - id: inline-node
     prompt: "Summarize the changes made in $implement.output"  # Inline prompt (no command file)
@@ -208,8 +208,8 @@ nodes:
 |-------|------|-------------|
 | `command` | string | Command name. Packaged workflows resolve it only from their own `commands/`; legacy workflows use shared repo → home → bundled lookup. Optional `with:` binds upstream values by name into the file's `$INPUTS.<name>` surface — see [Binding values into command and script nodes](#binding-values-into-command-and-script-nodes) |
 | `prompt` | string | Inline prompt string |
-| `bash` | string | Shell script (no AI). Stdout captured as `$nodeId.output`; successful stdout is also stored in `node_completed.data.node_output` as an audit preview capped at 32 KiB (UTF-8 bytes). Optional `timeout` (ms, default 120000) |
-| `script` | string | TypeScript/JavaScript (via `bun`) or Python (via `uv`) — inline code or named reference. Packaged workflows resolve named scripts only from their own `scripts/`; legacy workflows use shared script directories. Stdout captured as `$nodeId.output`. Requires `runtime: bun` or `runtime: uv`. Optional `deps` (uv only) and `timeout` (ms, default 120000); optional `with:` binds upstream values by name into `INPUTS_<UPPER_SNAKE>` env vars — see [Binding values into command and script nodes](#binding-values-into-command-and-script-nodes). See [Script Nodes](/guides/script-nodes/) |
+| `bash` | string | Shell script (no AI). Stdout captured as `$nodeId.output`; successful stdout is also stored in `node_completed.data.node_output` as an audit preview capped at 32 KiB (UTF-8 bytes). Optional `timeout` (ms, default 120000); `on_timeout: skip` makes a timeout skipped instead of failed |
+| `script` | string | TypeScript/JavaScript (via `bun`) or Python (via `uv`) — inline code or named reference. Packaged workflows resolve named scripts only from their own `scripts/`; legacy workflows use shared script directories. Stdout captured as `$nodeId.output`. Requires `runtime: bun` or `runtime: uv`. Optional `deps` (uv only) and `timeout` (ms, default 120000); `on_timeout: skip` makes a timeout skipped instead of failed; optional `with:` binds upstream values by name into `INPUTS_<UPPER_SNAKE>` env vars — see [Binding values into command and script nodes](#binding-values-into-command-and-script-nodes). See [Script Nodes](/guides/script-nodes/) |
 | `loop` | object | Iterative AI prompt until a declared completion condition is met. See [Loop Nodes](/guides/loop-nodes/) |
 | `loop_group` | object | Multi-node sub-DAG body repeated per iteration until a declared completion condition is met. See [Cross-Node Loops](/guides/loop-nodes/#cross-node-loops-with-loop_group) |
 | `approval` | object | Pauses workflow for human review. See [Approval Nodes](/guides/approval-nodes/) |
@@ -402,8 +402,17 @@ nodes:
 |-------|----------|
 | `all_success` | Run only if all upstream deps completed successfully (default) |
 | `one_success` | Run if at least one upstream dep completed successfully |
-| `none_failed_min_one_success` | Run if no deps failed AND at least one succeeded (skipped deps are ok) |
+| `none_failed_min_one_success` | Run if at least one dependency succeeded and none failed or skipped because of an upstream failure (`upstream_failed`) |
 | `all_done` | Run when all deps are in a terminal state (completed, failed, or skipped) |
+
+`none_failed_min_one_success` blocks failure-cascade skips by default, including
+across dependency chains and includes. The skipped join retains the original failed
+node in its `upstream_failed` cause. Condition skips and optional timeout
+skips (`on_timeout: skip`) remain admissible when another dependency succeeds.
+
+`all_success`, `one_success`, and `all_done` keep their existing behavior.
+`if_skipped` supplies a value for a skipped output binding; it does not make a
+blocked node eligible to run or permit binding a failed output.
 
 :::note[`trigger_rule` is not `fan_out.join`]
 They share value names and have **different defaults**, so it is worth keeping straight:
@@ -1024,8 +1033,9 @@ is the YAML-coordinates / code-computes split. A skipped producer with **no**
 `if_skipped` fails the node with the
 binding, producer, and fix named — a binding never silently resolves to `''`.
 
-`if_skipped` only ever covers a producer that **did not run**. A producer that ran and
-**failed** always fails the binding too, whether or not `if_skipped` is declared — a
+`if_skipped` covers a producer that completed as **skipped**, including an exec node that
+ran until an opted-in timeout. A producer that **failed** always fails the binding too,
+whether or not `if_skipped` is declared — a
 `loop_group`'s failure paths in particular can leave real, non-empty output behind (its last
 completed iteration's text), so this is an explicit check, not an accident of empty output.
 There is no way to opt a binding out of this: declaring `if_skipped` never papers over a real
@@ -2300,6 +2310,26 @@ result.
 A malformed schema is a **load error**. `archon validate workflows` and every run compile
 each declared `output_format` before a provider is called, so a contract can never silently
 stop being enforced after the money is spent.
+
+### Inspecting a terminal run
+
+The engine records terminal facts even when failure skips your reporting node. Use
+[`archon workflow get <run-id> --json`](/reference/cli/#workflow-get) to read
+`terminal_record`, or read `run.terminal_record` from `GET /api/workflows/runs/:runId`.
+The record preserves execution status, authored outcome, node states and skip causes,
+the selected `returns:` value when available, and an artifact manifest. Execution
+status and authored outcome remain independent; the engine does not infer a delivery
+verdict from filenames or output prose. Runs created before this support may have no
+record. Resumed active runs expose `null` until their next terminal transition.
+
+The manifest contains file metadata, not content previews. Its `limitations` identify
+incomplete observations. Cancellation can record pending or running nodes and files
+that are still changing; terminalization does not make the filesystem snapshot atomic.
+You do not need a new YAML field or collector node to obtain these facts.
+
+Workflow-pack adoption remains separate: [#3127](https://github.com/coleam00/Archon/issues/3127)
+owns typed discovery and failure-cause consumption and completion-only outcome formatting.
+A consumer must still depend on the producers whose artifacts it needs.
 
 ### A deterministic producer owns the same contract
 
