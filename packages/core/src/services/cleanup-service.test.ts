@@ -2586,3 +2586,60 @@ describe('removeEnvironment — host-invisible envs', () => {
     expect(mockUpdateStatus).toHaveBeenCalledWith('env-wt', 'destroyed');
   });
 });
+
+// removeEnvironment now refuses a host-invisible env, so a closed conversation
+// owning a container env would leak its stack unless this path reclaims it with
+// the container machinery instead. Safe here, unlike in the sweeps: the
+// live-run lock above is a DB read, not a host stat, so it holds for a container
+// env exactly as it does for a worktree one.
+describe('onConversationClosed — container envs', () => {
+  const REPO_PATH = '/home/bunny/archon/worktrees/marphob-page/task-x';
+
+  beforeEach(() => {
+    mockGetById.mockReset();
+    mockGetCodebase.mockReset();
+    mockGetLiveRunOwningEnv.mockReset();
+    mockGetLiveRunOwningEnv.mockImplementation(() => Promise.resolve(null));
+    mockGetConversationByPlatformId.mockReset();
+    mockGetActiveSession.mockReset();
+    mockGetActiveSession.mockImplementation(() => Promise.resolve(null));
+    mockUpdateConversation.mockClear();
+    mockDestroy.mockClear();
+    mockProviderDestroy.mockClear();
+    mockContainerDestroy.mockClear();
+    mockWorktreeExists.mockResolvedValue(false);
+    mockHasUncommittedChanges.mockResolvedValue(false);
+  });
+
+  test('reclaims a container env through the container path, not the worktree one', async () => {
+    mockGetConversationByPlatformId.mockResolvedValue(
+      makeConversation({ id: 'conv-c', isolation_env_id: 'env-c' })
+    );
+    mockGetById.mockResolvedValue(
+      makeEnvironment({ id: 'env-c', provider: 'container', working_path: REPO_PATH })
+    );
+    mockGetCodebase.mockResolvedValue(makeCodebase({ kind: 'repo' }));
+
+    await onConversationClosed('github', 'owner/repo#300');
+
+    expect(mockProviderDestroy).toHaveBeenCalledWith(REPO_PATH);
+    expect(mockDestroy).not.toHaveBeenCalled();
+  });
+
+  test('a live run still blocks reclamation of a container env', async () => {
+    mockGetConversationByPlatformId.mockResolvedValue(
+      makeConversation({ id: 'conv-live', isolation_env_id: 'env-live' })
+    );
+    mockGetById.mockResolvedValue(
+      makeEnvironment({ id: 'env-live', provider: 'container', working_path: REPO_PATH })
+    );
+    mockGetLiveRunOwningEnv.mockImplementation(() =>
+      Promise.resolve({ id: 'run-live', status: 'paused' })
+    );
+
+    await onConversationClosed('github', 'owner/repo#301');
+
+    expect(mockProviderDestroy).not.toHaveBeenCalled();
+    expect(mockContainerDestroy).not.toHaveBeenCalled();
+  });
+});

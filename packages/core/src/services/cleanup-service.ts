@@ -329,6 +329,16 @@ export async function onConversationClosed(
       if (!(err instanceof ConversationNotFoundError)) throw err;
     });
 
+  // A container env is reclaimed by its own machinery — removeEnvironment refuses
+  // a host-invisible env, since a host stat cannot prove its worktree is gone.
+  // Tearing the stack down is safe HERE and not in the sweeps: the live-run lock
+  // above is a DB read, so it holds for a container env exactly as for a worktree
+  // one, whereas the sweeps decide from a stat that always false-negatives.
+  if (env.provider && !isHostVisibleEnv(env.provider)) {
+    await reclaimContainerEnv(envId);
+    return;
+  }
+
   await removeEnvironment(envId, {
     force: false,
     deleteRemoteBranch: options?.merged,
