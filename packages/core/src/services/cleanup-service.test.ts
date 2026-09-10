@@ -2543,3 +2543,46 @@ describe('reclaimContainerEnv', () => {
     expect(mockProviderDestroy).not.toHaveBeenCalled();
   });
 });
+
+// A host-liveness check cannot see a repo container env's worktree: it lives in
+// the WSL distro, so `worktreeExists` ALWAYS false-negatives from Windows. The
+// sweeps read that as "worktree gone" and reclaimed the row -- destroying a LIVE
+// container run's only resume source of truth while its compose stack kept
+// running, untracked. isHostVisibleEnv's own doc comment mandates this guard and
+// reconcileGhosts already honours it; removeEnvironment did not.
+describe('removeEnvironment — host-invisible envs', () => {
+  beforeEach(() => {
+    mockGetById.mockReset();
+    mockDestroy.mockClear();
+    mockUpdateStatus.mockClear();
+    mockWorktreeExists.mockClear();
+  });
+
+  test('refuses a container env — a host stat cannot prove its worktree is gone', async () => {
+    mockGetById.mockResolvedValue(
+      makeEnvironment({
+        id: 'env-container',
+        provider: 'container',
+        working_path: '/home/bunny/archon/worktrees/marphob-page/task-x',
+      })
+    );
+
+    const result = await removeEnvironment('env-container');
+
+    expect(result.skippedReason).toMatch(/host-invisible/i);
+    expect(mockDestroy).not.toHaveBeenCalled();
+    expect(mockUpdateStatus).not.toHaveBeenCalled();
+  });
+
+  test('still removes a worktree env — the guard is scoped to host-invisible providers', async () => {
+    mockGetById.mockResolvedValue(
+      makeEnvironment({ id: 'env-wt', provider: 'worktree', working_path: '/tmp/wt' })
+    );
+
+    const result = await removeEnvironment('env-wt');
+
+    expect(result.skippedReason).toBeUndefined();
+    expect(mockDestroy).toHaveBeenCalled();
+    expect(mockUpdateStatus).toHaveBeenCalledWith('env-wt', 'destroyed');
+  });
+});

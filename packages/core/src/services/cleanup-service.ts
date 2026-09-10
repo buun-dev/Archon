@@ -27,6 +27,7 @@ import {
   toBranchName,
 } from '@archon/git';
 import type { RepoPath, BranchName } from '@archon/git';
+import { isHostVisibleEnv } from '@archon/isolation/types';
 import { createLogger } from '@archon/paths';
 import type { IsolationEnvironmentRow } from '@archon/isolation';
 import { ConversationNotFoundError } from '../types';
@@ -378,6 +379,22 @@ export async function removeEnvironment(
   if (env.status === 'destroyed') {
     getLog().debug({ envId }, 'env_already_destroyed');
     return { ...noopResult, skippedReason: 'already destroyed' };
+  }
+
+  // Every removal below is decided by a host stat, and a host stat cannot see a
+  // container env's worktree — it lives in the WSL distro, so `worktreeExists`
+  // ALWAYS false-negatives from the engine. Reading that as "worktree gone"
+  // destroys a LIVE run's only resume source of truth and strands its compose
+  // stack, running and no longer tracked by anything. isHostVisibleEnv's own
+  // contract requires this guard; reconcileGhosts already applies it. Container
+  // envs are reclaimed by reclaimContainerEnv, which addresses the stack rather
+  // than the path. Legacy rows without a provider stay host-visible.
+  if (env.provider && !isHostVisibleEnv(env.provider)) {
+    getLog().debug({ envId, provider: env.provider }, 'env_host_invisible_skipped');
+    return {
+      ...noopResult,
+      skippedReason: 'host-invisible env — reclaim it with reclaimContainerEnv',
+    };
   }
 
   // Get canonical repo path from codebase for branch cleanup
