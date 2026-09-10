@@ -44,6 +44,8 @@ import {
   isContainerEnvironment,
   resolveFolderBackend,
   classifyIsolationError,
+  assertContainerPrerequisites,
+  assertIsolationProviderRecognized,
 } from '@archon/isolation';
 import type {
   ExecutionContext,
@@ -2192,6 +2194,39 @@ async function runWorkflowWithOwnedSource(
     // Surface worktree-option conflicts synchronously in the parent rather than
     // letting the child fail after fork.
     assertNoWorktreeOptionsForFolder(detachIsFolder, options);
+
+    // Container isolation's prerequisites live OUTSIDE the repo — the `sandbox.sh`
+    // lifecycle script, the WSL distro it runs in, the docker daemon, the runner
+    // image — and the child is what would have discovered them missing, after this
+    // process wrote the run row and printed `Started`. #2206 asks for the opposite:
+    // "Unsupported or incomplete configuration fails before a run starts and names
+    // the setting the operator must correct." So the same probes `ContainerProvider.
+    // create()` runs are run HERE too, in the pre-flight, where nothing exists yet.
+    //
+    // Both branches are behind a repo-kind ISOLATING dispatch, so a folder project,
+    // a --no-worktree run and a plain host run reach neither. A repo that asks for
+    // `worktree` (or asks for nothing) pays one config read and starts no subprocess.
+    //
+    // FRESH launches only, like the interactive-class refusal above. A continuation
+    // reuses its own run's row rather than writing one, so the "no run row" clause is
+    // already satisfied — and its prerequisites are a different set: resume goes
+    // through `provider.reattach`, which addresses a live compose stack and never
+    // shells `sandbox.sh`. Refusing a resume for a missing lifecycle script would
+    // block a run that can genuinely continue.
+    if (
+      !isContinuation &&
+      !options.noWorktree &&
+      wantsIsolation &&
+      detachCodebase &&
+      !detachIsFolder
+    ) {
+      const detachIsolationProvider = (await loadRepoConfig(detachCodebase.default_cwd))?.isolation
+        ?.provider;
+      assertIsolationProviderRecognized(detachIsolationProvider);
+      if (detachIsolationProvider === 'container') {
+        await assertContainerPrerequisites();
+      }
+    }
 
     // Between-run continuation (#2747): refuse an unresolvable declaration HERE — this
     // is the exact failure that vanished into a child log. `resolveWorkflowAdoption` is

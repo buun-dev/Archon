@@ -254,8 +254,20 @@ const mockSelectIsolationProvider = mock((providerType?: string) =>
       }
     : mockGetIsolationProvider()
 );
+/**
+ * The slice-4 prerequisite preflight. Resolves by default (every existing detach
+ * test dispatches a worktree run, which never reaches it); a container test
+ * overrides it per invocation. Mocked here rather than left real because the real
+ * one shells `wsl.exe` and `docker`.
+ */
+const mockAssertContainerPrerequisites = mock(() => Promise.resolve());
 mock.module('@archon/isolation', () => ({
   configureIsolation: mock(() => undefined),
+  assertContainerPrerequisites: mockAssertContainerPrerequisites,
+  assertIsolationProviderRecognized: mock((value?: string) => {
+    if (value === undefined || value === 'worktree' || value === 'container') return;
+    throw new Error(`Unknown isolation.provider '${value}' in .archon/config.yaml.`);
+  }),
   classifyIsolationError: (error: Error) => error.message,
   getIsolationProvider: mockGetIsolationProvider,
   selectIsolationProvider: mockSelectIsolationProvider,
@@ -3243,6 +3255,55 @@ describe('workflowRunCommand', () => {
     expect(isolationDb.create).toHaveBeenLastCalledWith(
       expect.objectContaining({ provider: 'container' })
     );
+  });
+
+  // Slice 4, foreground half. CHARACTERIZATION, not a red-first test: this ordering
+  // (`provider.create()` at the isolation block, `executeWorkflow` — which creates the
+  // run row — only much later) already held, and it is precisely why putting the
+  // preflight inside `create()` satisfies the foreground half of "no run row" outright.
+  // Pinned here so a future edit that moves row creation earlier, or that swallows a
+  // create() rejection, cannot quietly cost the guarantee.
+  it('fails a container dispatch with absent prerequisites before any run row exists', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+    const conversationDb = await import('@archon/core/db/conversations');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    const core = await import('@archon/core');
+    const isolation = await import('@archon/isolation');
+
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'assist', description: 'Help' })],
+      errors: [],
+    });
+    (conversationDb.getOrCreateConversation as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'conv-pre',
+    });
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'cb-pre',
+      default_cwd: '/test/path',
+    });
+    (core.loadRepoConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      isolation: { provider: 'container' },
+    });
+    (isolation.selectIsolationProvider as ReturnType<typeof mock>).mockImplementationOnce(() => ({
+      providerType: 'container' as const,
+      healthCheck: mock(() => Promise.resolve(false)),
+      create: mock(() =>
+        Promise.reject(
+          new Error(
+            "Container isolation is unavailable: the WSL distro 'Ubuntu' is not reachable. " +
+              'This repo asks for container isolation (`isolation.provider: container` in ' +
+              '.archon/config.yaml); set it to `worktree` to run on the host instead.'
+          )
+        )
+      ),
+    }));
+    (executeWorkflow as ReturnType<typeof mock>).mockClear();
+
+    await expect(workflowRunCommand('/test/path', 'assist', 'hello')).rejects.toThrow(
+      /isolation\.provider/
+    );
+    expect(executeWorkflow).not.toHaveBeenCalled();
   });
 
   it('throws when --branch is used with --no-worktree', async () => {
@@ -7051,6 +7112,86 @@ describe('workflowRunCommand — detach', () => {
   // #2872 — the launch printed `Started` and exited 0 while the child died on adoption
   // resolution, so no run row was ever created and the failure existed only inside the
   // detached child's log. The refusal has to reach the launching terminal.
+  // Slice 4 — a repo whose `.archon/config.yaml` asks for container isolation has
+  // prerequisites (sandbox.sh, the distro, the docker daemon, the runner image)
+  // that only the CHILD would have discovered, long after this process wrote the run
+  // row and printed `Started`. The done-when is "no run row, worktree, or container
+  // is created", so the check belongs in the same pre-flight (#2872) that already
+  // refuses an unresolvable --adopt.
+  it('refuses a container dispatch with absent prerequisites before writing the run row', async () => {
+    jest.useRealTimers();
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const core = await import('@archon/core');
+    const isolation = await import('@archon/isolation');
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'assist', description: 'Help' })],
+      errors: [],
+    });
+    (core.loadRepoConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      isolation: { provider: 'container' },
+    });
+    (isolation.assertContainerPrerequisites as ReturnType<typeof mock>).mockRejectedValueOnce(
+      new Error(
+        "Container isolation is unavailable: the WSL distro 'Ubuntu' is not reachable. " +
+          'This repo asks for container isolation (`isolation.provider: container` in ' +
+          '.archon/config.yaml); set it to `worktree` to run on the host instead.'
+      )
+    );
+    mockCreateWorkflowRun.mockClear();
+
+    const child = createDetachedChildFixture();
+    const spawnSpy = spyOn(Bun, 'spawn').mockReturnValue(child.child);
+    const savedArgv = process.argv;
+    process.argv = ['bun', '/abs/cli.ts', 'workflow', 'run', 'assist', 'hello', '--detach'];
+
+    try {
+      await expect(
+        workflowRunCommand('/test/path', 'assist', 'hello', { detach: true })
+      ).rejects.toThrow(/isolation\.provider/);
+      // The two things the done-when names: no child, and no row.
+      expect(spawnSpy).not.toHaveBeenCalled();
+      expect(mockCreateWorkflowRun).not.toHaveBeenCalled();
+    } finally {
+      process.argv = savedArgv;
+      spawnSpy.mockRestore();
+    }
+
+    expect(consoleSpy).not.toHaveBeenCalledWith("Started 'assist' in the background.");
+  });
+
+  // The silent-fallback half. `isolation: { provider: contaner }` used to parse
+  // fine, miss the `=== 'container'` test, and run on the HOST — the operator asked
+  // for container isolation and nothing said they had not got it.
+  it('refuses a misspelled isolation.provider rather than launching a host run', async () => {
+    jest.useRealTimers();
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const core = await import('@archon/core');
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'assist', description: 'Help' })],
+      errors: [],
+    });
+    (core.loadRepoConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      isolation: { provider: 'contaner' },
+    });
+    mockCreateWorkflowRun.mockClear();
+
+    const child = createDetachedChildFixture();
+    const spawnSpy = spyOn(Bun, 'spawn').mockReturnValue(child.child);
+    const savedArgv = process.argv;
+    process.argv = ['bun', '/abs/cli.ts', 'workflow', 'run', 'assist', 'hello', '--detach'];
+
+    try {
+      await expect(
+        workflowRunCommand('/test/path', 'assist', 'hello', { detach: true })
+      ).rejects.toThrow(/Unknown isolation\.provider 'contaner'/);
+      expect(spawnSpy).not.toHaveBeenCalled();
+      expect(mockCreateWorkflowRun).not.toHaveBeenCalled();
+    } finally {
+      process.argv = savedArgv;
+      spawnSpy.mockRestore();
+    }
+  });
+
   it('refuses an unresolvable --adopt synchronously instead of acking Started (#2872)', async () => {
     // Real timers: pre-fix this path spawns and waits out the startup window, so the
     // assertions below must be reachable rather than parked on an unadvanced fake timer.
