@@ -51,6 +51,7 @@ import type {
   ContainerBackendConfig,
   ContainerProvider,
   IIsolationProvider,
+  IsolationEnvironmentRow,
 } from '@archon/isolation';
 import type { TaskBranchSelection } from '@archon/isolation';
 import {
@@ -447,6 +448,24 @@ export function resolveContainerBackendConfig(
 export function hasUnresolvedWriteback(metadata: Record<string, unknown> | undefined): boolean {
   if (!metadata) return false;
   return metadata.pending_writeback !== undefined && metadata.writeback_resolved !== true;
+}
+
+/**
+ * Whether a run's `working_path` can be stat'd by this process.
+ *
+ * A repo-kind container run's worktree lives inside the WSL distro
+ * (`/home/<user>/archon/worktrees/...`), which a Windows `existsSync` resolves
+ * drive-relative and never finds. A FOLDER container run's path is the folder
+ * root, mounted same-path, and is perfectly host-visible — so the provider alone
+ * cannot answer this question (both kinds record `provider: 'container'`).
+ *
+ * Absent env information answers `true`: with nothing to except, stat it.
+ */
+export function isWorkingPathHostVisible(
+  codebaseKind: 'repo' | 'folder' | undefined,
+  envProvider: string | null | undefined
+): boolean {
+  return !(codebaseKind !== 'folder' && envProvider === 'container');
 }
 
 /**
@@ -2532,6 +2551,10 @@ async function runWorkflowWithOwnedSource(
   // matches. Only a worktree-isolated run has one; the no-completed-nodes refusal
   // names it in the relaunch command it suggests (#3154).
   let resumeBranch: string | undefined;
+  // Isolation env row matching the resumable run's working path, if any. Outer
+  // scope: Step 6's repo-container resume branch (below) reads it after Step 5's
+  // lookup assigns it.
+  let matchingEnv: IsolationEnvironmentRow | undefined;
   if (options.resume) {
     if (!codebase) {
       if (codebaseLookupError) {
@@ -2575,28 +2598,35 @@ async function runWorkflowWithOwnedSource(
     // which calls backend.resumeEnv when `resumable.metadata.isolation` is
     // 'container'). Nothing to reject here anymore.
 
-    // Reuse the working path from the resumable run (verify it still exists)
-    if (resumable.working_path) {
-      const { existsSync } = await import('fs');
-      if (!existsSync(resumable.working_path)) {
-        throw new Error(
-          `Cannot resume: the working path from the run no longer exists: ${resumable.working_path}\n` +
-            'The worktree may have been cleaned up. Start a fresh run with --branch instead.'
-        );
-      }
-      workingCwd = resumable.working_path;
-    }
-
-    // Look up the isolation environment that owns this working path (if any)
+    // Look up the isolation environment that owns this run's working path BEFORE
+    // deciding whether the path can be stat'd: a repo container run's worktree is
+    // inside the WSL distro and is invisible to this process (D3).
     const allEnvs = await isolationDb.listByCodebase(codebase.id);
-    const matchingEnv = allEnvs.find(e => e.working_path === workingCwd);
+    // `resumable` is narrowed non-null above, but that narrowing does not carry
+    // into a closure — capture the path here so `.find` doesn't need it to.
+    const resumableWorkingPath = resumable.working_path;
+    matchingEnv = allEnvs.find(e => e.working_path === resumableWorkingPath);
     if (matchingEnv) {
       isolationEnvId = matchingEnv.id;
       resumeBranch = matchingEnv.branch_name;
       getLog().info(
-        { envId: isolationEnvId, workingPath: workingCwd },
+        { envId: isolationEnvId, workingPath: resumable.working_path },
         'workflow.resume_env_found'
       );
+    }
+
+    // Reuse the working path from the resumable run (verify it still exists)
+    if (resumable.working_path) {
+      if (isWorkingPathHostVisible(codebase.kind, matchingEnv?.provider)) {
+        const { existsSync } = await import('fs');
+        if (!existsSync(resumable.working_path)) {
+          throw new Error(
+            `Cannot resume: the working path from the run no longer exists: ${resumable.working_path}\n` +
+              'The worktree may have been cleaned up. Start a fresh run with --branch instead.'
+          );
+        }
+      }
+      workingCwd = resumable.working_path;
     }
 
     console.log(`Resuming workflow run: ${resumable.id}`);
@@ -2931,6 +2961,45 @@ async function runWorkflowWithOwnedSource(
       }
       getLog().info({ path: workingCwd }, 'worktree_created');
     }
+  } else if (options.resume && codebase && matchingEnv?.provider === 'container') {
+    // A repo container run resumes into the SAME stack: reattach rebuilds the
+    // execContext (starting a stopped agent) without re-running `sandbox.sh up`,
+    // so no re-provision and no fresh worktree. Folder container resume is handled
+    // in the isFolderCodebase branch above via backend.resumeEnv.
+    const provider = selectIsolationProvider('container', {
+      loadConfig: async (repoPath: string) => {
+        const repoConfig = await loadRepoConfig(repoPath);
+        return repoConfig?.worktree ?? null;
+      },
+    });
+    if (!isContainerCapableProvider(provider)) {
+      throw new Error(
+        'Container isolation was selected for a resume but did not produce a container provider. ' +
+          'This is a build inconsistency; start a fresh run instead.'
+      );
+    }
+    console.log(`Repo project — resuming container run at ${matchingEnv.working_path}.`);
+    getLog().info(
+      { envId: matchingEnv.id, workingPath: matchingEnv.working_path },
+      'workflow.resuming_repo_container'
+    );
+    let reattached;
+    try {
+      reattached = await provider.reattach(matchingEnv.working_path);
+    } catch (reattachErr) {
+      const err = reattachErr as Error;
+      getLog().error(
+        { err, envId: matchingEnv.id, workingPath: matchingEnv.working_path },
+        'workflow.repo_container_resume_failed'
+      );
+      throw new Error(
+        `Cannot resume run in its container: the sandbox stack for ${matchingEnv.working_path} ` +
+          `is gone (${err.message}). Start a fresh run instead.`
+      );
+    }
+    execContext = reattached.execContext;
+    containerWriteBack = provider.writeBackBackend(matchingEnv.working_path);
+    containerEnvId = matchingEnv.id;
   } else if (options.noWorktree) {
     getLog().info({ cwd }, 'workflow.running_without_isolation');
   } else if (wantsIsolation) {

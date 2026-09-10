@@ -71,6 +71,7 @@ import {
   maybePrintTierNotice,
   resolveContainerBackendConfig,
   hasUnresolvedWriteback,
+  isWorkingPathHostVisible,
   buildNodeSummaries,
   resolveCliExitCode,
   WorkflowRunFailedError,
@@ -12430,5 +12431,27 @@ describe('workflowWaitCommand', () => {
     await expect(workflowWaitCommand(FULL_ID, undefined, '/repo')).rejects.toThrow(
       'Failed to wait for workflow run: database unreachable'
     );
+  });
+});
+
+describe('isWorkingPathHostVisible', () => {
+  it('a repo container env is NOT host-visible — its worktree lives in the WSL distro', () => {
+    expect(isWorkingPathHostVisible('repo', 'container')).toBe(false);
+  });
+
+  it('a FOLDER container env IS host-visible — the overlay merges at the host root', () => {
+    // Both kinds carry provider 'container' since the provider is recorded on the
+    // row, so the provider alone cannot answer this (D3).
+    expect(isWorkingPathHostVisible('folder', 'container')).toBe(true);
+  });
+
+  it('a worktree env is host-visible regardless of kind', () => {
+    expect(isWorkingPathHostVisible('repo', 'worktree')).toBe(true);
+    expect(isWorkingPathHostVisible('folder', 'worktree')).toBe(true);
+  });
+
+  it('no env row means nothing to except — stat it', () => {
+    expect(isWorkingPathHostVisible('repo', undefined)).toBe(true);
+    expect(isWorkingPathHostVisible(undefined, null)).toBe(true);
   });
 });
