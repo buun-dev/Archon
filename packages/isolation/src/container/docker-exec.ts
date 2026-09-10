@@ -76,10 +76,16 @@ export async function dockerCli(
  *
  * Throws a plain `Error` whose message the isolation classifier recognizes
  * (daemon-down / image-missing patterns in `errors.ts`).
+ *
+ * `buildHint` overrides the "how do I get this image" sentence. The folder
+ * backend builds from the in-repo Dockerfile and omits it; the repo-kind WSL
+ * sandbox builds `archon-runner:latest` from its own out-of-repo script, and an
+ * instruction pointing at the wrong Dockerfile is worse than none.
  */
 export async function dockerPreflight(
   image: string,
-  runner: DockerRunner = dockerCli
+  runner: DockerRunner = dockerCli,
+  buildHint?: string
 ): Promise<void> {
   // 1. Daemon reachable. `docker version --format {{.Server.Version}}` errors
   //    with "Cannot connect to the Docker daemon" when the daemon is down.
@@ -108,9 +114,11 @@ export async function dockerPreflight(
     await runner(['image', 'inspect', image], { timeout: 15_000 });
   } catch (err) {
     const detail = extractDockerError(err);
+    const build =
+      buildHint ??
+      `docker build -t ${image} -f packages/isolation/docker/runner.Dockerfile packages/isolation/docker`;
     throw new Error(
-      `No such image: '${image}'. Build the runner image first: ` +
-        `docker build -t ${image} -f packages/isolation/docker/runner.Dockerfile packages/isolation/docker (${detail})`
+      `No such image: '${image}'. Build the runner image first: ${build} (${detail})`
     );
   }
 }

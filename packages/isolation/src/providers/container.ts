@@ -26,6 +26,8 @@
 import { createHash } from 'crypto';
 
 import { execFileAsync, toBranchName, getDefaultBranch, toRepoPath } from '@archon/git';
+
+import { dockerPreflight } from '../container/docker-exec';
 import type {
   ExecutionContext,
   WriteBackApplySummary,
@@ -49,6 +51,10 @@ import { isPRIsolationRequest } from '../types';
  * self-locates via `${BASH_SOURCE[0]}`, so a copy breaks its `SANDBOX_DIR`.
  */
 const SANDBOX_SH = '/mnt/c/Users/Buun/.archon/sandbox/sandbox.sh';
+/** The distro `sandbox.sh` runs in. Hand-synced with `defaultRunSandbox`'s `-d`. */
+const WSL_DISTRO = 'Ubuntu';
+/** The image `compose.yml.tmpl` gives the `agent` service; built by `build-runner.sh`. */
+const RUNNER_IMAGE = 'archon-runner:latest';
 /** Base dir under which sandbox.sh places each repo's worktrees, one subdir per repo. */
 const WORKTREE_ROOT_BASE = '/home/bunny/archon/worktrees';
 /** Container runs as uid 1000 (compose `user: "1000:1000"`); `docker exec` must match. */
@@ -58,6 +64,8 @@ const CONTAINER_EXEC_USER = '1000';
 const SANDBOX_UP_TIMEOUT_MS = 20 * 60 * 1000;
 const SANDBOX_DOWN_TIMEOUT_MS = 5 * 60 * 1000;
 const DOCKER_QUERY_TIMEOUT_MS = 30 * 1000;
+/** The preflight's whole budget is seconds — it must never look like provisioning. */
+const WSL_PROBE_TIMEOUT_MS = 20 * 1000;
 
 interface ExecResult {
   stdout: string;
@@ -69,6 +77,8 @@ type SandboxRunner = (
   extraEnv?: Record<string, string>
 ) => Promise<ExecResult>;
 type DockerRunner = (args: string[], opts: { timeout: number }) => Promise<ExecResult>;
+/** Runs one `bash -c <script>` inside the WSL distro. Used only by the preflight. */
+type WslProbe = (script: string, timeoutMs: number) => Promise<ExecResult>;
 
 /**
  * THE compose-project naming rule — one definition, deliberately exported.
@@ -125,6 +135,123 @@ function defaultDocker(args: string[], opts: { timeout: number }): Promise<ExecR
   return execFileAsync('docker', args, opts);
 }
 
+/** Default WSL probe — one `bash -c` in the distro. Never a login shell (slow). */
+function defaultProbeWsl(script: string, timeoutMs: number): Promise<ExecResult> {
+  return execFileAsync('wsl.exe', ['-d', WSL_DISTRO, '--', 'bash', '-c', script], {
+    timeout: timeoutMs,
+  });
+}
+
+/**
+ * Markers the probe script echoes. Reading OUR OWN tokens out of stdout is what
+ * keeps this off the `classifyIsolationError` prose-matching path: a wsl.exe or
+ * bash rewording cannot change which prerequisite we name. `ARCHON_WSL_OK` is
+ * unconditional, so its presence means the distro answered; `ARCHON_SANDBOX_SH_OK`
+ * is gated on the script's existence. One round trip answers both.
+ */
+const WSL_MARKER = 'ARCHON_WSL_OK';
+const SANDBOX_SH_MARKER = 'ARCHON_SANDBOX_SH_OK';
+/** `if` returns 0 on a false condition, so the probe always exits 0 when the distro is up. */
+const PREREQUISITE_PROBE = `echo ${WSL_MARKER}; if [ -f '${SANDBOX_SH}' ]; then echo ${SANDBOX_SH_MARKER}; fi`;
+
+/**
+ * Named in every refusal. The done-when is "names the setting the operator must
+ * correct", and for all four prerequisites that setting is the same one.
+ */
+const PROVIDER_SETTING_HINT =
+  'This repo asks for container isolation (`isolation.provider: container` in ' +
+  '.archon/config.yaml); set it to `worktree` to run on the host instead.';
+
+/**
+ * Why the WSL probe failed, in as few words as are actually informative.
+ *
+ * Not `extractDockerError`: when `wsl.exe` refuses a distro it writes UTF-16LE that
+ * reaches us as an EMPTY `stderr`, and the fallback — `err.message` — is
+ * `Command failed: wsl.exe -d Ubuntu -- bash -c <the whole probe script>`, which
+ * buries the actionable sentence under an echo of our own command. Verified live
+ * 2026-09-10 against a non-existent distro. So: a real stderr line if there is one,
+ * else the errno (`ENOENT` when wsl.exe is absent, `ETIMEDOUT` on a hung distro),
+ * else nothing.
+ */
+function probeFailureDetail(err: unknown): string {
+  const e = err as Error & { stderr?: string; code?: string | number };
+  const stderr = (e.stderr ?? '').trim();
+  if (stderr) return ` (${stderr.split('\n')[0]})`;
+  return e.code ? ` (${String(e.code)})` : '';
+}
+
+/** Directory `sandbox.sh` self-locates from — also where `build-runner.sh` lives. */
+function sandboxDir(): string {
+  return SANDBOX_SH.replace(/\/[^/]+$/, '');
+}
+
+export interface ContainerPrerequisiteDeps {
+  /** WSL probe runner (tests inject a fake; prod shells `wsl.exe -d Ubuntu`). */
+  probeWsl?: WslProbe;
+  /** Docker CLI runner (tests inject a fake; prod runs the Windows `docker` CLI). */
+  docker?: DockerRunner;
+}
+
+/**
+ * Fail a container dispatch BEFORE anything is created when a prerequisite that
+ * lives outside the repo is absent (#2206: "Unsupported or incomplete
+ * configuration fails before a run starts and names the setting the operator
+ * must correct").
+ *
+ * Four prerequisites, two probes: one `bash -c` in the distro answers both the
+ * distro and the lifecycle script, and `dockerPreflight` — the folder backend's
+ * existing preflight, reused rather than reimplemented — answers the daemon and
+ * the runner image. Present prerequisites cost about a second; `sandbox.sh up`
+ * budgets twenty minutes.
+ *
+ * Deliberately separate from `assertSupported`, which judges the REQUEST (a
+ * `--from` start point, a PR checkout) rather than the environment.
+ */
+export async function assertContainerPrerequisites(
+  deps: ContainerPrerequisiteDeps = {}
+): Promise<void> {
+  const probe = deps.probeWsl ?? defaultProbeWsl;
+  const docker = deps.docker ?? defaultDocker;
+
+  let stdout: string;
+  try {
+    ({ stdout } = await probe(PREREQUISITE_PROBE, WSL_PROBE_TIMEOUT_MS));
+  } catch (err) {
+    throw new Error(
+      `Container isolation is unavailable: the WSL distro '${WSL_DISTRO}' is not reachable` +
+        `${probeFailureDetail(err)}. Install or start it (\`wsl --install -d ${WSL_DISTRO}\`). ` +
+        PROVIDER_SETTING_HINT
+    );
+  }
+  if (!stdout.includes(WSL_MARKER)) {
+    throw new Error(
+      `Container isolation is unavailable: the WSL distro '${WSL_DISTRO}' answered nothing. ` +
+        `Check it with \`wsl -d ${WSL_DISTRO} -- true\`. ` +
+        PROVIDER_SETTING_HINT
+    );
+  }
+  if (!stdout.includes(SANDBOX_SH_MARKER)) {
+    throw new Error(
+      'Container isolation is unavailable: the sandbox lifecycle script is missing at ' +
+        `${SANDBOX_SH} (inside the ${WSL_DISTRO} distro). Restore it there — the whole ` +
+        `${sandboxDir()} directory is required, since the script self-locates from it. ` +
+        PROVIDER_SETTING_HINT
+    );
+  }
+
+  try {
+    await dockerPreflight(
+      RUNNER_IMAGE,
+      (args, options) => docker(args, { timeout: options?.timeout ?? DOCKER_QUERY_TIMEOUT_MS }),
+      `bash ${sandboxDir()}/build-runner.sh`
+    );
+  } catch (err) {
+    throw new Error(
+      `Container isolation is unavailable: ${(err as Error).message} ${PROVIDER_SETTING_HINT}`
+    );
+  }
+}
+
 /**
  * The originating user's git identity, as env for `sandbox.sh`. This provider
  * cannot `git config` the worktree (it's a distro path Windows git can't reach),
@@ -147,6 +274,8 @@ export interface ContainerProviderDeps {
   runSandbox?: SandboxRunner;
   /** Docker CLI runner (tests inject a fake; prod runs the Windows `docker` CLI). */
   docker?: DockerRunner;
+  /** WSL probe runner for the prerequisite preflight (tests inject a fake). */
+  probeWsl?: WslProbe;
 }
 
 export class ContainerProvider implements IIsolationProvider {
@@ -155,18 +284,23 @@ export class ContainerProvider implements IIsolationProvider {
   private readonly loadConfig: RepoConfigLoader;
   private readonly runSandbox: SandboxRunner;
   private readonly docker: DockerRunner;
+  private readonly probeWsl: WslProbe;
 
   constructor(deps: ContainerProviderDeps = {}) {
     this.loadConfig =
       deps.loadConfig ?? ((): Promise<WorktreeCreateConfig | null> => Promise.resolve(null));
     this.runSandbox = deps.runSandbox ?? defaultRunSandbox;
     this.docker = deps.docker ?? defaultDocker;
+    this.probeWsl = deps.probeWsl ?? defaultProbeWsl;
   }
 
   async create(request: IsolationRequest): Promise<IsolatedEnvironment> {
     // Reject before provisioning: `sandbox.sh up` cuts only from the base branch,
     // so an explicit --from or a PR checkout would go green against the WRONG tree.
     this.assertSupported(request);
+    // Then the ENVIRONMENT (slice 4). The request is judged first because a
+    // malformed request is wrong on any machine; the probes cost a round trip.
+    await assertContainerPrerequisites({ probeWsl: this.probeWsl, docker: this.docker });
 
     const repo = basename(request.canonicalRepoPath);
     const slug = this.slugFor(request);

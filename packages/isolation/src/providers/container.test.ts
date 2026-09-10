@@ -6,10 +6,20 @@ import { toBranchName } from '@archon/git';
 /**
  * Fake runners so create() is unit-testable without a real WSL distro / docker
  * daemon. `runSandbox` records every `sandbox.sh` invocation; `docker` answers
- * the `compose -p <project> ps -q agent` container-id resolution.
+ * the `compose -p <project> ps -q agent` container-id resolution; `probeWsl`
+ * answers the slice-4 prerequisite preflight with both markers present.
+ *
+ * `probeWsl` is not optional garnish: without it these tests fall through to
+ * `defaultProbeWsl`, which really shells `wsl.exe -d Ubuntu` — so they would pass
+ * on this machine and fail on any machine without the distro, while proving
+ * nothing about the code either way.
  */
 function makeRunners(containerId = 'container-abc') {
   const calls: { sandbox: string[][]; docker: string[][] } = { sandbox: [], docker: [] };
+  const probeWsl = async (): Promise<{ stdout: string; stderr: string }> => ({
+    stdout: 'ARCHON_WSL_OK\nARCHON_SANDBOX_SH_OK\n',
+    stderr: '',
+  });
   const runSandbox = async (args: string[]): Promise<{ stdout: string; stderr: string }> => {
     calls.sandbox.push(args);
     return { stdout: '', stderr: '' };
@@ -19,7 +29,7 @@ function makeRunners(containerId = 'container-abc') {
     if (args.includes('ps')) return { stdout: `${containerId}\n`, stderr: '' };
     return { stdout: '', stderr: '' };
   };
-  return { calls, runSandbox, docker };
+  return { calls, runSandbox, docker, probeWsl };
 }
 
 const BASE_REQ = {
@@ -31,8 +41,13 @@ const BASE_REQ = {
 
 describe('ContainerProvider.create', () => {
   test('brings up the WSL sandbox and returns a container execContext', async () => {
-    const { calls, runSandbox, docker } = makeRunners();
-    const provider = new ContainerProvider({ runSandbox, docker, loadConfig: async () => null });
+    const { calls, runSandbox, docker, probeWsl } = makeRunners();
+    const provider = new ContainerProvider({
+      runSandbox,
+      docker,
+      probeWsl,
+      loadConfig: async () => null,
+    });
 
     const env = await provider.create({
       ...BASE_REQ,
@@ -55,8 +70,13 @@ describe('ContainerProvider.create', () => {
   });
 
   test('resolves the container id via `docker compose -p <project> ps -q agent`', async () => {
-    const { calls, runSandbox, docker } = makeRunners('cid-xyz');
-    const provider = new ContainerProvider({ runSandbox, docker, loadConfig: async () => null });
+    const { calls, runSandbox, docker, probeWsl } = makeRunners('cid-xyz');
+    const provider = new ContainerProvider({
+      runSandbox,
+      docker,
+      probeWsl,
+      loadConfig: async () => null,
+    });
 
     const env = await provider.create({
       ...BASE_REQ,
@@ -73,10 +93,11 @@ describe('ContainerProvider.create', () => {
   });
 
   test('base precedence: baseOverride wins over repo config and request.baseBranch', async () => {
-    const { calls, runSandbox, docker } = makeRunners();
+    const { calls, runSandbox, docker, probeWsl } = makeRunners();
     const provider = new ContainerProvider({
       runSandbox,
       docker,
+      probeWsl,
       loadConfig: async () => ({ baseBranch: 'develop' }),
     });
 
@@ -93,10 +114,11 @@ describe('ContainerProvider.create', () => {
   });
 
   test('base precedence: repo config wins over request.baseBranch when no override', async () => {
-    const { calls, runSandbox, docker } = makeRunners();
+    const { calls, runSandbox, docker, probeWsl } = makeRunners();
     const provider = new ContainerProvider({
       runSandbox,
       docker,
+      probeWsl,
       loadConfig: async () => ({ baseBranch: 'develop' }),
     });
 
@@ -112,8 +134,13 @@ describe('ContainerProvider.create', () => {
   });
 
   test('rejects an explicit --from start point (sandbox.sh up cuts only from the base)', async () => {
-    const { runSandbox, docker } = makeRunners();
-    const provider = new ContainerProvider({ runSandbox, docker, loadConfig: async () => null });
+    const { runSandbox, docker, probeWsl } = makeRunners();
+    const provider = new ContainerProvider({
+      runSandbox,
+      docker,
+      probeWsl,
+      loadConfig: async () => null,
+    });
 
     await expect(
       provider.create({
@@ -126,8 +153,13 @@ describe('ContainerProvider.create', () => {
   });
 
   test('rejects a PR checkout (sandbox.sh cannot check out a PR)', async () => {
-    const { runSandbox, docker } = makeRunners();
-    const provider = new ContainerProvider({ runSandbox, docker, loadConfig: async () => null });
+    const { runSandbox, docker, probeWsl } = makeRunners();
+    const provider = new ContainerProvider({
+      runSandbox,
+      docker,
+      probeWsl,
+      loadConfig: async () => null,
+    });
 
     await expect(
       provider.create({
@@ -143,8 +175,13 @@ describe('ContainerProvider.create', () => {
 
 describe('ContainerProvider.writeBackBackend (engine port)', () => {
   test('suspend stops the agent for the BOUND working path, ignoring the row id it is handed', async () => {
-    const { calls, runSandbox, docker } = makeRunners();
-    const provider = new ContainerProvider({ runSandbox, docker, loadConfig: async () => null });
+    const { calls, runSandbox, docker, probeWsl } = makeRunners();
+    const provider = new ContainerProvider({
+      runSandbox,
+      docker,
+      probeWsl,
+      loadConfig: async () => null,
+    });
 
     const port = provider.writeBackBackend('/home/bunny/archon/worktrees/marphob-page/task-x');
     // The engine passes an `isolation_environments` row id here, never a path (D5).
@@ -159,8 +196,13 @@ describe('ContainerProvider.writeBackBackend (engine port)', () => {
   });
 
   test('finalize never requests approval — a repo run is already commits on its branch', async () => {
-    const { runSandbox, docker } = makeRunners();
-    const provider = new ContainerProvider({ runSandbox, docker, loadConfig: async () => null });
+    const { runSandbox, docker, probeWsl } = makeRunners();
+    const provider = new ContainerProvider({
+      runSandbox,
+      docker,
+      probeWsl,
+      loadConfig: async () => null,
+    });
 
     const port = provider.writeBackBackend('/home/bunny/archon/worktrees/marphob-page/task-x');
 
@@ -172,8 +214,13 @@ describe('ContainerProvider.writeBackBackend (engine port)', () => {
 
 describe('ContainerProvider.reattach (resume / D8 recovery)', () => {
   test('restarts the agent then rebuilds the execContext from a working path', async () => {
-    const { calls, runSandbox, docker } = makeRunners('cid-resumed');
-    const provider = new ContainerProvider({ runSandbox, docker, loadConfig: async () => null });
+    const { calls, runSandbox, docker, probeWsl } = makeRunners('cid-resumed');
+    const provider = new ContainerProvider({
+      runSandbox,
+      docker,
+      probeWsl,
+      loadConfig: async () => null,
+    });
 
     const env = await provider.reattach('/home/bunny/archon/worktrees/marphob-page/task-x');
 
@@ -198,8 +245,13 @@ describe('ContainerProvider — execution context shape', () => {
   // container context has neither, and this asserts the fork's matches: the whole
   // point of the change is that the two stop diverging.
   test('carries no workdir and no pathMap', async () => {
-    const { runSandbox, docker } = makeRunners();
-    const provider = new ContainerProvider({ runSandbox, docker, loadConfig: async () => null });
+    const { runSandbox, docker, probeWsl } = makeRunners();
+    const provider = new ContainerProvider({
+      runSandbox,
+      docker,
+      probeWsl,
+      loadConfig: async () => null,
+    });
 
     const env = await provider.create({
       ...BASE_REQ,
@@ -211,5 +263,202 @@ describe('ContainerProvider — execution context shape', () => {
     if (env.provider !== 'container') throw new Error('expected a container environment');
     expect(env.execContext.kind).toBe('container');
     expect(Object.keys(env.execContext).sort()).toEqual(['containerId', 'execUser', 'kind']);
+  });
+});
+
+/**
+ * Slice 4 — a repo-kind container run's prerequisites live entirely outside the
+ * repo: the `sandbox.sh` lifecycle script, the Ubuntu distro it runs in, a
+ * reachable Docker daemon, and the runner image compose brings up. None of them
+ * was checked; each surfaced as vendor stderr from `wsl.exe` or `docker`, after
+ * the 20-minute `sandbox.sh up` had already started creating things.
+ *
+ * Every test here asserts the SPY, not just the rejection: a fake that resolves
+ * everything would let `create()` reject for some later reason and prove nothing
+ * about ordering. `calls.sandbox` being empty is the ordering claim.
+ */
+describe('ContainerProvider.create — prerequisite preflight', () => {
+  const REQ = { ...BASE_REQ, workflowType: 'task', identifier: 'pre' } as IsolationRequest;
+
+  test('refuses before sandbox.sh up when the WSL distro is unreachable', async () => {
+    const { calls, runSandbox, docker } = makeRunners();
+    const probeWsl = async (): Promise<{ stdout: string; stderr: string }> => {
+      const err = new Error('Command failed') as Error & { stderr?: string };
+      err.stderr = 'There is no distribution with the supplied name.';
+      throw err;
+    };
+    const provider = new ContainerProvider({
+      runSandbox,
+      docker,
+      probeWsl,
+      loadConfig: async () => null,
+    });
+
+    await expect(provider.create(REQ)).rejects.toThrow(/WSL distro 'Ubuntu'/);
+    expect(calls.sandbox).toHaveLength(0);
+  });
+
+  test('refuses before sandbox.sh up when the lifecycle script is missing', async () => {
+    const { calls, runSandbox, docker } = makeRunners();
+    // The distro answers; the script is not on its filesystem.
+    const probeWsl = async (): Promise<{ stdout: string; stderr: string }> => ({
+      stdout: 'ARCHON_WSL_OK\n',
+      stderr: '',
+    });
+    const provider = new ContainerProvider({
+      runSandbox,
+      docker,
+      probeWsl,
+      loadConfig: async () => null,
+    });
+
+    await expect(provider.create(REQ)).rejects.toThrow(/sandbox\.sh/);
+    expect(calls.sandbox).toHaveLength(0);
+  });
+
+  test('refuses before sandbox.sh up when the Docker daemon is unreachable', async () => {
+    const { calls, runSandbox } = makeRunners();
+    const probeWsl = async (): Promise<{ stdout: string; stderr: string }> => ({
+      stdout: 'ARCHON_WSL_OK\nARCHON_SANDBOX_SH_OK\n',
+      stderr: '',
+    });
+    const docker = async (args: string[]): Promise<{ stdout: string; stderr: string }> => {
+      if (args[0] === 'version') {
+        const err = new Error('Command failed') as Error & { stderr?: string };
+        err.stderr = 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock';
+        throw err;
+      }
+      return { stdout: '', stderr: '' };
+    };
+    const provider = new ContainerProvider({
+      runSandbox,
+      docker,
+      probeWsl,
+      loadConfig: async () => null,
+    });
+
+    await expect(provider.create(REQ)).rejects.toThrow(/Docker daemon/);
+    expect(calls.sandbox).toHaveLength(0);
+  });
+
+  test('refuses before sandbox.sh up when the runner image is absent, naming how to build it', async () => {
+    const { calls, runSandbox } = makeRunners();
+    const probeWsl = async (): Promise<{ stdout: string; stderr: string }> => ({
+      stdout: 'ARCHON_WSL_OK\nARCHON_SANDBOX_SH_OK\n',
+      stderr: '',
+    });
+    const docker = async (args: string[]): Promise<{ stdout: string; stderr: string }> => {
+      if (args[0] === 'image') {
+        const err = new Error('Command failed') as Error & { stderr?: string };
+        err.stderr = 'Error: No such image: archon-runner:latest';
+        throw err;
+      }
+      return { stdout: '', stderr: '' };
+    };
+    const provider = new ContainerProvider({
+      runSandbox,
+      docker,
+      probeWsl,
+      loadConfig: async () => null,
+    });
+
+    const p = provider.create(REQ);
+    await expect(p).rejects.toThrow(/archon-runner:latest/);
+    // Naming the symptom is not enough — name the command that fixes it.
+    await expect(p).rejects.toThrow(/build-runner\.sh/);
+    expect(calls.sandbox).toHaveLength(0);
+  });
+
+  // `wsl.exe` writes UTF-16LE, which reaches us as an EMPTY stderr, so the fallback
+  // detail is `Command failed: wsl.exe -d Ubuntu -- bash -c <the whole probe script>`.
+  // Echoing our own script back at the operator buries the sentence that helps.
+  test('the distro refusal does not echo the probe script back at the operator', async () => {
+    const { runSandbox, docker } = makeRunners();
+    const probeWsl = async (): Promise<{ stdout: string; stderr: string }> => {
+      const err = new Error(
+        "Command failed: wsl.exe -d Ubuntu -- bash -c echo ARCHON_WSL_OK; if [ -f '/x' ]; then echo ARCHON_SANDBOX_SH_OK; fi"
+      ) as Error & { stderr?: string; code?: string };
+      err.stderr = '';
+      err.code = 'ENOENT';
+      throw err;
+    };
+    const provider = new ContainerProvider({
+      runSandbox,
+      docker,
+      probeWsl,
+      loadConfig: async () => null,
+    });
+
+    const message = await provider.create(REQ).then(
+      () => 'resolved',
+      (e: Error) => e.message
+    );
+    expect(message).toContain("WSL distro 'Ubuntu' is not reachable");
+    expect(message).toContain('ENOENT');
+    expect(message).not.toContain('ARCHON_WSL_OK');
+  });
+
+  test('every refusal names the setting the operator must correct', async () => {
+    const { runSandbox, docker } = makeRunners();
+    const probeWsl = async (): Promise<{ stdout: string; stderr: string }> => ({
+      stdout: '',
+      stderr: '',
+    });
+    const provider = new ContainerProvider({
+      runSandbox,
+      docker,
+      probeWsl,
+      loadConfig: async () => null,
+    });
+
+    await expect(provider.create(REQ)).rejects.toThrow(/isolation\.provider/);
+  });
+
+  test('a satisfied prerequisite set costs one WSL probe, then provisions', async () => {
+    const { calls, runSandbox, docker } = makeRunners();
+    let probes = 0;
+    const probeWsl = async (): Promise<{ stdout: string; stderr: string }> => {
+      probes += 1;
+      return { stdout: 'ARCHON_WSL_OK\nARCHON_SANDBOX_SH_OK\n', stderr: '' };
+    };
+    const provider = new ContainerProvider({
+      runSandbox,
+      docker,
+      probeWsl,
+      loadConfig: async () => null,
+    });
+
+    await provider.create(REQ);
+
+    expect(probes).toBe(1);
+    // The preflight's docker cost is the daemon + image pair, nothing heavier.
+    expect(calls.docker.filter(a => a[0] === 'version')).toHaveLength(1);
+    expect(calls.docker.filter(a => a[0] === 'image')).toHaveLength(1);
+    expect(calls.sandbox.find(a => a[0] === 'up')).toBeDefined();
+  });
+
+  test('a rejected REQUEST never reaches the environment probe', async () => {
+    const { runSandbox, docker } = makeRunners();
+    let probes = 0;
+    const probeWsl = async (): Promise<{ stdout: string; stderr: string }> => {
+      probes += 1;
+      return { stdout: 'ARCHON_WSL_OK\nARCHON_SANDBOX_SH_OK\n', stderr: '' };
+    };
+    const provider = new ContainerProvider({
+      runSandbox,
+      docker,
+      probeWsl,
+      loadConfig: async () => null,
+    });
+
+    await expect(
+      provider.create({
+        ...BASE_REQ,
+        workflowType: 'task',
+        identifier: 't',
+        taskBranch: { kind: 'new', fromBranch: toBranchName('feature-x') },
+      } as IsolationRequest)
+    ).rejects.toThrow(/start point/i);
+    expect(probes).toBe(0);
   });
 });

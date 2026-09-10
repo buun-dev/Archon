@@ -69,6 +69,7 @@ export {
   configureIsolation,
   resetIsolationProvider,
   selectIsolationProvider,
+  assertIsolationProviderRecognized,
 } from './factory';
 
 // --- Resolver ---
@@ -79,10 +80,11 @@ export type { IsolationResolverDeps } from './resolver';
 export { WorktreeProvider } from './providers/worktree';
 export {
   ContainerProvider,
+  assertContainerPrerequisites,
   composeProjectFor,
   composeProjectFromWorkingPath,
 } from './providers/container';
-export type { ContainerProviderDeps } from './providers/container';
+export type { ContainerProviderDeps, ContainerPrerequisiteDeps } from './providers/container';
 
 // --- PR state lookup ---
 export { getPrState } from './pr-state';
