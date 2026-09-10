@@ -41,6 +41,7 @@ import {
   readContinuationMode,
   WORKFLOW_SOURCE_METADATA_KEY,
   readWorkflowSourceState,
+  isTerminalRunStatus,
   type ContinuationMode,
 } from './schemas';
 import {
@@ -272,9 +273,17 @@ async function resolveUserGithubEnvForWorkflow(
 }
 
 /**
- * Remove file-delivered credentials left by an earlier invocation of this run.
- * A resume must not keep a readable credential after it has been disconnected
- * or after fresh credential resolution fails.
+ * Remove this run's file-delivered credentials from the host.
+ *
+ * Called at both ends of an invocation, for two different reasons. At run start it
+ * removes what an EARLIER invocation of this run left, so a resume cannot keep a
+ * readable credential after it has been disconnected or after fresh resolution
+ * fails. At run end it removes what THIS invocation delivered, once the run has
+ * reached a status nothing will resume it from — without that second call every
+ * completed run kept its credential on disk forever.
+ *
+ * Always takes the HOST-visible artifacts dir — the engine's own filesystem access,
+ * never the node-visible form a container run's nodes see.
  */
 async function clearManagedProviderCredentialFiles(hostArtifactsDir: string): Promise<void> {
   for (const relativePath of MANAGED_PROVIDER_CREDENTIAL_RELATIVE_PATHS) {
@@ -3415,6 +3424,33 @@ export async function executeWorkflow(
           deps.store.failWorkflowRun(runId, 'Workflow exited without finalizing — see logs'),
           { workflowRunId: runId, site: 'executor.backstop_fail_failed' }
         );
+      }
+      // A file-delivered provider credential outlives the process that wrote it, so
+      // a run that can no longer be resumed must not leave one readable on disk. The
+      // clear at the top of this function only removes what the PREVIOUS invocation
+      // of THIS run left, so a run that completes and is never re-invoked kept its
+      // credential forever.
+      //
+      // The lifecycle point is the run's own status, not this function returning:
+      // `paused` is a live run waiting at a gate whose container is merely suspended,
+      // and it re-enters here on resume. A non-terminal status that is not `paused`,
+      // or no status at all (the read failed), means the record no longer describes
+      // the run — leave the file rather than act on a state we cannot read. The
+      // backstop just made a stuck `running` terminal, so read it as such rather than
+      // re-querying.
+      const exitStatus = backstopStatus === 'running' ? 'failed' : backstopStatus;
+      if (exitStatus && isTerminalRunStatus(exitStatus)) {
+        try {
+          await clearManagedProviderCredentialFiles(hostArtifactsDir);
+        } catch (error) {
+          // Non-fatal, for the same reason the run-start clear's catch is: a cleanup
+          // failure must not replace the result the run already produced. It IS an
+          // unremoved credential, so it logs at ERROR.
+          getLog().error(
+            { err: error as Error, workflowRunId: runId },
+            'workflow.user_provider_files_terminal_cleanup_failed'
+          );
+        }
       }
     }
   }
