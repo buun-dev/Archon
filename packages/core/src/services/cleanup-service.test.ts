@@ -180,12 +180,25 @@ const mockContainerDestroy = mock<ContainerBackend['destroy']>(() => Promise.res
 class MockContainerBackend {
   destroy = mockContainerDestroy;
 }
+const mockProviderDestroy = mock<IIsolationProvider['destroy']>(() =>
+  Promise.resolve({
+    worktreeRemoved: true,
+    branchDeleted: null,
+    remoteBranchDeleted: null,
+    directoryClean: true,
+    warnings: [],
+  })
+);
+class MockContainerProvider {
+  destroy = mockProviderDestroy;
+}
 mock.module('@archon/isolation', () => ({
   getIsolationProvider: () => ({
     destroy: mockDestroy,
   }),
   getPrState: mockGetPrState,
   ContainerBackend: MockContainerBackend,
+  ContainerProvider: MockContainerProvider,
   // Loaded transitively via the orchestrator → child-isolation-resolver (PR-A).
   classifyIsolationError: (err: Error) => err.message,
 }));
@@ -278,6 +291,7 @@ import {
   removeEnvironment,
   onConversationClosed,
   cleanupContainerEnvironments,
+  reclaimContainerEnv,
   SESSION_RETENTION_DAYS,
 } from './cleanup-service';
 
@@ -2409,5 +2423,53 @@ describe('cleanupStaleWorktrees', () => {
       reason: 'run run-live is paused',
     });
     expect(mockGetById).not.toHaveBeenCalled();
+  });
+});
+
+describe('reclaimContainerEnv', () => {
+  beforeEach(() => {
+    mockContainerDestroy.mockClear();
+    mockProviderDestroy.mockClear();
+  });
+
+  test('a REPO container env tears down through the provider, not the folder backend', async () => {
+    mockGetById.mockResolvedValueOnce(
+      makeEnvironment({
+        id: 'env-repo',
+        provider: 'container',
+        working_path: '/home/bunny/archon/worktrees/marphob-page/task-x',
+      })
+    );
+    mockGetCodebase.mockResolvedValueOnce(makeCodebase({ kind: 'repo' }));
+
+    await reclaimContainerEnv('env-repo');
+
+    // The provider is addressed by the worktree path; the folder backend, which
+    // would look for an overlay volume this env has never had, is not called.
+    expect(mockProviderDestroy).toHaveBeenCalledWith(
+      '/home/bunny/archon/worktrees/marphob-page/task-x'
+    );
+    expect(mockContainerDestroy).not.toHaveBeenCalled();
+  });
+
+  test('a FOLDER container env still tears down through the folder backend', async () => {
+    mockGetById.mockResolvedValueOnce(
+      makeEnvironment({ id: 'env-folder', provider: 'container', working_path: '/projects/site' })
+    );
+    mockGetCodebase.mockResolvedValueOnce(makeCodebase({ kind: 'folder' }));
+
+    await reclaimContainerEnv('env-folder');
+
+    expect(mockContainerDestroy).toHaveBeenCalledWith('env-folder');
+    expect(mockProviderDestroy).not.toHaveBeenCalled();
+  });
+
+  test('a missing env row is a no-op, not a throw — the caller has nothing to reclaim', async () => {
+    mockGetById.mockResolvedValueOnce(null);
+
+    await reclaimContainerEnv('env-gone');
+
+    expect(mockContainerDestroy).not.toHaveBeenCalled();
+    expect(mockProviderDestroy).not.toHaveBeenCalled();
   });
 });

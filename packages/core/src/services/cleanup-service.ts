@@ -8,7 +8,12 @@ import * as sessionDb from '../db/sessions';
 import { SessionNotFoundError } from '../db/sessions';
 import * as codebaseDb from '../db/codebases';
 import * as workflowDb from '../db/workflows';
-import { getIsolationProvider, getPrState, ContainerBackend } from '@archon/isolation';
+import {
+  getIsolationProvider,
+  getPrState,
+  ContainerBackend,
+  ContainerProvider,
+} from '@archon/isolation';
 import type { WorktreeStatusBreakdown, PrState, ContainerBackendConfig } from '@archon/isolation';
 import {
   hasUncommittedChanges,
@@ -112,10 +117,30 @@ export interface ContainerCleanupReport {
  * Immediately reclaim (destroy) a single container isolation environment by id —
  * used when a container run is ABANDONED (M2), so its container + upper volume don't
  * linger until the scheduled reaper. Best-effort: throws on a genuine docker failure
- * (the caller surfaces it), a no-op if the row/container is already gone. The
- * placeholder config is unused by `destroy` (see CLEANUP_PLACEHOLDER_CONTAINER_CONFIG).
+ * (the caller surfaces it), a no-op if the row/container is already gone.
+ *
+ * Routes on the CODEBASE KIND, not the row's provider: since the creating provider
+ * is recorded on the row, folder and repo container envs both read
+ * `provider: 'container'`, but they are torn down by different machinery. A repo
+ * env has no overlay volume, so the folder backend would throw on its empty
+ * metadata and the compose stack would survive the cancel.
  */
 export async function reclaimContainerEnv(envId: string): Promise<void> {
+  const row = await isolationEnvDb.getById(envId);
+  if (!row) {
+    getLog().warn({ envId }, 'container_reclaim_row_missing');
+    return;
+  }
+
+  const codebase = await codebaseDb.getCodebase(row.codebase_id);
+  if (codebase?.kind !== 'folder') {
+    // Repo-kind: `sandbox.sh down` composes the stack down and removes the
+    // worktree. Addressed by working path, as every provider method is.
+    await new ContainerProvider().destroy(row.working_path);
+    await isolationEnvDb.updateStatus(envId, 'destroyed');
+    return;
+  }
+
   const backend = new ContainerBackend({
     store: isolationEnvDb.createIsolationStore(),
     config: CLEANUP_PLACEHOLDER_CONTAINER_CONFIG,
