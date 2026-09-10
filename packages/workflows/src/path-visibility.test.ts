@@ -135,6 +135,24 @@ describe('assertRunPathsResolve', () => {
     expect(() => assertRunPathsResolve(flat, 'wsl')).not.toThrow();
   });
 
+  it('accepts a folder-kind container run whose cwd is the host root', () => {
+    // `cwd` is NOT on the host/node axis, and this is the case that proves it. A
+    // repo-kind container run's checkout lives inside the distro
+    // (`/home/<user>/archon/worktrees/...`) and has no host form at all; upstream's
+    // FOLDER container backend returns `codebase.defaultCwd` -- the host root -- and
+    // mounts it at the SAME absolute path inside the container, so a drive-lettered
+    // cwd is correct there and a node opens it by that very string.
+    //
+    // Both take the 'wsl' arm of `execContext.kind === 'container' ? 'wsl' : 'host'`,
+    // so a form check on `cwd` would reject the folder run outright. The backend owns
+    // this path and guarantees its own nodes can open it; the contract declares that
+    // rather than guessing a direction.
+    expect(RUN_PATH_CONTRACT.cwd?.carries).toBe('backend');
+    expect(() =>
+      assertRunPathsResolve(wslPaths({ cwd: 'D:/Projects/ops-folder' }), 'wsl')
+    ).not.toThrow();
+  });
+
   it('declares docsDir off the host/node axis, so a relative value passes', () => {
     // `config.docsPath ?? 'docs/'` is relative to the workspace and resolves on
     // whichever side reads it. Declaring it is the point; converting it would be

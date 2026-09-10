@@ -68,8 +68,14 @@ export interface RunPaths {
  * `'node'` — resolves for the node. On a `'wsl'` run the engine must not open it.
  * `'host'` — resolves for the engine. On a `'wsl'` run a node must not open it.
  * `'relative'` — not on the axis at all; resolves on whichever side reads it.
+ * `'backend'` — the isolation backend produced it and guarantees its own nodes can
+ *   open it, so the FORM is backend-specific and no check applies. Only `cwd` is
+ *   this, and it has to be: a repo-kind container returns a distro path with no host
+ *   form, while upstream's folder container returns the host root mounted at the same
+ *   absolute path. Both are `kind === 'container'`, so any single direction asserted
+ *   here would reject one of them.
  */
-export type PathAxis = 'host' | 'node' | 'relative';
+export type PathAxis = 'host' | 'node' | 'relative' | 'backend';
 
 /** One declared path: the form the field carries, and its opposite-form partner. */
 interface PathDeclaration {
@@ -106,12 +112,19 @@ type RunPathContract = Readonly<Partial<Record<keyof RunPaths, PathDeclaration>>
  */
 export const RUN_PATH_CONTRACT: RunPathContract = {
   /**
-   * Node-visible with NO host sibling, and that is not an omission: a repo-kind
-   * container run's checkout lives inside the distro at `/home/<user>/...`, a path
-   * with no host form at all. Any engine-side filesystem access through `cwd` on
-   * such a run is broken by construction, not by a missing pairing.
+   * Backend-owned, with no sibling and no form check — the one path here the engine
+   * does not resolve. A repo-kind container run's checkout lives inside the distro
+   * at `/home/<user>/archon/worktrees/...`, which has no host form at all; upstream's
+   * FOLDER container backend returns `codebase.defaultCwd`, the host root, bind-mounted
+   * at the SAME absolute path inside the container. Whichever it is, the backend
+   * guarantees a node can open it and the engine must not assume it can.
+   *
+   * Consequence worth naming rather than checking: `snapshotCheckout` runs a HOST
+   * `git status` against this cwd and swallows the failure, so `mutates_checkout:
+   * false` is silently unenforced on a repo-kind container run. Same defect class,
+   * different fix — that call has to route through `execContext`.
    */
-  cwd: { carries: 'node' },
+  cwd: { carries: 'backend' },
   artifactsDir: { carries: 'node', sibling: 'hostArtifactsDir' },
   /**
    * Node-visible with a host sibling for the engine's own pre-create mkdir. The
@@ -166,7 +179,7 @@ function isHostForm(path: string): boolean {
  * the two forms are one string, and demanding a drive letter would fail a run that
  * is entirely correct. Both predicates pass such a path, which is the right answer.
  */
-function checkAxis(field: string, path: string, axis: PathAxis): void {
+function checkAxis(field: string, path: string, axis: CheckableAxis): void {
   if (axis === 'node' && isHostForm(path)) {
     throw new RunPathContractError(
       field,
@@ -184,8 +197,11 @@ function checkAxis(field: string, path: string, axis: PathAxis): void {
   }
 }
 
+/** The two directions the engine resolves, and so the only two it can check. */
+type CheckableAxis = Extract<PathAxis, 'host' | 'node'>;
+
 /** The other side of the axis — derived, so a declaration cannot name it wrongly. */
-function oppositeAxis(axis: PathAxis): PathAxis {
+function oppositeAxis(axis: CheckableAxis): CheckableAxis {
   return axis === 'host' ? 'node' : 'host';
 }
 
@@ -203,7 +219,11 @@ export function assertRunPathsResolve(paths: RunPaths, nodeVisibility: NodeVisib
   if (nodeVisibility === 'host') return;
   for (const field of Object.keys(RUN_PATH_CONTRACT) as (keyof RunPaths)[]) {
     const declaration = RUN_PATH_CONTRACT[field];
-    if (!declaration || declaration.carries === 'relative') continue;
+    if (!declaration) continue;
+    // Neither axis applies: 'relative' resolves wherever it is read, 'backend' is a
+    // form the isolation backend owns. Both are DECLARED so the set is total; only
+    // the two engine-resolved directions are checkable.
+    if (declaration.carries === 'relative' || declaration.carries === 'backend') continue;
     checkAxis(field, paths[field] ?? '', declaration.carries);
     if (!declaration.sibling) continue;
     const sibling = paths[declaration.sibling];
