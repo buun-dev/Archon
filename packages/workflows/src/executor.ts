@@ -76,6 +76,11 @@ import { TerminalStatusWriteError, requireTerminalStatusWrite } from './terminal
 import { isRegisteredProvider, getRegisteredProviders } from '@archon/providers';
 import type { ExecutionContext } from '@archon/providers/types';
 import type { ContainerRunContext } from './container-context';
+import { assertRunPathsResolve, RunPathContractError } from './path-visibility';
+import type { NodeVisibility } from './path-visibility';
+// Re-exported so the package's public `./executor` entry point is unchanged by the
+// type moving to the module that now owns the whole host/node axis.
+export type { NodeVisibility } from './path-visibility';
 export type { ContainerRunContext, ContainerWriteBackBackend } from './container-context';
 // Re-exported so callers driving the capture-first sequence need only this module.
 export {
@@ -398,16 +403,13 @@ async function isFolderCodebase(
 }
 
 /**
- * Where this run's nodes execute, as far as path resolution is concerned.
+ * The run-scoped output directories plus the project root they hang off.
  *
- * `'host'` — nodes see the same filesystem the engine does. Host-visible IS
- * node-visible and nothing is converted.
- * `'wsl'` — nodes execute inside the WSL2 distro (a repo-kind container run), where
- * the engine's `C:\...` paths do not resolve.
+ * Which side of the host/node axis each field resolves on is DECLARED, once, in
+ * `RUN_PATH_CONTRACT` (`path-visibility.ts`), and `executeWorkflow` asserts the
+ * pairing there before the first node runs. The per-field docs below give the
+ * arithmetic behind each direction; the contract is what enforces it.
  */
-export type NodeVisibility = 'host' | 'wsl';
-
-/** The run-scoped output directories plus the project root they hang off. */
 export interface ResolvedProjectPaths {
   artifactsDir: string;
   /** Where this run's frozen workflow source lives — beside `artifactsDir`, never inside it. */
@@ -2552,6 +2554,49 @@ export async function executeWorkflow(
   // directly); `nodePaths` carries the node-visible sibling for the 2
   // `buildExecNodeEnvironment` delivery sites. Undefined on a host run.
   const nodeLogDir = nodePaths?.logDir;
+
+  // Every engine-owned path of the run has to resolve on the side its declaration
+  // names, checked here and once — BEFORE the artifacts mkdir, before `output_root`
+  // is persisted, and before the DAG boundary. Not at the first bad read, because a
+  // bad read is silent: the engine opens a `/mnt/<drive>` string, Windows resolves
+  // it drive-relative, and the write lands in a tree nothing ever scans. Over the
+  // very locals forwarded to the DAG below, so the check covers the handoff and not
+  // just the resolution. A host run returns from the first line of the assert.
+  try {
+    assertRunPathsResolve(
+      {
+        cwd,
+        artifactsDir,
+        hostArtifactsDir,
+        stateDir,
+        hostStateDir,
+        logDir,
+        nodeLogDir,
+        outputRoot,
+        docsDir,
+      },
+      nodeVisibility
+    );
+  } catch (error) {
+    if (!(error instanceof RunPathContractError)) throw error;
+    // Same treatment as an unwritable artifacts directory below: an unusable path
+    // layout is a pre-execution fatal, and the row must reach a terminal status
+    // rather than sit `running` with no owner.
+    getLog().error(
+      { err: error, field: error.field, workflowRunId: workflowRun.id, nodeVisibility },
+      'workflow.run_path_contract_violated'
+    );
+    await sendCriticalMessage(
+      platform,
+      conversationId,
+      `❌ **Workflow failed**: run path contract violated — ${error.message}`
+    );
+    await requireTerminalStatusWrite(deps.store.failWorkflowRun(workflowRun.id, error.message), {
+      workflowRunId: workflowRun.id,
+      site: 'workflow.run_path_contract_fail_db_record_failed',
+    });
+    return { success: false, workflowRunId: workflowRun.id, error: error.message };
+  }
 
   // Record the resolved root ONCE, so every later reader (artifact routes, CLI)
   // addresses this run's output by a durable pointer instead of re-deriving it

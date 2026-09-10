@@ -97,6 +97,10 @@ import { toNodeVisiblePath as realToNodeVisiblePath } from '../../paths/src/wsl-
 // Hoisted so the node-visibility tests can swap in a drive-lettered storage root
 // (the fake tree above is rooted at WS, which has none) and restore it after.
 const mockGetProjectStoragePaths = mock(fakeGetProjectStoragePaths);
+// Indirected through a swappable delegate so the run-path-contract test can
+// neutralise the rewrite and prove the dispatch guard catches a container run whose
+// paths were never converted to the node form.
+let toNodeVisibleImpl: (path: string) => string = realToNodeVisiblePath;
 
 mock.module('@archon/paths', () => ({
   createLogger: mock(() => mockLogger),
@@ -108,7 +112,7 @@ mock.module('@archon/paths', () => ({
   resolveProjectStorageKey: mock(fakeResolveProjectStorageKey),
   getProjectStoragePaths: mockGetProjectStoragePaths,
   getStoragePathsForRoot: mock(fakeStoragePathsForRoot),
-  toNodeVisiblePath: mock(realToNodeVisiblePath),
+  toNodeVisiblePath: mock((path: string) => toNodeVisibleImpl(path)),
   // The fake tree is rooted at WS, so that is this suite's ARCHON_HOME.
   isInsideArchonHome: mock((candidate: string) => candidate.startsWith(WS)),
   slugifyFolderName: mock((name: string) => name),
@@ -3379,6 +3383,59 @@ describe('executeWorkflow', () => {
           join(realToNodeVisiblePath(hostArtifactsDir), PI_AUTH_JSON_RELATIVE_PATH)
         );
       });
+
+      // The pairing `resolveProjectPaths` produces is only useful if it survives to
+      // the DAG boundary, because that is where all nine fallback readers read it:
+      // `hostArtifactsDir ?? artifactsDir` is correct only because the host form is
+      // actually there, and `nodeLogDir ?? logDir` delivers a usable $LOG_DIR only
+      // because the node form is. Asserted against the rewrite applied to the host
+      // root rather than a literal `/mnt/` prefix, so it neither passes vacuously
+      // nor fails wrongly on a CI root with no drive letter.
+      it('forwards both forms of every paired path to the DAG boundary', async () => {
+        const backend = {
+          suspend: mock(async () => {}),
+          finalize: mock(async () => ({ requiresApproval: false })),
+          applyChanges: mock(async () => ({ filesApplied: 0, filesDeleted: 0, warnings: [] })),
+          discardChanges: mock(async () => {}),
+        };
+        const store = makeStore({
+          getWorkflowRun: mock(async () => ({
+            ...makeRun({ id: 'crun-paths' }),
+            status: 'paused' as const,
+          })),
+          getWorkflowRunStatus: mock(async () => 'paused' as const),
+        });
+
+        await executeWorkflow(
+          makeDeliveringDeps(store),
+          makePlatform(),
+          'conv-1',
+          '/tmp/ops',
+          makeWorkflow(),
+          'msg',
+          'db-conv-1',
+          {
+            preCreatedRun: makeRun({
+              id: 'crun-paths',
+              metadata: { isolation: 'container', isolation_env_id: 'env-paths' },
+            }),
+            priorCompletedNodes: new Map([['node1', { output: 'out' }]]),
+            execContext: { kind: 'container', containerId: 'cid' },
+            container: { envId: 'env-paths', writeBack: 'approve', backend },
+          }
+        );
+
+        const ctx = mockExecuteDagWorkflow.mock.calls[0]?.[0];
+        const hostArtifacts = join(hostRoot, 'artifacts', 'runs', 'crun-paths');
+        expect(ctx?.hostArtifactsDir).toBe(hostArtifacts);
+        expect(ctx?.artifactsDir).toBe(realToNodeVisiblePath(hostArtifacts));
+        expect(ctx?.stateDir).toBe(realToNodeVisiblePath(join(hostRoot, 'state')));
+        // logDir points the OTHER way: host-visible for the engine's own ~32
+        // transcript writes and its read-back through getRunLogPathForRoot, with the
+        // node form alongside it purely for the two $LOG_DIR delivery sites.
+        expect(ctx?.logDir).toBe(join(hostRoot, 'logs'));
+        expect(ctx?.nodeLogDir).toBe(realToNodeVisiblePath(join(hostRoot, 'logs')));
+      });
     });
   });
 
@@ -5078,6 +5135,66 @@ describe('resolveProjectPaths', () => {
         expect(paths.outputRoot).not.toStartWith('/mnt/');
       });
     });
+  });
+});
+
+/**
+ * The run path contract, enforced at dispatch (slice 3).
+ *
+ * `resolveProjectPaths` producing a total pairing is one thing; the run reaching its
+ * first node with that pairing intact is another, and every reader reads the second.
+ * A run whose pairing is incomplete has to fail BEFORE the DAG, because a reader
+ * that picks the wrong form does not fail at all -- it writes into a
+ * `<drive>:\mnt\...` tree nobody ever looks at, which is how a provider
+ * credential leaked for eight weeks.
+ */
+describe('run path contract at dispatch', () => {
+  beforeEach(() => {
+    // This describe sits outside the `executeWorkflow` block that clears it, and the
+    // assertion below is that the DAG was never reached at all.
+    mockExecuteDagWorkflow.mockClear();
+  });
+
+  afterEach(() => {
+    mockGetProjectStoragePaths.mockImplementation(fakeGetProjectStoragePaths);
+    toNodeVisibleImpl = realToNodeVisiblePath;
+  });
+
+  it('fails a container run whose paths were never converted, before the DAG starts', async () => {
+    // The whole defect class in one arrangement: a container run holding host-form
+    // paths. Nothing downstream would complain -- nodes would receive `C:\...` and
+    // fail one at a time, or worse succeed against a path that happens to exist.
+    //
+    // The root is a literal drive-lettered path that does NOT exist, which is
+    // deliberate twice over: the fake tree has no drive letter, so both forms would
+    // be one string and the arrangement would be undetectable; and the guard has to
+    // fire before the artifacts mkdir, so an EPERM in this message would mean the
+    // check sits too late to be the pre-execution check it claims to be.
+    mockGetProjectStoragePaths.mockImplementation(() =>
+      fakeStoragePathsForRoot(join('C:/', 'Users', 'Test', 'ArchonHome', '_cwd', 'ops'))
+    );
+    toNodeVisibleImpl = path => path;
+    const failSpy = mock(async () => {});
+    const store = makeStore({ failWorkflowRun: failSpy });
+
+    const result = await executeWorkflow(
+      makeDeps(store),
+      makePlatform(),
+      'conv-1',
+      '/tmp/ops',
+      makeWorkflow(),
+      'msg',
+      'db-conv-1',
+      { execContext: { kind: 'container', containerId: 'cid-paths' } }
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.success === false && result.error).toContain('artifactsDir');
+    expect(result.success === false && result.error).toContain('node-visible');
+    // Before the first node, not at the first bad read.
+    expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
+    // And the row reaches a terminal status rather than sitting `running` forever.
+    expect(failSpy).toHaveBeenCalled();
   });
 });
 
