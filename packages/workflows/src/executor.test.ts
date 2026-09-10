@@ -3306,6 +3306,80 @@ describe('executeWorkflow', () => {
         await expect(readFile(piAuthPath, 'utf8')).rejects.toThrow();
       });
     });
+
+    describe('on a container run', () => {
+      // A container run's `artifactsDir` is node-visible (`/mnt/<drive>/...`), which
+      // Windows resolves drive-relative -- so an engine write through it materialises
+      // a stray `<cwd-drive>:\mnt\...` tree that no cleanup ever scans. The engine's
+      // own write must use the host-visible sibling, the same root
+      // `clearManagedProviderCredentialFiles` is handed. Needs a REAL drive-lettered
+      // storage root to tell the two apart, so the fake tree (rooted at WS, which has
+      // no drive letter) is redirected at a temp dir for these tests only.
+      let hostRoot: string;
+
+      beforeEach(async () => {
+        hostRoot = await mkdtemp(join(tmpdir(), 'archon-cred-host-'));
+        mockGetProjectStoragePaths.mockImplementation(() => fakeStoragePathsForRoot(hostRoot));
+      });
+
+      afterEach(async () => {
+        mockGetProjectStoragePaths.mockImplementation(fakeGetProjectStoragePaths);
+        await removeTempTree(hostRoot);
+      });
+
+      it('writes the credential under the host artifacts dir, and delivers the node-visible path', async () => {
+        const backend = {
+          suspend: mock(async () => {}),
+          finalize: mock(async () => ({ requiresApproval: false })),
+          applyChanges: mock(async () => ({ filesApplied: 0, filesDeleted: 0, warnings: [] })),
+          discardChanges: mock(async () => {}),
+        };
+        // Paused, so the credential is still on disk to be located -- a terminal
+        // container run clears it, which the host-run test above already covers.
+        const store = makeStore({
+          getWorkflowRun: mock(async () => ({
+            ...makeRun({ id: 'crun-cred' }),
+            status: 'paused' as const,
+          })),
+          getWorkflowRunStatus: mock(async () => 'paused' as const),
+        });
+
+        await executeWorkflow(
+          makeDeliveringDeps(store),
+          makePlatform(),
+          'conv-1',
+          '/tmp/ops',
+          makeWorkflow(),
+          'msg',
+          'db-conv-1',
+          {
+            // `executionUserId` comes from the ROW, not the transient opt (see
+            // 'uses the persisted user identity' above) -- without it the delivery
+            // is skipped and the test would go green for the wrong reason.
+            preCreatedRun: makeRun({
+              id: 'crun-cred',
+              user_id: 'u-1',
+              metadata: { isolation: 'container', isolation_env_id: 'env-cred' },
+            }),
+            priorCompletedNodes: new Map([['node1', { output: 'out' }]]),
+            execContext: { kind: 'container', containerId: 'cid' },
+            container: { envId: 'env-cred', writeBack: 'approve', backend },
+            userId: 'u-1',
+          }
+        );
+
+        const hostArtifactsDir = join(hostRoot, 'artifacts', 'runs', 'crun-cred');
+        expect(await readFile(join(hostArtifactsDir, PI_AUTH_JSON_RELATIVE_PATH), 'utf8')).toBe(
+          CREDENTIAL
+        );
+        // The env beside it still points a NODE at the file, so the two halves of the
+        // delivery address the same bytes from opposite sides of the boundary.
+        const configArg = mockExecuteDagWorkflow.mock.calls[0]?.[0].config;
+        expect(configArg?.envVars?.ARCHON_PI_AUTH_PATH).toBe(
+          join(realToNodeVisiblePath(hostArtifactsDir), PI_AUTH_JSON_RELATIVE_PATH)
+        );
+      });
+    });
   });
 
   // -------------------------------------------------------------------------

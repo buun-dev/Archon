@@ -5,7 +5,7 @@ import { RUN_GRAPH_METADATA_KEY, runGraphSchema } from './schemas/terminal-recor
 import { mkdir, readdir, rename, rm, stat, writeFile } from 'fs/promises';
 import { randomUUID } from 'crypto';
 import { existsSync } from 'fs';
-import { dirname, join } from 'path';
+import { dirname, isAbsolute, join, relative, sep } from 'path';
 import { MANAGED_PROVIDER_CREDENTIAL_RELATIVE_PATHS } from './deps';
 import type { IWorkflowPlatform, WorkflowMessageMetadata } from './deps';
 import type { WorkflowDeps } from './deps';
@@ -282,13 +282,44 @@ async function resolveUserGithubEnvForWorkflow(
  * reached a status nothing will resume it from — without that second call every
  * completed run kept its credential on disk forever.
  *
- * Always takes the HOST-visible artifacts dir — the engine's own filesystem access,
- * never the node-visible form a container run's nodes see.
+ * Always takes the HOST-visible artifacts dir: on a container run the node-visible
+ * form would resolve drive-relative under Windows and scan a directory the engine
+ * never wrote to (see {@link toHostCredentialFilePath}).
  */
 async function clearManagedProviderCredentialFiles(hostArtifactsDir: string): Promise<void> {
   for (const relativePath of MANAGED_PROVIDER_CREDENTIAL_RELATIVE_PATHS) {
     await rm(join(hostArtifactsDir, relativePath), { force: true });
   }
+}
+
+/**
+ * Host-visible target for a credential file the delivery map placed under the
+ * run's artifacts directory.
+ *
+ * `getUserProviderEnv` builds every `files[].path` from the NODE-visible
+ * `artifactsDir`, because the env var delivered beside it (`CODEX_HOME`,
+ * `ARCHON_PI_AUTH_PATH`) is what a node opens the file by, and the two must name
+ * the same bytes. Writing those bytes, though, is the ENGINE's own filesystem
+ * access — exactly what `hostPaths` exists for. On a container run the node form
+ * is `/mnt/<drive>/...`, which Windows resolves drive-relative: the write lands in
+ * a literal `<cwd-drive>:\mnt\<drive>\...` tree, leaving a readable credential in
+ * a directory `clearManagedProviderCredentialFiles` — handed the host root — never
+ * scans.
+ *
+ * This re-roots between two forms the caller already holds; it is not a third
+ * `toNodeVisiblePath` call site (see that function's doc). A delivery outside
+ * `artifactsDir` is outside the `getUserProviderEnv` contract and is written
+ * verbatim, exactly as before.
+ */
+function toHostCredentialFilePath(
+  filePath: string,
+  artifactsDir: string,
+  hostArtifactsDir: string
+): string {
+  if (artifactsDir === hostArtifactsDir) return filePath;
+  const rel = relative(artifactsDir, filePath);
+  if (!rel || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return filePath;
+  return join(hostArtifactsDir, rel);
 }
 
 /**
@@ -308,7 +339,8 @@ async function clearManagedProviderCredentialFiles(hostArtifactsDir: string): Pr
 async function resolveUserProviderEnvForWorkflow(
   deps: WorkflowDeps,
   userId: string | undefined,
-  artifactsDir: string
+  artifactsDir: string,
+  hostArtifactsDir: string
 ): Promise<{ env: Record<string, string>; protectedValues: string[] }> {
   const perUserEnabled = deps.isPerUserProviderKeysEnabled?.() ?? false;
   if (!perUserEnabled || !userId || !deps.getUserProviderEnv) {
@@ -325,8 +357,9 @@ async function resolveUserProviderEnvForWorkflow(
   const { env, files, protectedValues } = resolved;
   try {
     for (const f of files) {
-      await mkdir(dirname(f.path), { recursive: true });
-      await writeFile(f.path, f.contents, { encoding: 'utf8', mode: 0o600 });
+      const hostPath = toHostCredentialFilePath(f.path, artifactsDir, hostArtifactsDir);
+      await mkdir(dirname(hostPath), { recursive: true });
+      await writeFile(hostPath, f.contents, { encoding: 'utf8', mode: 0o600 });
     }
   } catch (err) {
     getLog().warn({ err: err as Error, userId }, 'workflow.user_provider_files_write_failed');
@@ -2948,7 +2981,8 @@ export async function executeWorkflow(
   const { env: userProviderEnv, protectedValues } = await resolveUserProviderEnvForWorkflow(
     deps,
     executionUserId,
-    artifactsDir
+    artifactsDir,
+    hostArtifactsDir
   );
   config.envVars = { ...config.envVars, ...userProviderEnv };
   for (const key of Object.keys(userProviderEnv)) {
