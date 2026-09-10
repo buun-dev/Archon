@@ -45,7 +45,13 @@ import {
   resolveFolderBackend,
   classifyIsolationError,
 } from '@archon/isolation';
-import type { ExecutionContext, ContainerBackend, ContainerBackendConfig } from '@archon/isolation';
+import type {
+  ExecutionContext,
+  ContainerBackend,
+  ContainerBackendConfig,
+  ContainerProvider,
+  IIsolationProvider,
+} from '@archon/isolation';
 import type { TaskBranchSelection } from '@archon/isolation';
 import {
   createLogger,
@@ -87,6 +93,7 @@ import {
   type CapturedSourceOwner,
   type PreparedWorkflowSource,
   type ResolvedContinuation,
+  type ContainerWriteBackBackend,
 } from '@archon/workflows/executor';
 import {
   assertComposedGateDriveable,
@@ -440,6 +447,25 @@ export function resolveContainerBackendConfig(
 export function hasUnresolvedWriteback(metadata: Record<string, unknown> | undefined): boolean {
   if (!metadata) return false;
   return metadata.pending_writeback !== undefined && metadata.writeback_resolved !== true;
+}
+
+/**
+ * Structural narrowing to the container provider's engine-facing methods.
+ *
+ * `selectIsolationProvider` is declared to return `IIsolationProvider`, which
+ * carries neither method. Nominal narrowing (`instanceof ContainerProvider`)
+ * cannot be used: the CLI suite mocks `@archon/isolation` and its container
+ * double is an object literal, so `instanceof` is false for a provider that is
+ * otherwise the real container shape. This matches how the file already narrows
+ * (`isContainerEnvironment` keys on `env.provider`).
+ */
+function isContainerCapableProvider(
+  provider: IIsolationProvider
+): provider is IIsolationProvider & Pick<ContainerProvider, 'reattach' | 'writeBackBackend'> {
+  const candidate = provider as Partial<Pick<ContainerProvider, 'reattach' | 'writeBackBackend'>>;
+  return (
+    typeof candidate.writeBackBackend === 'function' && typeof candidate.reattach === 'function'
+  );
 }
 
 /**
@@ -2427,6 +2453,11 @@ async function runWorkflowWithOwnedSource(
   // Overlay mode the backend actually mounted (fuse = unprivileged; native =
   // CAP_SYS_ADMIN, gate-bypassable). Threaded to the engine for the H4 run-start warning.
   let containerOverlayMode: 'fuse' | 'native' | undefined;
+  // The engine-facing write-back port, set by BOTH the folder and repo container
+  // branches — unlike `containerBackend`, which stays folder-only because it also
+  // drives auto-teardown (D6): tearing a repo run down would delete the worktree
+  // and branch its PR is opened from.
+  let containerWriteBack: ContainerWriteBackBackend | undefined;
 
   // Between-run continuation (#2747): resolve the declared adoption BEFORE any
   // lane decision — it dictates the lane, fail-loud (never a silent fresh
@@ -2735,6 +2766,7 @@ async function runWorkflowWithOwnedSource(
       workingCwd = prepared.cwd;
       execContext = prepared.execContext;
       containerBackend = backend;
+      containerWriteBack = backend;
       containerEnvId = prepared.envId;
       containerOverlayMode = prepared.overlayMode;
       isolationEnvId = prepared.envId;
@@ -2885,6 +2917,17 @@ async function runWorkflowWithOwnedSource(
       // leave execContext at its 'host' default.
       if (isContainerEnvironment(isolatedEnv)) {
         execContext = isolatedEnv.execContext;
+        // The engine's resume guard (executor.ts) refuses any run stamped
+        // isolation: 'container' that arrives without this context. The port is
+        // bound to the worktree path; the env id below stays the DB row id (D5).
+        if (!isContainerCapableProvider(provider)) {
+          throw new Error(
+            'A container environment was created by a provider without the container ' +
+              'write-back port. This is a build inconsistency; start a fresh run instead.'
+          );
+        }
+        containerWriteBack = provider.writeBackBackend(isolatedEnv.workingPath);
+        containerEnvId = envRecord.id;
       }
       getLog().info({ path: workingCwd }, 'worktree_created');
     }
@@ -3196,11 +3239,11 @@ async function runWorkflowWithOwnedSource(
     // env id + policy. The executor drives suspend-on-pause and the write-back gate
     // through this. Absent for host/in-place runs.
     const containerRunCtx =
-      containerBackend && containerEnvId
+      containerWriteBack && containerEnvId
         ? {
             envId: containerEnvId,
             writeBack: workflow.container?.write_back ?? ('approve' as const),
-            backend: containerBackend,
+            backend: containerWriteBack,
             ...(containerOverlayMode ? { overlayMode: containerOverlayMode } : {}),
           }
         : undefined;

@@ -243,6 +243,13 @@ const mockSelectIsolationProvider = mock((providerType?: string) =>
           })
         ),
         healthCheck: mock(() => Promise.resolve(true)),
+        writeBackBackend: mock(() => ({
+          suspend: mock(() => Promise.resolve()),
+          finalize: mock(() => Promise.resolve({ requiresApproval: false })),
+          applyChanges: mock(() => Promise.reject(new Error('no overlay write-back'))),
+          discardChanges: mock(() => Promise.reject(new Error('no overlay write-back'))),
+        })),
+        reattach: mock(() => Promise.reject(new Error('reattach not stubbed for this test'))),
       }
     : mockGetIsolationProvider()
 );
