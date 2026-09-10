@@ -784,6 +784,25 @@ describe('archon-paths', () => {
     test('rejects an untrusted root when no codebase can re-derive it', () => {
       expect(resolveRunStorageRoot({ output_root: '/etc' }, null)).toBeNull();
     });
+
+    // The reader half of `logDir`'s deliberate asymmetry. The engine writes a run's
+    // transcript HOST-side and reads it back through
+    // `getRunLogPathForRoot(resolveRunStorageRoot(...), id)` -- which is why
+    // `composeRunPaths` leaves `logDir` host-visible on a container run and produces
+    // a node-visible sibling only for the two $LOG_DIR delivery sites. A
+    // node-visible root reaching this reader would point `archon run get` at a
+    // Windows drive-relative path and return nothing for every container run, so it
+    // is refused here as well: the `isInsideArchonHome` gate is what makes writer
+    // and reader provably the same filesystem.
+    test('refuses a node-visible root, so a container run reads its transcript host-side', () => {
+      const nodeVisibleRoot = '/mnt/c/custom/archon/workspaces/acme/widget';
+      const codebase = { kind: 'repo', name: 'acme/widget', default_cwd: '/repos/widget' };
+
+      const root = resolveRunStorageRoot({ output_root: nodeVisibleRoot }, codebase);
+
+      expect(root).toBe(join('/custom/archon', 'workspaces', 'acme', 'widget'));
+      expect(getRunLogPathForRoot(root as string, 'run-1')).not.toStartWith('/mnt/');
+    });
   });
 
   describe('getRunArtifactsDirForKey', () => {

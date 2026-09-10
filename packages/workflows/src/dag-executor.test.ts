@@ -17584,6 +17584,75 @@ describe('executeDagWorkflow -- script nodes', () => {
     expect(prompt).not.toContain('$WORKFLOW_ID');
   });
 
+  it('$LOG_DIR delivers the node-visible logDir, not the host-visible one the engine writes', async () => {
+    // `logDir` is the one run path that stays HOST-visible on a container run: the
+    // engine's ~32 transcript writes use it directly, and it reads the transcript
+    // back through getRunLogPathForRoot, so converting it split writer from reader
+    // and made `archon run get` return nothing for every container run.
+    //
+    // The two `buildExecNodeEnvironment` sites are the exception, and they are why
+    // `nodePaths.logDir` exists at all: a node handed `C:\...` cannot open it.
+    // Nothing else in the tree reads `nodeLogDir`, so dropping the `?? ` fallback's
+    // left-hand side here would be invisible -- the delivery would keep working on
+    // every host run and quietly hand containers a path they cannot use.
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('wf-nodelogdir', {
+      workflow_name: 'node-log-dir-test',
+      conversation_id: 'conv-nodelogdir',
+      user_message: 'node log dir test',
+    });
+
+    const logDir = join(testDir, 'logs');
+    // A literal, not a derived value: on a POSIX fixture root the two forms would be
+    // the same string and the assertion would hold whichever one was delivered.
+    const nodeLogDir = '/mnt/c/fixture/logs';
+    const commandsDir = join(testDir, '.archon', 'commands');
+    await mkdir(commandsDir, { recursive: true });
+    await writeFile(
+      join(commandsDir, 'check-logdir.md'),
+      'script=$from-script.output bash=$from-bash.output'
+    );
+
+    const nodes: DagNode[] = [
+      // One node per delivery site -- executeScriptNode and executeBashNode each
+      // build their own env bag. Both read the env var and neither body carries a
+      // literal `$LOG_DIR`, so the textual substitution path cannot make this pass.
+      {
+        id: 'from-script',
+        kind: 'exec',
+        script: 'console.log(process.env.LOG_DIR)',
+        runtime: 'bun',
+      },
+      { id: 'from-bash', kind: 'exec', runtime: 'sh', script: 'printf %s "${LOG_DIR}"' },
+      {
+        id: 'check',
+        kind: 'agent',
+        source: { kind: 'command', name: 'check-logdir' },
+        depends_on: ['from-script', 'from-bash'],
+      },
+    ];
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: mockDeps,
+        platform,
+        conversationId: 'conv-nodelogdir',
+        cwd: testDir,
+        workflow: { name: 'node-log-dir', nodes },
+        workflowRun,
+        logDir,
+        nodeLogDir,
+      })
+    );
+
+    expect(mockSendQueryDag.mock.calls.length).toBe(1);
+    const prompt = mockSendQueryDag.mock.calls[0][0] as string;
+    expect(prompt).toContain(`script=${nodeLogDir}`);
+    expect(prompt).toContain(`bash=${nodeLogDir}`);
+    expect(prompt).not.toContain(logDir);
+  });
+
   it('STATE_DIR reaches script and bash subprocesses as an env var, not just as text', async () => {
     // The textual `$STATE_DIR` path is protected by the fail-fast in
     // executor-shared (referenced-but-unresolved throws). The ENV-BAG path is
