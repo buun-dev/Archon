@@ -141,36 +141,32 @@ describe('ContainerProvider.create', () => {
   });
 });
 
-describe('ContainerProvider.writeBackBackend (engine container-run port)', () => {
-  const ENV_ID = '/home/bunny/archon/worktrees/marphob-page/task-x';
-
-  test('suspend stops the compose agent service (pause economics; reattach restarts it)', async () => {
+describe('ContainerProvider.writeBackBackend (engine port)', () => {
+  test('suspend stops the agent for the BOUND working path, ignoring the row id it is handed', async () => {
     const { calls, runSandbox, docker } = makeRunners();
     const provider = new ContainerProvider({ runSandbox, docker, loadConfig: async () => null });
 
-    await provider.writeBackBackend().suspend(ENV_ID);
+    const port = provider.writeBackBackend('/home/bunny/archon/worktrees/marphob-page/task-x');
+    // The engine passes an `isolation_environments` row id here, never a path (D5).
+    await port.suspend('env-row-01H8XYZ');
 
     const stop = calls.docker.find(a => a.includes('stop'));
     expect(stop).toContain('-p');
     expect(stop).toContain('archon-marphob-page-task-x');
     expect(stop).toContain('agent');
+    // The row id must never reach the compose project name.
+    expect(stop?.join(' ')).not.toContain('env-row-01H8XYZ');
   });
 
-  test('finalize never requests approval — a worktree branch has no overlay to write back', async () => {
+  test('finalize never requests approval — a repo run is already commits on its branch', async () => {
     const { runSandbox, docker } = makeRunners();
     const provider = new ContainerProvider({ runSandbox, docker, loadConfig: async () => null });
 
-    await expect(provider.writeBackBackend().finalize(ENV_ID)).resolves.toEqual({
-      requiresApproval: false,
-    });
-  });
+    const port = provider.writeBackBackend('/home/bunny/archon/worktrees/marphob-page/task-x');
 
-  test('applyChanges and discardChanges are unreachable for repo-kind runs and reject loudly', async () => {
-    const { runSandbox, docker } = makeRunners();
-    const provider = new ContainerProvider({ runSandbox, docker, loadConfig: async () => null });
-
-    await expect(provider.writeBackBackend().applyChanges(ENV_ID)).rejects.toThrow(/write-back/i);
-    await expect(provider.writeBackBackend().discardChanges(ENV_ID)).rejects.toThrow(/write-back/i);
+    expect(await port.finalize('env-row-01H8XYZ')).toEqual({ requiresApproval: false });
+    await expect(port.applyChanges('env-row-01H8XYZ')).rejects.toThrow(/no overlay write-back/);
+    await expect(port.discardChanges('env-row-01H8XYZ')).rejects.toThrow(/no overlay write-back/);
   });
 });
 

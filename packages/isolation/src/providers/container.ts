@@ -195,18 +195,21 @@ export class ContainerProvider implements IIsolationProvider {
    * working path WITHOUT re-running `sandbox.sh up` (no re-provision). Throws if
    * the stack is gone (torn down); a resume then cannot continue in-container.
    */
-  async reattach(envId: string): Promise<ContainerEnvironment> {
-    const { repo, slug } = repoSlugFromWorkingPath(envId);
+  async reattach(workingPath: string): Promise<ContainerEnvironment> {
+    const { repo, slug } = repoSlugFromWorkingPath(workingPath);
     const project = composeProjectFor(repo, slug);
     const containerId = await this.resolveContainerId(project);
-    return this.buildEnv(slug, envId, project, containerId);
+    return this.buildEnv(slug, workingPath, project, containerId);
   }
 
   /**
    * Engine-facing container-run port (structural `ContainerWriteBackBackend`,
    * Phase C). The executor's resume guard requires a `container` context for any
    * run stamped `isolation: 'container'`; this is the repo-kind implementation.
-   * A repo-kind sandbox writes straight to its git worktree branch — there is no
+   * The working path is bound here at construction; the `envId` each closure
+   * receives is the engine's `isolation_environments` row id (D5) and is unused
+   * — the compose stack is addressed by the bound path, not by that id. A
+   * repo-kind sandbox writes straight to its git worktree branch — there is no
    * overlay diff to gate — so `finalize` never requests approval, which makes
    * `applyChanges`/`discardChanges` unreachable (defensive rejects). `suspend`
    * genuinely stops the agent service (pause economics); `reattach()`'s
@@ -215,18 +218,20 @@ export class ContainerProvider implements IIsolationProvider {
    * folder teardown paths (which would `sandbox.sh down` the worktree) cannot
    * engage.
    */
-  writeBackBackend(): {
+  writeBackBackend(workingPath: string): {
     suspend(envId: string): Promise<void>;
     finalize(envId: string): Promise<WriteBackFinalizeResult>;
     applyChanges(envId: string): Promise<WriteBackApplySummary>;
     discardChanges(envId: string): Promise<void>;
   } {
+    const project = composeProjectFromWorkingPath(workingPath);
     return {
-      suspend: async (envId: string): Promise<void> => {
-        await this.docker(
-          ['compose', '-p', composeProjectFromWorkingPath(envId), 'stop', 'agent'],
-          { timeout: DOCKER_QUERY_TIMEOUT_MS }
-        );
+      // The engine hands us its `isolation_environments` row id here (D5). The
+      // compose stack is addressed by the path bound above, so the id is unused.
+      suspend: async (): Promise<void> => {
+        await this.docker(['compose', '-p', project, 'stop', 'agent'], {
+          timeout: DOCKER_QUERY_TIMEOUT_MS,
+        });
       },
       finalize: (): Promise<WriteBackFinalizeResult> =>
         Promise.resolve({ requiresApproval: false }),
