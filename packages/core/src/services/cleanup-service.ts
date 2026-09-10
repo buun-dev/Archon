@@ -116,14 +116,20 @@ export interface ContainerCleanupReport {
 /**
  * Immediately reclaim (destroy) a single container isolation environment by id —
  * used when a container run is ABANDONED (M2), so its container + upper volume don't
- * linger until the scheduled reaper. Best-effort: throws on a genuine docker failure
- * (the caller surfaces it), a no-op if the row/container is already gone.
+ * linger until the scheduled reaper. A no-op if the row/container is already gone.
+ *
+ * Failure behavior differs by codebase kind: the folder branch throws on a genuine
+ * docker failure (the caller surfaces it), while the repo branch is best-effort —
+ * ContainerProvider.destroy swallows sandbox.sh failures, so a repo teardown
+ * reports success even when the stack survives.
  *
  * Routes on the CODEBASE KIND, not the row's provider: since the creating provider
  * is recorded on the row, folder and repo container envs both read
  * `provider: 'container'`, but they are torn down by different machinery. A repo
  * env has no overlay volume, so the folder backend would throw on its empty
  * metadata and the compose stack would survive the cancel.
+ *
+ * The placeholder config (CLEANUP_PLACEHOLDER_CONTAINER_CONFIG) is unused by destroy.
  */
 export async function reclaimContainerEnv(envId: string): Promise<void> {
   const row = await isolationEnvDb.getById(envId);
