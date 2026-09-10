@@ -200,11 +200,6 @@ export async function cleanupContainerEnvironments(
   const rows = await isolationEnvDb.listActiveContainerEnvironments();
   if (rows.length === 0) return report;
 
-  const backend = new ContainerBackend({
-    store: isolationEnvDb.createIsolationStore(),
-    config: CLEANUP_PLACEHOLDER_CONTAINER_CONFIG,
-  });
-
   for (const row of rows) {
     // FAIL CLOSED on an ambiguous lookup (H3): a DB error is NOT "no run" — treating
     // it as an orphan would destroy a claimable run's container on a transient blip
@@ -239,7 +234,11 @@ export async function cleanupContainerEnvironments(
       continue;
     }
     try {
-      await backend.destroy(row.id);
+      // Routes on the codebase kind, exactly as an abandon-triggered reclaim does
+      // — a repo env has no overlay volume, so the folder backend would throw on
+      // its empty metadata and the compose stack would outlive the reap. Sharing
+      // the one function keeps the scheduled and on-demand paths from drifting.
+      await reclaimContainerEnv(row.id);
       report.removed.push(row.id);
       // No runId: the reap only happens when no run can still claim this env.
       getLog().info({ envId: row.id }, 'container_env_reaped');

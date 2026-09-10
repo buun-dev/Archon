@@ -308,6 +308,15 @@ describe('cleanupContainerEnvironments — H3 fail-closed on lookup error', () =
     mockGetLiveRunOwningEnv.mockImplementation(() => Promise.resolve(null));
     mockContainerDestroy.mockReset();
     mockContainerDestroy.mockImplementation(() => Promise.resolve());
+    // `oldRow` is a FOLDER-project container env (`/tmp/ops`); the reaper now
+    // consults the codebase kind to pick its teardown, so say so explicitly
+    // rather than relying on the unstubbed default.
+    mockGetById.mockReset();
+    mockGetById.mockResolvedValue(
+      makeEnvironment({ id: 'env-1', provider: 'container', working_path: '/tmp/ops' })
+    );
+    mockGetCodebase.mockReset();
+    mockGetCodebase.mockResolvedValue(makeCodebase({ kind: 'folder' }));
   });
 
   test('does NOT destroy when the run lookup throws — reports the error instead', async () => {
@@ -350,6 +359,67 @@ describe('cleanupContainerEnvironments — H3 fail-closed on lookup error', () =
     const report = await cleanupContainerEnvironments(7);
     expect(mockContainerDestroy).toHaveBeenCalledTimes(1);
     expect(report.removed).toEqual(['env-1']);
+  });
+});
+
+// The scheduled reaper had the same unconditional routing reclaimContainerEnv
+// used to have: one folder ContainerBackend for every active container row. A
+// repo env's metadata is `{}`, so that throws by design and the row lands in
+// report.errors instead of being reaped — leaving the compose stack running
+// with nothing left to reclaim it.
+describe('cleanupContainerEnvironments — routes by codebase kind', () => {
+  const REPO_PATH = '/home/bunny/archon/worktrees/marphob-page/task-x';
+  const repoRow = makeContainerEnvironment({
+    id: 'env-repo',
+    codebase_name: 'marphob-page',
+    working_path: REPO_PATH,
+    days_since_created: 30,
+  });
+  const folderRow = makeContainerEnvironment({
+    id: 'env-folder',
+    codebase_name: 'ops',
+    working_path: '/projects/site',
+    days_since_created: 30,
+  });
+
+  beforeEach(() => {
+    mockListActiveContainerEnvironments.mockReset();
+    mockGetLiveRunOwningEnv.mockReset();
+    mockGetLiveRunOwningEnv.mockImplementation(() => Promise.resolve(null));
+    mockContainerDestroy.mockReset();
+    mockContainerDestroy.mockImplementation(() => Promise.resolve());
+    mockProviderDestroy.mockClear();
+    mockGetById.mockReset();
+    mockGetCodebase.mockReset();
+  });
+
+  test('a REPO container env is reaped through the provider, not the folder backend', async () => {
+    mockListActiveContainerEnvironments.mockImplementation(() => Promise.resolve([repoRow]));
+    mockGetById.mockResolvedValue(
+      makeEnvironment({ id: 'env-repo', provider: 'container', working_path: REPO_PATH })
+    );
+    mockGetCodebase.mockResolvedValue(makeCodebase({ kind: 'repo' }));
+
+    const report = await cleanupContainerEnvironments(7);
+
+    expect(mockProviderDestroy).toHaveBeenCalledWith(REPO_PATH);
+    expect(mockContainerDestroy).not.toHaveBeenCalled();
+    expect(report.removed).toEqual(['env-repo']);
+    expect(report.errors).toEqual([]);
+  });
+
+  test('a FOLDER container env is still reaped through the folder backend', async () => {
+    mockListActiveContainerEnvironments.mockImplementation(() => Promise.resolve([folderRow]));
+    mockGetById.mockResolvedValue(
+      makeEnvironment({ id: 'env-folder', provider: 'container', working_path: '/projects/site' })
+    );
+    mockGetCodebase.mockResolvedValue(makeCodebase({ kind: 'folder' }));
+
+    const report = await cleanupContainerEnvironments(7);
+
+    expect(mockContainerDestroy).toHaveBeenCalledWith('env-folder');
+    expect(mockProviderDestroy).not.toHaveBeenCalled();
+    expect(report.removed).toEqual(['env-folder']);
   });
 });
 
