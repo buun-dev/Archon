@@ -7113,7 +7113,7 @@ describe('workflowRunCommand — detach', () => {
   // resolution, so no run row was ever created and the failure existed only inside the
   // detached child's log. The refusal has to reach the launching terminal.
   // Slice 4 — a repo whose `.archon/config.yaml` asks for container isolation has
-  // prerequisites (sandbox.sh, the distro, the docker daemon, the runner image)
+  // prerequisites (the distro, the base clone, the docker daemon, the runner image)
   // that only the CHILD would have discovered, long after this process wrote the run
   // row and printed `Started`. The done-when is "no run row, worktree, or container
   // is created", so the check belongs in the same pre-flight (#2872) that already

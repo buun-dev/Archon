@@ -9,6 +9,7 @@ import {
   registerRepository,
   registerFolder,
   loadConfig,
+  loadGlobalConfig,
   loadRepoConfig,
   generateAndSetTitle,
   createWorkflowStore,
@@ -52,8 +53,12 @@ import type {
   ContainerBackend,
   ContainerBackendConfig,
   ContainerProvider,
+  ContainerProviderDeps,
   IIsolationProvider,
   IsolationEnvironmentRow,
+  RepoSandboxConfig,
+  SandboxHostConfig,
+  WorktreeCreateConfig,
 } from '@archon/isolation';
 import type { TaskBranchSelection } from '@archon/isolation';
 import {
@@ -68,7 +73,7 @@ import {
   captureDetachedInstallContext,
   type DetachedInstallContext,
 } from '@archon/paths';
-import { isAbsolute, join, resolve } from 'node:path';
+import { basename, isAbsolute, join, resolve } from 'node:path';
 import { applyWorkflowRunConfigLayer } from '@archon/workflows/run-config';
 import { mkdirSync, openSync, closeSync, readFileSync, rmSync, writeSync } from 'node:fs';
 import { mkdir, open as openFile } from 'node:fs/promises';
@@ -468,6 +473,24 @@ export function isWorkingPathHostVisible(
   envProvider: string | null | undefined
 ): boolean {
   return !(codebaseKind !== 'folder' && envProvider === 'container');
+}
+
+/**
+ * What a repo-kind `ContainerProvider` reads from config: the repo's
+ * `worktree.baseBranch` and `isolation` (overlay + provision command), and the
+ * machine's `isolation.container`. One definition for both dispatch sites.
+ */
+function containerProviderDeps(): ContainerProviderDeps {
+  return {
+    loadConfig: async (repoPath: string): Promise<WorktreeCreateConfig | null> =>
+      (await loadRepoConfig(repoPath))?.worktree ?? null,
+    loadRepoSandboxConfig: async (repoPath: string): Promise<RepoSandboxConfig | null> => {
+      const isolation = (await loadRepoConfig(repoPath))?.isolation;
+      return isolation ? { compose: isolation.compose, provision: isolation.provision } : null;
+    },
+    loadHostConfig: async (): Promise<SandboxHostConfig | null> =>
+      (await loadGlobalConfig()).isolation?.container ?? null,
+  };
 }
 
 /**
@@ -2195,10 +2218,10 @@ async function runWorkflowWithOwnedSource(
     // letting the child fail after fork.
     assertNoWorktreeOptionsForFolder(detachIsFolder, options);
 
-    // Container isolation's prerequisites live OUTSIDE the repo — the `sandbox.sh`
-    // lifecycle script, the WSL distro it runs in, the docker daemon, the runner
-    // image — and the child is what would have discovered them missing, after this
-    // process wrote the run row and printed `Started`. #2206 asks for the opposite:
+    // Container isolation's prerequisites live OUTSIDE the repo — the WSL distro,
+    // the repo's base clone inside it, the docker daemon, the runner image — and
+    // the child is what would have discovered them missing, after this process
+    // wrote the run row and printed `Started`. #2206 asks for the opposite:
     // "Unsupported or incomplete configuration fails before a run starts and names
     // the setting the operator must correct." So the same probes `ContainerProvider.
     // create()` runs are run HERE too, in the pre-flight, where nothing exists yet.
@@ -2211,8 +2234,8 @@ async function runWorkflowWithOwnedSource(
     // reuses its own run's row rather than writing one, so the "no run row" clause is
     // already satisfied — and its prerequisites are a different set: resume goes
     // through `provider.reattach`, which addresses a live compose stack and never
-    // shells `sandbox.sh`. Refusing a resume for a missing lifecycle script would
-    // block a run that can genuinely continue.
+    // runs the lifecycle. Refusing a resume for a missing base clone would block a
+    // run that can genuinely continue.
     if (
       !isContinuation &&
       !options.noWorktree &&
@@ -2224,7 +2247,9 @@ async function runWorkflowWithOwnedSource(
         ?.provider;
       assertIsolationProviderRecognized(detachIsolationProvider);
       if (detachIsolationProvider === 'container') {
-        await assertContainerPrerequisites();
+        await assertContainerPrerequisites(basename(detachCodebase.default_cwd), {
+          host: (await loadGlobalConfig()).isolation?.container ?? null,
+        });
       }
     }
 
@@ -2857,16 +2882,14 @@ async function runWorkflowWithOwnedSource(
     // Repo-kind container isolation is opt-in via `.archon/config.yaml`
     // isolation.provider: container. Default (worktree) is byte-identical to a host run.
     const repoIsolationConfig = await loadRepoConfig(codebase.default_cwd);
-    const provider = selectIsolationProvider(repoIsolationConfig?.isolation?.provider, {
-      loadConfig: async (repoPath: string) => {
-        const repoConfig = await loadRepoConfig(repoPath);
-        return repoConfig?.worktree ?? null;
-      },
-    });
+    const provider = selectIsolationProvider(
+      repoIsolationConfig?.isolation?.provider,
+      containerProviderDeps()
+    );
     const wantsContainerIsolation = provider.providerType === 'container';
 
     // Check for existing worktree (only when explicit --branch). Container runs skip
-    // this: `sandbox.sh up` is idempotent, and reuse-by-branch returns no execContext.
+    // this: the sandbox `up` is idempotent, and reuse-by-branch returns no execContext.
     const existingEnv =
       !wantsContainerIsolation && options.branchName
         ? await isolationDb.findActiveByWorkflow(codebase.id, 'task', options.branchName)
@@ -2998,15 +3021,10 @@ async function runWorkflowWithOwnedSource(
     }
   } else if (options.resume && codebase && matchingEnv?.provider === 'container') {
     // A repo container run resumes into the SAME stack: reattach rebuilds the
-    // execContext (starting a stopped agent) without re-running `sandbox.sh up`,
+    // execContext (starting a stopped agent) without re-running the sandbox `up`,
     // so no re-provision and no fresh worktree. Folder container resume is handled
     // in the isFolderCodebase branch above via backend.resumeEnv.
-    const provider = selectIsolationProvider('container', {
-      loadConfig: async (repoPath: string) => {
-        const repoConfig = await loadRepoConfig(repoPath);
-        return repoConfig?.worktree ?? null;
-      },
-    });
+    const provider = selectIsolationProvider('container', containerProviderDeps());
     if (!isContainerCapableProvider(provider)) {
       throw new Error(
         'Container isolation was selected for a resume but did not produce a container provider. ' +

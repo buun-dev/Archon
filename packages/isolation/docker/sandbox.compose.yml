@@ -1,0 +1,106 @@
+# sandbox.compose.yml — the Archon half of a repo-kind sandbox stack.
+#
+# The `ContainerProvider` brings one of these up per run, INSIDE the WSL distro
+# (`docker compose -p archon-<repo>-<slug> -f <this file> -f <repo overlay> up`),
+# because every bind mount below is a distro path and the Windows docker CLI would
+# resolve it against an empty directory in the daemon's own VM. The repo's overlay
+# (`isolation.compose` in its .archon/config.yaml, e.g. `.archon/sandbox.compose.yml`)
+# adds the services the repo needs beside the agent — a database, say — and may
+# add `depends_on` to `agent`. This file knows nothing about any stack.
+#
+# `./allowlist.txt` and `./init-firewall.sh` are relative to THIS file: compose
+# resolves relative mounts against the first `-f` file's directory, so this file
+# is always passed first.
+#
+# Interpolated from the provider's environment (forwarded over WSLENV):
+#   ARCHON_RUNNER_IMAGE  the agent image (global config `isolation.container.image`)
+#   ARCHON_WORKTREE      the run's worktree, distro path, mounted at its own path
+#   ARCHON_BASE_CLONE    the repo's base clone, distro path, mounted at its own path
+#   ARCHON_SCRIPTS       ~/.archon/scripts as the distro sees it
+#   ARCHON_META_DIR      the run's project dir (artifacts + logs), as the distro sees it
+#   ANTHROPIC_API_KEY, GH_TOKEN  baked into the agent's environment
+
+services:
+  agent:
+    image: ${ARCHON_RUNNER_IMAGE:?ARCHON_RUNNER_IMAGE is required}
+    init: true              # PID-1 (tini) reaper for zombie child procs (test runners, Chromium)
+    deploy:
+      resources:
+        limits:       { memory: 7g, cpus: "6" }   # generous: build + full pytest + Chromium
+        reservations: { memory: 1g }              # low floor → idle stacks cede RAM to the hot one
+    cap_add:
+      - NET_ADMIN             # init-firewall.sh needs it; applied after provisioning
+    user: "1000:1000"
+    working_dir: ${ARCHON_WORKTREE:?ARCHON_WORKTREE is required}
+    environment:
+      IS_SANDBOX: "1"
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GH_TOKEN: ${GH_TOKEN:-}
+      # Browsers live in the SHARED cache volume below, not the container layer.
+      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
+    volumes:
+      - ${ARCHON_WORKTREE}:${ARCHON_WORKTREE}
+      # The worktree's .git file references the base clone's gitdir by absolute
+      # path; mount the base clone at that same path (rw — git commit writes
+      # objects + the worktree branch ref there) so in-container git works
+      # (commit/push/gh pr create). Containment stays with the scoped PAT + firewall.
+      - ${ARCHON_BASE_CLONE:?ARCHON_BASE_CLONE is required}:${ARCHON_BASE_CLONE}
+      # Workflow nodes invoke $HOME/.archon/scripts/... on the agent; the
+      # container's uid-1000 home is /home/ubuntu, so surface the host scripts there.
+      - ${ARCHON_SCRIPTS:?ARCHON_SCRIPTS is required}:/home/ubuntu/.archon/scripts:ro
+      # Run meta dir (artifacts + logs), bind-mounted at the SAME absolute path it
+      # has on the host. $ARTIFACTS_DIR then means one thing whether a node reads it
+      # from an env var or from substituted prompt text.
+      - ${ARCHON_META_DIR:?ARCHON_META_DIR is required}:${ARCHON_META_DIR}
+      - ./allowlist.txt:/etc/archon/allowlist.txt:ro
+      - ./init-firewall.sh:/usr/local/bin/init-firewall.sh:ro
+      # Phase-stagger semaphore: shared across ALL stacks (see volumes: below).
+      - archon-gate-lock:/archon-gate
+      # Playwright browsers: shared across ALL stacks (see volumes: below).
+      - archon-playwright:/ms-playwright
+      # Package caches: uv (Python) and bun (JS). Same fixed-name/shared/external
+      # trick as archon-playwright one line up, for the same reason. Both caches are
+      # content-addressed by package+version, not by project, so ONE volume serves
+      # every repo and every workflow that shares a dependency.
+      - archon-uv:/home/ubuntu/.cache/uv
+      - archon-bun:/home/ubuntu/.bun/install/cache
+    ports:
+      - "0:3000"   # frontend peek — kernel-assigned host port
+      - "0:8123"   # backend peek — kernel-assigned host port
+    command: ["sleep", "infinity"]
+
+volumes:
+  # Phase-stagger semaphore. One shared ext4 volume flock'd across ALL sandbox
+  # stacks so at most N heavy gates (build + pytest + Chromium) run at once. Fixed
+  # `name` (not project-prefixed) so every stack references the SAME volume; compose
+  # creates it on first `up`. `down -v` can only remove it when no stack holds it
+  # (Docker's in-use guard), and it holds nothing but empty lock files, so a
+  # recreation is harmless.
+  archon-gate-lock:
+    name: archon-gate-lock
+  # Playwright browser cache. One volume for EVERY stack, so the ~170 MB chromium
+  # download happens ONCE on this machine instead of once per run. Contents must be
+  # owned by uid 1000 (the agent runs as 1000:1000) or the installer cannot write on
+  # a cache miss.
+  # `external: true` is LOAD-BEARING, not tidiness. Teardown runs
+  # `docker compose down -v`, which removes every volume the file DECLARES once no
+  # other stack holds it. Recreating THIS one costs a 177 MiB download measured as
+  # slow as 45 KB/s. External volumes are never created or removed by compose, so a
+  # teardown cannot destroy the cache.
+  # One-time setup on a new machine (compose will NOT do it for you):
+  #   docker volume create archon-playwright
+  #   docker run --rm -v archon-playwright:/d postgres:18-alpine chown 1000:1000 /d
+  archon-playwright:
+    name: archon-playwright
+    external: true
+  # uv + bun package caches — shared and external for the SAME reason as
+  # archon-playwright. Contents must be owned by uid 1000.
+  # One-time setup on a new machine:
+  #   docker volume create archon-uv && docker volume create archon-bun
+  #   docker run --rm -v archon-uv:/a -v archon-bun:/b postgres:18-alpine chown 1000:1000 /a /b
+  archon-uv:
+    name: archon-uv
+    external: true
+  archon-bun:
+    name: archon-bun
+    external: true

@@ -14,7 +14,12 @@ import {
   ContainerBackend,
   ContainerProvider,
 } from '@archon/isolation';
-import type { WorktreeStatusBreakdown, PrState, ContainerBackendConfig } from '@archon/isolation';
+import type {
+  WorktreeStatusBreakdown,
+  PrState,
+  ContainerBackendConfig,
+  SandboxHostConfig,
+} from '@archon/isolation';
 import {
   hasUncommittedChanges,
   worktreeExists,
@@ -31,7 +36,7 @@ import { isHostVisibleEnv } from '@archon/isolation/types';
 import { createLogger } from '@archon/paths';
 import type { IsolationEnvironmentRow } from '@archon/isolation';
 import { ConversationNotFoundError } from '../types';
-import { loadRepoConfig } from '../config/config-loader';
+import { loadGlobalConfig, loadRepoConfig } from '../config/config-loader';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -121,7 +126,7 @@ export interface ContainerCleanupReport {
  *
  * Failure behavior differs by codebase kind: the folder branch throws on a genuine
  * docker failure (the caller surfaces it), while the repo branch is best-effort —
- * ContainerProvider.destroy swallows sandbox.sh failures, so a repo teardown
+ * ContainerProvider.destroy swallows lifecycle failures, so a repo teardown
  * reports success even when the stack survives.
  *
  * Routes on the CODEBASE KIND, not the row's provider: since the creating provider
@@ -141,9 +146,14 @@ export async function reclaimContainerEnv(envId: string): Promise<void> {
 
   const codebase = await codebaseDb.getCodebase(row.codebase_id);
   if (codebase?.kind !== 'folder') {
-    // Repo-kind: `sandbox.sh down` composes the stack down and removes the
-    // worktree. Addressed by working path, as every provider method is.
-    await new ContainerProvider().destroy(row.working_path);
+    // Repo-kind: the sandbox lifecycle composes the stack down and removes the
+    // worktree in the distro. Addressed by working path, as every provider method
+    // is; the machine's `isolation.container` says which distro and where the
+    // base clones live.
+    await new ContainerProvider({
+      loadHostConfig: async (): Promise<SandboxHostConfig | null> =>
+        (await loadGlobalConfig()).isolation?.container ?? null,
+    }).destroy(row.working_path);
     await isolationEnvDb.updateStatus(envId, 'destroyed');
     return;
   }

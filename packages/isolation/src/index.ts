@@ -83,8 +83,16 @@ export {
   assertContainerPrerequisites,
   composeProjectFor,
   composeProjectFromWorkingPath,
+  SANDBOX_COMPOSE_FILE,
 } from './providers/container';
-export type { ContainerProviderDeps, ContainerPrerequisiteDeps } from './providers/container';
+export type {
+  ContainerProviderDeps,
+  ContainerPrerequisiteDeps,
+  ContainerPrerequisites,
+  RepoSandboxConfigLoader,
+  SandboxHostConfigLoader,
+} from './providers/container';
+export type { RepoSandboxConfig, SandboxHostConfig } from './backends/sandbox';
 
 // --- PR state lookup ---
 export { getPrState } from './pr-state';

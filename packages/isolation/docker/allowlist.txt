@@ -1,0 +1,13 @@
+api.anthropic.com
+github.com
+api.github.com
+codeload.github.com
+cli.github.com
+objects.githubusercontent.com
+registry.npmjs.org
+pypi.org
+files.pythonhosted.org
+deb.nodesource.com
+astral.sh
+fonts.googleapis.com
+fonts.gstatic.com

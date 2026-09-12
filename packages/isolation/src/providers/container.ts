@@ -2,12 +2,13 @@
  * Container Provider — WSL-sandbox container isolation for repo-kind projects.
  *
  * Re-expressed behind upstream's `ExecutionContext` contract (Phase 1). Instead
- * of `git worktree add`, this provider shells the already-validated `sandbox.sh`
- * lifecycle (`up` = worktree-in-distro + compose up + provision; `down` = compose
- * down + worktree remove). The engine stays on Windows; the Windows `docker` CLI
- * drives the Linux daemon natively, so `docker compose …` state queries run
- * WITHOUT wsl.exe. Only the git-provisioning script (`sandbox.sh`, which lives in
- * the distro FS) is invoked through `wsl.exe`.
+ * of `git worktree add` on the host, this provider drives the `SandboxLifecycle`
+ * (`backends/sandbox.ts`): a worktree cut in the WSL distro, a compose stack made
+ * of Archon's base file plus the repo's overlay, the repo's one provisioning
+ * command, then the firewall. The engine stays on Windows; the Windows `docker`
+ * CLI drives the Linux daemon natively, so `docker compose …` state queries run
+ * WITHOUT wsl.exe. Only the commands that touch the distro filesystem — git, the
+ * handshake file, and `compose up` with its bind mounts — go through `wsl.exe`.
  *
  * create() resolves the compose `agent` service to a concrete container id and
  * returns a container `ExecutionContext` (containerId + execUser) — the worktree
@@ -18,16 +19,42 @@
  * `ContainerBackend`/overlay/write-back — this is an execution substrate for a
  * git worktree, not a folder review-buffer.
  *
- * Addressing (from `compose.yml.tmpl`): compose project `archon-<repo>-<slug>`,
- * service `agent`, in-container workdir set per run to the worktree's host path
- * (compose's `working_dir`, bind-mounted at that same path on both sides).
+ * Addressing: compose project `archon-<repo>-<slug>`, service `agent`,
+ * in-container workdir set per run to the worktree's distro path (compose's
+ * `working_dir`, bind-mounted at that same path on both sides).
+ *
+ * What the machine looks like — the distro, the runner image, where the base
+ * clones and worktrees live, a fallback git identity — is the global config's
+ * `isolation.container` section, with defaults for the original layout. What the
+ * repo needs — its compose overlay and its provisioning command — is the repo's
+ * `isolation` section. Both are injected as loaders, like `worktree.baseBranch`.
  */
 
 import { createHash } from 'crypto';
+import { existsSync } from 'fs';
+import { join } from 'path';
 
 import { execFileAsync, toBranchName, getDefaultBranch, toRepoPath } from '@archon/git';
+import {
+  getHomeScriptsPath,
+  getProjectRoot,
+  resolveRepoProjectIdentity,
+  toNodeVisiblePath,
+} from '@archon/paths';
 
 import { dockerPreflight } from '../container/docker-exec';
+import {
+  SANDBOX_HOST_DEFAULTS,
+  SandboxLifecycle,
+  defaultSandboxDocker,
+  defaultWslRunner,
+  resolveSandboxHost,
+  shq,
+  type RepoSandboxConfig,
+  type ResolvedSandboxHost,
+  type SandboxHostConfig,
+  type WslRunner,
+} from '../backends/sandbox';
 import type {
   ExecutionContext,
   WriteBackApplySummary,
@@ -46,23 +73,22 @@ import type {
 } from '../types';
 import { isPRIsolationRequest } from '../types';
 
-/**
- * Real, LF-safe path to the lifecycle script. Never a `/tmp` copy — the script
- * self-locates via `${BASH_SOURCE[0]}`, so a copy breaks its `SANDBOX_DIR`.
- */
-const SANDBOX_SH = '/mnt/c/Users/Buun/.archon/sandbox/sandbox.sh';
-/** The distro `sandbox.sh` runs in. Hand-synced with `defaultRunSandbox`'s `-d`. */
-const WSL_DISTRO = 'Ubuntu';
-/** The image `compose.yml.tmpl` gives the `agent` service; built by `build-runner.sh`. */
-const RUNNER_IMAGE = 'archon-runner:latest';
-/** Base dir under which sandbox.sh places each repo's worktrees, one subdir per repo. */
-const WORKTREE_ROOT_BASE = '/home/bunny/archon/worktrees';
 /** Container runs as uid 1000 (compose `user: "1000:1000"`); `docker exec` must match. */
 const CONTAINER_EXEC_USER = '1000';
 
-/** `sandbox.sh up` provisions (uv sync + install + alembic + playwright); be generous. */
-const SANDBOX_UP_TIMEOUT_MS = 20 * 60 * 1000;
-const SANDBOX_DOWN_TIMEOUT_MS = 5 * 60 * 1000;
+/**
+ * Archon's half of the compose recipe, beside the runner Dockerfile. The firewall
+ * script and the allowlist it mounts live in the same directory — compose resolves
+ * their `./` paths against this file's, which is why it is always passed first.
+ */
+export const SANDBOX_COMPOSE_FILE = join(
+  import.meta.dir,
+  '..',
+  '..',
+  'docker',
+  'sandbox.compose.yml'
+);
+
 const DOCKER_QUERY_TIMEOUT_MS = 30 * 1000;
 /** The preflight's whole budget is seconds — it must never look like provisioning. */
 const WSL_PROBE_TIMEOUT_MS = 20 * 1000;
@@ -71,19 +97,18 @@ interface ExecResult {
   stdout: string;
   stderr: string;
 }
-type SandboxRunner = (
-  args: string[],
-  timeoutMs: number,
-  extraEnv?: Record<string, string>
-) => Promise<ExecResult>;
 type DockerRunner = (args: string[], opts: { timeout: number }) => Promise<ExecResult>;
-/** Runs one `bash -c <script>` inside the WSL distro. Used only by the preflight. */
-type WslProbe = (script: string, timeoutMs: number) => Promise<ExecResult>;
+/** Runs one `bash -c <script>` inside a WSL distro. Used only by the preflight. */
+type WslProbe = (distro: string, script: string, timeoutMs: number) => Promise<ExecResult>;
+/** Loads the global `isolation.container` section; `null` when nothing is configured. */
+export type SandboxHostConfigLoader = () => Promise<SandboxHostConfig | null>;
+/** Loads a repo's `isolation` section (`compose`, `provision`); `null` when absent. */
+export type RepoSandboxConfigLoader = (repoPath: string) => Promise<RepoSandboxConfig | null>;
 
 /**
  * THE compose-project naming rule — one definition, deliberately exported.
- * `sandbox.sh` brings each stack up as `archon-<repo>-<slug>`, and BOTH segments
- * are load-bearing (two repos can carry the same slug). Anything that addresses a
+ * Each stack comes up as `archon-<repo>-<slug>`, and BOTH segments are
+ * load-bearing (two repos can carry the same slug). Anything that addresses a
  * live stack (`docker compose -p … exec agent`) must derive the name through here.
  */
 export function composeProjectFor(repo: string, slug: string): string {
@@ -111,33 +136,18 @@ function repoSlugFromWorkingPath(envId: string): { repo: string; slug: string } 
   return { slug: parts[parts.length - 1] ?? '', repo: parts[parts.length - 2] ?? '' };
 }
 
-/** Default WSL runner — invokes `sandbox.sh` inside the Ubuntu distro. */
-function defaultRunSandbox(
-  args: string[],
-  timeoutMs: number,
-  extraEnv: Record<string, string> = {}
-): Promise<ExecResult> {
-  // wsl.exe forwards only WSLENV-named vars into the distro. Forward the secrets
-  // `sandbox.sh` bakes into the container via envsubst (GH_TOKEN, ANTHROPIC_API_KEY)
-  // plus any identity vars. `/u` = Windows → WSL only.
-  const forwarded = ['GH_TOKEN', 'ANTHROPIC_API_KEY', ...Object.keys(extraEnv)];
-  const wslenv = [process.env.WSLENV, ...forwarded.map(name => `${name}/u`)]
-    .filter(Boolean)
-    .join(':');
-  return execFileAsync('wsl.exe', ['-d', 'Ubuntu', '--', 'bash', SANDBOX_SH, ...args], {
-    timeout: timeoutMs,
-    env: { ...process.env, ...extraEnv, WSLENV: wslenv },
-  });
-}
-
 /** Default docker runner — the Windows docker CLI drives the Linux daemon natively. */
 function defaultDocker(args: string[], opts: { timeout: number }): Promise<ExecResult> {
   return execFileAsync('docker', args, opts);
 }
 
-/** Default WSL probe — one `bash -c` in the distro. Never a login shell (slow). */
-function defaultProbeWsl(script: string, timeoutMs: number): Promise<ExecResult> {
-  return execFileAsync('wsl.exe', ['-d', WSL_DISTRO, '--', 'bash', '-c', script], {
+/**
+ * Default WSL probe — one `bash -c` in the distro. `--exec`, never `--`: `--`
+ * routes the command line through the distro's login shell, which expands `$HOME`
+ * in the script before bash sees it (harmless here, wrong in general) and is slow.
+ */
+function defaultProbeWsl(distro: string, script: string, timeoutMs: number): Promise<ExecResult> {
+  return execFileAsync('wsl.exe', ['-d', distro, '--exec', 'bash', '-c', script], {
     timeout: timeoutMs,
   });
 }
@@ -146,17 +156,28 @@ function defaultProbeWsl(script: string, timeoutMs: number): Promise<ExecResult>
  * Markers the probe script echoes. Reading OUR OWN tokens out of stdout is what
  * keeps this off the `classifyIsolationError` prose-matching path: a wsl.exe or
  * bash rewording cannot change which prerequisite we name. `ARCHON_WSL_OK` is
- * unconditional, so its presence means the distro answered; `ARCHON_SANDBOX_SH_OK`
- * is gated on the script's existence. One round trip answers both.
+ * unconditional, so its presence means the distro answered; `ARCHON_WSL_HOME=`
+ * carries the distro home the default roots resolve against; `ARCHON_BASE_CLONE_OK`
+ * is gated on the repo's base clone. One round trip answers all three.
  */
 const WSL_MARKER = 'ARCHON_WSL_OK';
-const SANDBOX_SH_MARKER = 'ARCHON_SANDBOX_SH_OK';
+const WSL_HOME_MARKER = 'ARCHON_WSL_HOME=';
+const BASE_CLONE_MARKER = 'ARCHON_BASE_CLONE_OK';
+
 /** `if` returns 0 on a false condition, so the probe always exits 0 when the distro is up. */
-const PREREQUISITE_PROBE = `echo ${WSL_MARKER}; if [ -f '${SANDBOX_SH}' ]; then echo ${SANDBOX_SH_MARKER}; fi`;
+function prerequisiteProbe(baseClone: string): string {
+  // `~` is expanded by bash here — the probe is the one place the distro home is
+  // not yet known, so the unresolved config value is handed to the shell that knows.
+  const clone = baseClone.startsWith('~/') ? `"$HOME"${shq(baseClone.slice(1))}` : shq(baseClone);
+  return (
+    `echo ${WSL_MARKER}; echo "${WSL_HOME_MARKER}$HOME"; ` +
+    `if [ -d ${clone}/.git ]; then echo ${BASE_CLONE_MARKER}; fi`
+  );
+}
 
 /**
  * Named in every refusal. The done-when is "names the setting the operator must
- * correct", and for all four prerequisites that setting is the same one.
+ * correct", and for every prerequisite that setting is the same one.
  */
 const PROVIDER_SETTING_HINT =
   'This repo asks for container isolation (`isolation.provider: container` in ' +
@@ -167,11 +188,10 @@ const PROVIDER_SETTING_HINT =
  *
  * Not `extractDockerError`: when `wsl.exe` refuses a distro it writes UTF-16LE that
  * reaches us as an EMPTY `stderr`, and the fallback — `err.message` — is
- * `Command failed: wsl.exe -d Ubuntu -- bash -c <the whole probe script>`, which
- * buries the actionable sentence under an echo of our own command. Verified live
- * 2026-09-10 against a non-existent distro. So: a real stderr line if there is one,
- * else the errno (`ENOENT` when wsl.exe is absent, `ETIMEDOUT` on a hung distro),
- * else nothing.
+ * `Command failed: wsl.exe -d Ubuntu … <the whole probe script>`, which buries the
+ * actionable sentence under an echo of our own command. Verified live 2026-09-10
+ * against a non-existent distro. So: a real stderr line if there is one, else the
+ * errno (`ENOENT` when wsl.exe is absent, `ETIMEDOUT` on a hung distro), else nothing.
  */
 function probeFailureDetail(err: unknown): string {
   const e = err as Error & { stderr?: string; code?: string | number };
@@ -180,16 +200,18 @@ function probeFailureDetail(err: unknown): string {
   return e.code ? ` (${String(e.code)})` : '';
 }
 
-/** Directory `sandbox.sh` self-locates from — also where `build-runner.sh` lives. */
-function sandboxDir(): string {
-  return SANDBOX_SH.replace(/\/[^/]+$/, '');
-}
-
 export interface ContainerPrerequisiteDeps {
-  /** WSL probe runner (tests inject a fake; prod shells `wsl.exe -d Ubuntu`). */
+  /** WSL probe runner (tests inject a fake; prod shells `wsl.exe -d <distro>`). */
   probeWsl?: WslProbe;
   /** Docker CLI runner (tests inject a fake; prod runs the Windows `docker` CLI). */
   docker?: DockerRunner;
+  /** The machine's `isolation.container` config; defaults apply for anything unset. */
+  host?: SandboxHostConfig | null;
+}
+
+/** What the preflight learned, for the create that follows it. */
+export interface ContainerPrerequisites {
+  host: ResolvedSandboxHost;
 }
 
 /**
@@ -198,113 +220,167 @@ export interface ContainerPrerequisiteDeps {
  * configuration fails before a run starts and names the setting the operator
  * must correct").
  *
- * Four prerequisites, two probes: one `bash -c` in the distro answers both the
- * distro and the lifecycle script, and `dockerPreflight` — the folder backend's
- * existing preflight, reused rather than reimplemented — answers the daemon and
- * the runner image. Present prerequisites cost about a second; `sandbox.sh up`
- * budgets twenty minutes.
+ * Five prerequisites, two probes and a stat: one `bash -c` in the distro answers
+ * the distro and the repo's base clone (and reports the distro home), the base
+ * compose file is Archon's own asset and is stat'd on the host, and
+ * `dockerPreflight` — the folder backend's existing preflight, reused rather than
+ * reimplemented — answers the daemon and the runner image. Present prerequisites
+ * cost about a second; provisioning budgets twenty minutes.
  *
  * Deliberately separate from `assertSupported`, which judges the REQUEST (a
  * `--from` start point, a PR checkout) rather than the environment.
  */
 export async function assertContainerPrerequisites(
+  repo: string,
   deps: ContainerPrerequisiteDeps = {}
-): Promise<void> {
+): Promise<ContainerPrerequisites> {
   const probe = deps.probeWsl ?? defaultProbeWsl;
   const docker = deps.docker ?? defaultDocker;
+  const configured = deps.host ?? undefined;
+  const distro = configured?.distro ?? SANDBOX_HOST_DEFAULTS.distro;
+  // Unresolved on purpose: `~` is expanded by the probe, inside the distro.
+  const baseClone = `${configured?.repoRoot ?? SANDBOX_HOST_DEFAULTS.repoRoot}/${repo}`;
 
   let stdout: string;
   try {
-    ({ stdout } = await probe(PREREQUISITE_PROBE, WSL_PROBE_TIMEOUT_MS));
+    ({ stdout } = await probe(distro, prerequisiteProbe(baseClone), WSL_PROBE_TIMEOUT_MS));
   } catch (err) {
     throw new Error(
-      `Container isolation is unavailable: the WSL distro '${WSL_DISTRO}' is not reachable` +
-        `${probeFailureDetail(err)}. Install or start it (\`wsl --install -d ${WSL_DISTRO}\`). ` +
+      `Container isolation is unavailable: the WSL distro '${distro}' is not reachable` +
+        `${probeFailureDetail(err)}. Install or start it (\`wsl --install -d ${distro}\`), ` +
+        'or name the right one in ~/.archon/config.yaml `isolation.container.distro`. ' +
         PROVIDER_SETTING_HINT
     );
   }
   if (!stdout.includes(WSL_MARKER)) {
     throw new Error(
-      `Container isolation is unavailable: the WSL distro '${WSL_DISTRO}' answered nothing. ` +
-        `Check it with \`wsl -d ${WSL_DISTRO} -- true\`. ` +
+      `Container isolation is unavailable: the WSL distro '${distro}' answered nothing. ` +
+        `Check it with \`wsl -d ${distro} -- true\`. ` +
         PROVIDER_SETTING_HINT
     );
   }
-  if (!stdout.includes(SANDBOX_SH_MARKER)) {
+  const home = stdout
+    .split('\n')
+    .map(l => l.trim())
+    .find(l => l.startsWith(WSL_HOME_MARKER))
+    ?.slice(WSL_HOME_MARKER.length);
+  if (!home) {
     throw new Error(
-      'Container isolation is unavailable: the sandbox lifecycle script is missing at ' +
-        `${SANDBOX_SH} (inside the ${WSL_DISTRO} distro). Restore it there — the whole ` +
-        `${sandboxDir()} directory is required, since the script self-locates from it. ` +
+      `Container isolation is unavailable: the WSL distro '${distro}' reported no $HOME, ` +
+        'so the sandbox paths cannot be resolved. ' +
+        PROVIDER_SETTING_HINT
+    );
+  }
+  const host = resolveSandboxHost(configured, home);
+  if (!stdout.includes(BASE_CLONE_MARKER)) {
+    throw new Error(
+      `Container isolation is unavailable: no base clone of '${repo}' at ` +
+        `${host.repoRoot}/${repo} inside the ${distro} distro. Clone it there ` +
+        `(\`wsl -d ${distro} -- git clone <url> ${host.repoRoot}/${repo}\`), or point ` +
+        '~/.archon/config.yaml `isolation.container.repoRoot` at where the clones live. ' +
+        PROVIDER_SETTING_HINT
+    );
+  }
+
+  if (!existsSync(SANDBOX_COMPOSE_FILE)) {
+    throw new Error(
+      "Container isolation is unavailable: Archon's base compose file is missing at " +
+        `${SANDBOX_COMPOSE_FILE}. This is a broken Archon checkout, not a repo or machine ` +
+        'setting; restore packages/isolation/docker/. ' +
         PROVIDER_SETTING_HINT
     );
   }
 
   try {
     await dockerPreflight(
-      RUNNER_IMAGE,
+      host.image,
       (args, options) => docker(args, { timeout: options?.timeout ?? DOCKER_QUERY_TIMEOUT_MS }),
-      `bash ${sandboxDir()}/build-runner.sh`
+      `build the runner image \`${host.image}\` (this fork builds it with ~/.archon/sandbox/build-runner.sh), ` +
+        'or name an existing image in ~/.archon/config.yaml `isolation.container.image`'
     );
   } catch (err) {
     throw new Error(
       `Container isolation is unavailable: ${(err as Error).message} ${PROVIDER_SETTING_HINT}`
     );
   }
-}
-
-/**
- * The originating user's git identity, as env for `sandbox.sh`. This provider
- * cannot `git config` the worktree (it's a distro path Windows git can't reach),
- * so `sandbox.sh` stamps it where the filesystem is. Empty when absent (solo
- * installs), leaving the script's own fallback identity in force.
- */
-function identityEnv(request: IsolationRequest): Record<string, string> {
-  const identity = request.gitIdentity;
-  if (!identity?.email) return {};
-  return {
-    ARCHON_GIT_USER_EMAIL: identity.email,
-    ...(identity.name ? { ARCHON_GIT_USER_NAME: identity.name } : {}),
-  };
+  return { host };
 }
 
 export interface ContainerProviderDeps {
   /** Repo config loader (for `worktree.baseBranch`). Defaults to a no-op loader. */
   loadConfig?: RepoConfigLoader;
-  /** WSL sandbox runner (tests inject a fake; prod shells `sandbox.sh` via wsl.exe). */
-  runSandbox?: SandboxRunner;
+  /** Repo `isolation` section loader (`compose`, `provision`). Defaults to a no-op loader. */
+  loadRepoSandboxConfig?: RepoSandboxConfigLoader;
+  /** Global `isolation.container` loader. Defaults to a no-op loader (all defaults). */
+  loadHostConfig?: SandboxHostConfigLoader;
+  /** Distro script runner for the lifecycle (tests inject a fake; prod shells `wsl.exe --exec`). */
+  wsl?: WslRunner;
   /** Docker CLI runner (tests inject a fake; prod runs the Windows `docker` CLI). */
   docker?: DockerRunner;
   /** WSL probe runner for the prerequisite preflight (tests inject a fake). */
   probeWsl?: WslProbe;
+  /** Where the lifecycle's transcript goes. Defaults to stdout as `[container] …` lines. */
+  onLine?: (line: string) => void;
+  /** Where `GH_TOKEN` / `ANTHROPIC_API_KEY` are read from. Defaults to `process.env`. */
+  secretsFrom?: NodeJS.ProcessEnv;
 }
 
 export class ContainerProvider implements IIsolationProvider {
   readonly providerType = 'container' as const;
 
   private readonly loadConfig: RepoConfigLoader;
-  private readonly runSandbox: SandboxRunner;
+  private readonly loadRepoSandboxConfig: RepoSandboxConfigLoader;
+  private readonly loadHostConfig: SandboxHostConfigLoader;
   private readonly docker: DockerRunner;
   private readonly probeWsl: WslProbe;
+  private readonly lifecycle: SandboxLifecycle;
+  private readonly secretsFrom: NodeJS.ProcessEnv;
+  /** The machine, resolved once per provider: the distro is asked for `$HOME` at most once. */
+  private hostPromise: Promise<ResolvedSandboxHost> | undefined;
 
   constructor(deps: ContainerProviderDeps = {}) {
     this.loadConfig =
       deps.loadConfig ?? ((): Promise<WorktreeCreateConfig | null> => Promise.resolve(null));
-    this.runSandbox = deps.runSandbox ?? defaultRunSandbox;
+    this.loadRepoSandboxConfig =
+      deps.loadRepoSandboxConfig ??
+      ((): Promise<RepoSandboxConfig | null> => Promise.resolve(null));
+    this.loadHostConfig =
+      deps.loadHostConfig ?? ((): Promise<SandboxHostConfig | null> => Promise.resolve(null));
     this.docker = deps.docker ?? defaultDocker;
     this.probeWsl = deps.probeWsl ?? defaultProbeWsl;
+    this.secretsFrom = deps.secretsFrom ?? process.env;
+    this.lifecycle = new SandboxLifecycle({
+      wsl: deps.wsl ?? defaultWslRunner,
+      docker: (args, opts): Promise<ExecResult> =>
+        deps.docker
+          ? deps.docker(args, { timeout: opts.timeoutMs })
+          : defaultSandboxDocker(args, opts),
+      onLine:
+        deps.onLine ??
+        ((line): void => {
+          console.log(`[container] ${line}`);
+        }),
+    });
   }
 
   async create(request: IsolationRequest): Promise<IsolatedEnvironment> {
-    // Reject before provisioning: `sandbox.sh up` cuts only from the base branch,
-    // so an explicit --from or a PR checkout would go green against the WRONG tree.
+    // Reject before provisioning: the sandbox cuts only from the base branch, so an
+    // explicit --from or a PR checkout would go green against the WRONG tree.
     this.assertSupported(request);
-    // Then the ENVIRONMENT (slice 4). The request is judged first because a
-    // malformed request is wrong on any machine; the probes cost a round trip.
-    await assertContainerPrerequisites({ probeWsl: this.probeWsl, docker: this.docker });
-
     const repo = basename(request.canonicalRepoPath);
+    // Then the repo's own declaration, which costs a config read and no subprocess.
+    const repoSandbox = await this.requireRepoSandboxConfig(request.canonicalRepoPath);
+    // Then the ENVIRONMENT. The request is judged first because a malformed
+    // request is wrong on any machine; the probes cost a round trip.
+    const { host } = await assertContainerPrerequisites(repo, {
+      probeWsl: this.probeWsl,
+      docker: this.docker,
+      host: await this.loadHostConfig(),
+    });
+    this.hostPromise = Promise.resolve(host);
+
     const slug = this.slugFor(request);
-    const workingPath = `${WORKTREE_ROOT_BASE}/${repo}/${slug}`;
+    const workingPath = `${host.worktreeRoot}/${repo}/${slug}`;
     const project = composeProjectFor(repo, slug);
     // The worktree lives in the distro, so the branch has to cross the wsl.exe
     // boundary as an argument; auto-detection runs against the host checkout.
@@ -312,11 +388,23 @@ export class ContainerProvider implements IIsolationProvider {
 
     // Worktree-in-distro + compose up + provision. No port allocator — the
     // container owns its own 3000/8123/5432 in a private network namespace.
-    await this.runSandbox(
-      ['up', repo, slug, baseBranch],
-      SANDBOX_UP_TIMEOUT_MS,
-      identityEnv(request)
-    );
+    await this.lifecycle.up({
+      distro: host.distro,
+      project,
+      repo,
+      slug,
+      baseBranch,
+      baseClone: `${host.repoRoot}/${repo}`,
+      worktree: workingPath,
+      image: host.image,
+      composeBase: toNodeVisiblePath(SANDBOX_COMPOSE_FILE),
+      composeOverlay: repoSandbox.compose ? `${workingPath}/${repoSandbox.compose}` : undefined,
+      provision: repoSandbox.provision,
+      scriptsDir: toNodeVisiblePath(getHomeScriptsPath()),
+      metaDir: toNodeVisiblePath(projectRootFor(request)),
+      gitIdentity: request.gitIdentity ?? host.gitIdentity,
+      secrets: pick(this.secretsFrom, ['GH_TOKEN', 'ANTHROPIC_API_KEY']),
+    });
 
     const containerId = await this.resolveContainerId(project);
     return this.buildEnv(slug, workingPath, project, containerId, request, baseBranch);
@@ -326,7 +414,7 @@ export class ContainerProvider implements IIsolationProvider {
    * Reattach to an existing sandbox on RESUME (D8 recovery). The container may be
    * STOPPED after a kill or a docker restart — resolveContainerId `start`s the
    * agent before resolving — so this rebuilds the container execContext from the
-   * working path WITHOUT re-running `sandbox.sh up` (no re-provision). Throws if
+   * working path WITHOUT re-running the lifecycle (no re-provision). Throws if
    * the stack is gone (torn down); a resume then cannot continue in-container.
    */
   async reattach(workingPath: string): Promise<ContainerEnvironment> {
@@ -349,8 +437,7 @@ export class ContainerProvider implements IIsolationProvider {
    * genuinely stops the agent service (pause economics); `reattach()`'s
    * resolveContainerId `start`s it again on the next resume. Deliberately NOT
    * the folder ContainerBackend: no prepare/resumeEnv/destroy, so the CLI's
-   * folder teardown paths (which would `sandbox.sh down` the worktree) cannot
-   * engage.
+   * folder teardown paths (which would tear the worktree down) cannot engage.
    */
   writeBackBackend(workingPath: string): {
     suspend(envId: string): Promise<void>;
@@ -387,13 +474,23 @@ export class ContainerProvider implements IIsolationProvider {
   }
 
   /**
-   * Best-effort teardown (mirrors WorktreeProvider.destroy's contract): shells
-   * `sandbox.sh down`, which composes-down `-v` and removes the worktree +
-   * `sandbox/<slug>` branch. A failure is swallowed — the run is already over.
+   * Best-effort teardown (mirrors WorktreeProvider.destroy's contract): composes
+   * the stack down `-v` and removes the worktree + `sandbox/<slug>` branch in the
+   * distro. Every step is best-effort inside the lifecycle — the run is already
+   * over — and a machine whose distro cannot be reached at all is logged, not thrown.
    */
   async destroy(envId: string, _options?: WorktreeDestroyOptions): Promise<DestroyResult> {
     const { repo, slug } = repoSlugFromWorkingPath(envId);
-    await this.runSandbox(['down', repo, slug], SANDBOX_DOWN_TIMEOUT_MS).catch(() => undefined);
+    const host = await this.host().catch(() => undefined);
+    if (host) {
+      await this.lifecycle.down({
+        distro: host.distro,
+        project: composeProjectFor(repo, slug),
+        slug,
+        baseClone: `${host.repoRoot}/${repo}`,
+        worktree: envId,
+      });
+    }
     return {
       worktreeRemoved: true,
       branchDeleted: null,
@@ -432,13 +529,15 @@ export class ContainerProvider implements IIsolationProvider {
       return [];
     }
     const envs: IsolatedEnvironment[] = [];
+    let worktreeRoot: string | undefined;
     for (const entry of entries) {
       const name = entry.Name ?? '';
       if (!name.startsWith(prefix)) continue;
       const slug = name.slice(prefix.length);
       const containerId = await this.resolveContainerId(name).catch(() => '');
       if (!containerId) continue;
-      envs.push(this.buildEnv(slug, `${WORKTREE_ROOT_BASE}/${repo}/${slug}`, name, containerId));
+      worktreeRoot ??= (await this.host()).worktreeRoot;
+      envs.push(this.buildEnv(slug, `${worktreeRoot}/${repo}/${slug}`, name, containerId));
     }
     return envs;
   }
@@ -448,11 +547,11 @@ export class ContainerProvider implements IIsolationProvider {
     return this.composeAgentRunning(composeProjectFor(repo, slug));
   }
 
-  /** Reject requests `sandbox.sh up` cannot honor (PR checkout, explicit --from). */
+  /** Reject requests the sandbox cannot honor (PR checkout, explicit --from). */
   private assertSupported(request: IsolationRequest): void {
     if (isPRIsolationRequest(request)) {
       throw new Error(
-        'Container isolation cannot check out a PR: sandbox.sh cuts a fresh branch off ' +
+        'Container isolation cannot check out a PR: the sandbox cuts a fresh branch off ' +
           'the base branch. Use worktree isolation for PR workflows.'
       );
     }
@@ -466,9 +565,38 @@ export class ContainerProvider implements IIsolationProvider {
     if (taskFromBranch) {
       throw new Error(
         `Container isolation cannot cut from an explicit start point (--from ${taskFromBranch}): ` +
-          'sandbox.sh up cuts only from the base branch.'
+          'the sandbox cuts only from the base branch.'
       );
     }
+  }
+
+  /**
+   * The repo's `isolation` section, checked where it becomes a decision — the
+   * loader is fail-soft and cannot refuse. `provision` is required: Archon runs
+   * exactly one command in the fresh container (D1), and a repo that names none
+   * would hand every node an unprovisioned worktree that fails on its first
+   * `uv run`, far from the setting that caused it.
+   */
+  private async requireRepoSandboxConfig(
+    repoPath: string
+  ): Promise<RepoSandboxConfig & { provision: string }> {
+    let config: RepoSandboxConfig | null;
+    try {
+      config = await this.loadRepoSandboxConfig(repoPath);
+    } catch (err) {
+      throw new Error(`Failed to load config: ${(err as Error).message}`);
+    }
+    const provision = config?.provision?.trim();
+    if (!provision) {
+      throw new Error(
+        'Container isolation needs the repo to say how to provision its worktree: set ' +
+          '`isolation.provision` in .archon/config.yaml to the one command Archon runs inside ' +
+          'the fresh container (for example `python3 scripts/sandbox_env.py`). ' +
+          PROVIDER_SETTING_HINT
+      );
+    }
+    const compose = config?.compose?.trim();
+    return { ...(compose ? { compose } : {}), provision };
   }
 
   /**
@@ -486,6 +614,30 @@ export class ContainerProvider implements IIsolationProvider {
     const preferred = request.baseOverride ?? config?.baseBranch ?? request.baseBranch;
     if (preferred) return preferred;
     return getDefaultBranch(toRepoPath(request.canonicalRepoPath));
+  }
+
+  /**
+   * The machine, for the methods that address an existing stack (`destroy`,
+   * `list`) and so never ran the preflight: one probe for the distro home, cached.
+   */
+  private host(): Promise<ResolvedSandboxHost> {
+    this.hostPromise ??= (async (): Promise<ResolvedSandboxHost> => {
+      const configured = (await this.loadHostConfig()) ?? undefined;
+      const distro = configured?.distro ?? SANDBOX_HOST_DEFAULTS.distro;
+      const { stdout } = await this.probeWsl(
+        distro,
+        `echo "${WSL_HOME_MARKER}$HOME"`,
+        WSL_PROBE_TIMEOUT_MS
+      );
+      const home = stdout
+        .split('\n')
+        .map(l => l.trim())
+        .find(l => l.startsWith(WSL_HOME_MARKER))
+        ?.slice(WSL_HOME_MARKER.length);
+      if (!home) throw new Error(`The WSL distro '${distro}' reported no $HOME.`);
+      return resolveSandboxHost(configured, home);
+    })();
+    return this.hostPromise;
   }
 
   /**
@@ -547,7 +699,7 @@ export class ContainerProvider implements IIsolationProvider {
       workingPath,
       project,
       execContext,
-      // sandbox.sh creates the branch as `sandbox/<slug>` off the base clone.
+      // The lifecycle creates the branch as `sandbox/<slug>` off the base clone.
       branchName: toBranchName(`sandbox/${slug}`),
       ...(baseBranch ? { baseBranch: toBranchName(baseBranch) } : {}),
       status: 'active',
@@ -597,4 +749,27 @@ export class ContainerProvider implements IIsolationProvider {
       .replace(/^-|-$/g, '')
       .substring(0, 50);
   }
+}
+
+/** The named keys that are set, and nothing else — the lifecycle sees no other secret. */
+function pick<K extends string>(source: NodeJS.ProcessEnv, keys: K[]): Partial<Record<K, string>> {
+  const out: Partial<Record<K, string>> = {};
+  for (const key of keys) {
+    const value = source[key];
+    if (value) out[key] = value;
+  }
+  return out;
+}
+
+/**
+ * The run's project dir — `~/.archon/workspaces/<owner>/<repo>` — as the engine
+ * resolves it for artifacts and logs. Mounted at its own (distro-visible) path so
+ * `$ARTIFACTS_DIR` means one thing on both sides.
+ */
+function projectRootFor(request: IsolationRequest): string {
+  const identity = resolveRepoProjectIdentity(
+    request.codebaseName ?? '',
+    request.canonicalRepoPath
+  ) ?? { owner: '_local', repo: basename(request.canonicalRepoPath) };
+  return getProjectRoot(identity.owner, identity.repo);
 }
