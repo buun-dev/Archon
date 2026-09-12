@@ -5,6 +5,7 @@ import type {
   ContainerBackend,
   IIsolationProvider,
   IsolationEnvironmentRow,
+  SandboxInspection,
 } from '@archon/isolation';
 import type { Codebase, Conversation, Session } from '../types';
 import type * as Git from '@archon/git';
@@ -189,8 +190,19 @@ const mockProviderDestroy = mock<IIsolationProvider['destroy']>(() =>
     warnings: [],
   })
 );
+/** A live stack over a clean, pushed worktree — the reap's "nothing to hold" answer. */
+const LIVE_CLEAN: SandboxInspection = {
+  stackExists: true,
+  worktreeExists: true,
+  dirty: false,
+  unpushed: false,
+};
+const mockProviderInspect = mock<(workingPath: string) => Promise<SandboxInspection>>(() =>
+  Promise.resolve(LIVE_CLEAN)
+);
 class MockContainerProvider {
   destroy = mockProviderDestroy;
+  inspect = mockProviderInspect;
 }
 mock.module('@archon/isolation', () => ({
   getIsolationProvider: () => ({
@@ -389,6 +401,7 @@ describe('cleanupContainerEnvironments — routes by codebase kind', () => {
     mockContainerDestroy.mockReset();
     mockContainerDestroy.mockImplementation(() => Promise.resolve());
     mockProviderDestroy.mockClear();
+    mockProviderInspect.mockClear();
     mockGetById.mockReset();
     mockGetCodebase.mockReset();
   });
@@ -419,7 +432,178 @@ describe('cleanupContainerEnvironments — routes by codebase kind', () => {
 
     expect(mockContainerDestroy).toHaveBeenCalledWith('env-folder');
     expect(mockProviderDestroy).not.toHaveBeenCalled();
+    // A folder env has no distro worktree to inspect; its overlay volume is the
+    // failed run's only copy, so the D10 release never applies to it.
+    expect(mockProviderInspect).not.toHaveBeenCalled();
     expect(report.removed).toEqual(['env-folder']);
+  });
+});
+
+// D10 + D11: a repo-kind row's estate is a git worktree in the distro and a
+// compose stack. Once every commit is on a remote there is nothing a reap can
+// lose, so a failed run's row is released after the threshold; a row whose
+// stack and worktree are both gone is reconciled at any age.
+describe('cleanupContainerEnvironments — repo-kind rows: failed runs and ghosts', () => {
+  const REPO_PATH = '/home/bunny/archon/worktrees/cloud-clinic/task-validate-whole-suite';
+  const row = (days: number) =>
+    makeContainerEnvironment({
+      id: 'env-repo',
+      codebase_name: 'cloud-clinic',
+      working_path: REPO_PATH,
+      days_since_created: days,
+    });
+  const failedRun = { id: 'a355c282', status: 'failed' };
+
+  beforeEach(() => {
+    mockListActiveContainerEnvironments.mockReset();
+    mockGetLiveRunOwningEnv.mockReset();
+    mockGetLiveRunOwningEnv.mockImplementation(() => Promise.resolve(null));
+    mockProviderDestroy.mockClear();
+    mockProviderInspect.mockReset();
+    mockProviderInspect.mockImplementation(() => Promise.resolve(LIVE_CLEAN));
+    mockUpdateStatus.mockClear();
+    mockGetById.mockReset();
+    mockGetById.mockResolvedValue(
+      makeEnvironment({ id: 'env-repo', provider: 'container', working_path: REPO_PATH })
+    );
+    mockGetCodebase.mockReset();
+    mockGetCodebase.mockResolvedValue(makeCodebase({ kind: 'repo' }));
+  });
+
+  test('a FAILED run past the threshold with a clean, pushed worktree is reclaimed', async () => {
+    mockListActiveContainerEnvironments.mockImplementation(() => Promise.resolve([row(30)]));
+    mockGetLiveRunOwningEnv.mockImplementation(() => Promise.resolve(failedRun));
+
+    const report = await cleanupContainerEnvironments(7);
+
+    expect(mockProviderInspect).toHaveBeenCalledWith(REPO_PATH);
+    expect(mockProviderDestroy).toHaveBeenCalledWith(REPO_PATH);
+    expect(mockUpdateStatus).toHaveBeenCalledWith('env-repo', 'destroyed');
+    expect(report.removed).toEqual(['env-repo']);
+    expect(report.skipped).toEqual([]);
+  });
+
+  test('a FAILED run with uncommitted changes is held, naming the work', async () => {
+    mockListActiveContainerEnvironments.mockImplementation(() => Promise.resolve([row(30)]));
+    mockGetLiveRunOwningEnv.mockImplementation(() => Promise.resolve(failedRun));
+    mockProviderInspect.mockImplementation(() => Promise.resolve({ ...LIVE_CLEAN, dirty: true }));
+
+    const report = await cleanupContainerEnvironments(7);
+
+    expect(mockProviderDestroy).not.toHaveBeenCalled();
+    expect(report.skipped).toEqual([
+      { id: 'env-repo', kind: 'held-work', reason: 'run a355c282 is failed: uncommitted changes' },
+    ]);
+  });
+
+  test('a FAILED run with unpushed commits is held, naming the work', async () => {
+    mockListActiveContainerEnvironments.mockImplementation(() => Promise.resolve([row(30)]));
+    mockGetLiveRunOwningEnv.mockImplementation(() => Promise.resolve(failedRun));
+    mockProviderInspect.mockImplementation(() =>
+      Promise.resolve({ ...LIVE_CLEAN, dirty: true, unpushed: true })
+    );
+
+    const report = await cleanupContainerEnvironments(7);
+
+    expect(mockProviderDestroy).not.toHaveBeenCalled();
+    expect(report.skipped[0]?.kind).toBe('held-work');
+    expect(report.skipped[0]?.reason).toBe(
+      'run a355c282 is failed: uncommitted changes, unpushed commits'
+    );
+  });
+
+  test('a FAILED run younger than the threshold is held by age even when clean', async () => {
+    mockListActiveContainerEnvironments.mockImplementation(() => Promise.resolve([row(4)]));
+    mockGetLiveRunOwningEnv.mockImplementation(() => Promise.resolve(failedRun));
+
+    const report = await cleanupContainerEnvironments(7);
+
+    expect(mockProviderDestroy).not.toHaveBeenCalled();
+    expect(report.skipped).toEqual([
+      { id: 'env-repo', kind: 'age', reason: 'run a355c282 is failed; 4d old (< 7d threshold)' },
+    ]);
+  });
+
+  test('a FAILED run whose worktree is gone but whose stack remains is reclaimed', async () => {
+    mockListActiveContainerEnvironments.mockImplementation(() => Promise.resolve([row(30)]));
+    mockGetLiveRunOwningEnv.mockImplementation(() => Promise.resolve(failedRun));
+    mockProviderInspect.mockImplementation(() =>
+      Promise.resolve({ stackExists: true, worktreeExists: false, dirty: false, unpushed: false })
+    );
+
+    const report = await cleanupContainerEnvironments(7);
+
+    expect(mockProviderDestroy).toHaveBeenCalledWith(REPO_PATH);
+    expect(report.removed).toEqual(['env-repo']);
+  });
+
+  test('a ghost — no stack, no worktree — is reconciled at any age without a teardown', async () => {
+    mockListActiveContainerEnvironments.mockImplementation(() => Promise.resolve([row(1)]));
+    mockGetLiveRunOwningEnv.mockImplementation(() => Promise.resolve(failedRun));
+    mockProviderInspect.mockImplementation(() =>
+      Promise.resolve({ stackExists: false, worktreeExists: false, dirty: false, unpushed: false })
+    );
+
+    const report = await cleanupContainerEnvironments(7);
+
+    expect(mockProviderDestroy).not.toHaveBeenCalled();
+    expect(mockUpdateStatus).toHaveBeenCalledWith('env-repo', 'destroyed');
+    expect(report.reconciled).toEqual(['env-repo']);
+    expect(report.removed).toEqual([]);
+    expect(report.skipped).toEqual([]);
+  });
+
+  test('a run-less ghost is reconciled the same way', async () => {
+    mockListActiveContainerEnvironments.mockImplementation(() => Promise.resolve([row(1)]));
+    mockProviderInspect.mockImplementation(() =>
+      Promise.resolve({ stackExists: false, worktreeExists: false, dirty: false, unpushed: false })
+    );
+
+    const report = await cleanupContainerEnvironments(7);
+
+    expect(mockProviderDestroy).not.toHaveBeenCalled();
+    expect(report.reconciled).toEqual(['env-repo']);
+  });
+
+  test('a RUNNING or PAUSED run is never inspected, let alone reconciled', async () => {
+    mockListActiveContainerEnvironments.mockImplementation(() => Promise.resolve([row(30)]));
+    mockGetLiveRunOwningEnv.mockImplementation(() =>
+      Promise.resolve({ id: 'run-live', status: 'running' })
+    );
+
+    const report = await cleanupContainerEnvironments(7);
+
+    expect(mockProviderInspect).not.toHaveBeenCalled();
+    expect(mockProviderDestroy).not.toHaveBeenCalled();
+    expect(mockUpdateStatus).not.toHaveBeenCalled();
+    expect(report.skipped).toEqual([
+      { id: 'env-repo', kind: 'live-run', reason: 'run run-live is running' },
+    ]);
+  });
+
+  test('an inspection that throws holds the row and reports why — never "clean" by default', async () => {
+    mockListActiveContainerEnvironments.mockImplementation(() => Promise.resolve([row(30)]));
+    mockGetLiveRunOwningEnv.mockImplementation(() => Promise.resolve(failedRun));
+    mockProviderInspect.mockImplementation(() => Promise.reject(new Error('distro unreachable')));
+
+    const report = await cleanupContainerEnvironments(7);
+
+    expect(mockProviderDestroy).not.toHaveBeenCalled();
+    expect(mockUpdateStatus).not.toHaveBeenCalled();
+    expect(report.errors).toEqual([
+      { id: 'env-repo', error: 'inspect failed (NOT reaped): distro unreachable' },
+    ]);
+  });
+
+  test('a run-less row younger than the threshold is held by age, as before', async () => {
+    mockListActiveContainerEnvironments.mockImplementation(() => Promise.resolve([row(2)]));
+
+    const report = await cleanupContainerEnvironments(7);
+
+    expect(mockProviderDestroy).not.toHaveBeenCalled();
+    expect(report.skipped).toEqual([
+      { id: 'env-repo', kind: 'age', reason: '2d old (< 7d threshold)' },
+    ]);
   });
 });
 

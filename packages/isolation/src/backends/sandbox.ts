@@ -168,8 +168,21 @@ export interface SandboxDownSpec {
   worktree: string;
 }
 
+/** What the reap needs to know about a worktree, answered from inside the distro. */
+export interface WorktreeInspection {
+  exists: boolean;
+  /** Uncommitted changes (`git status --porcelain` non-empty). */
+  dirty: boolean;
+  /** Commits reachable from HEAD but from no remote ref. */
+  unpushed: boolean;
+}
+
 /** Marker the existence probe echoes; read out of stdout, never inferred from prose. */
 const WORKTREE_EXISTS_MARKER = 'ARCHON_WORKTREE_EXISTS';
+/** Markers the inspection probe echoes: either the first alone, or the other two. */
+const WT_MISSING_MARKER = 'ARCHON_WT_MISSING';
+const WT_DIRTY_MARKER = 'ARCHON_WT_DIRTY=';
+const WT_UNPUSHED_MARKER = 'ARCHON_WT_UNPUSHED=';
 
 const FETCH_TIMEOUT_MS = 5 * 60 * 1000;
 const GIT_TIMEOUT_MS = 2 * 60 * 1000;
@@ -263,6 +276,43 @@ export class SandboxLifecycle {
         log.warn({ worktree: spec.worktree, err: lastLine(err) }, 'sandbox.down.worktree_failed');
       });
     log.info({ project: spec.project }, 'sandbox.down');
+  }
+
+  /**
+   * Answer the reap's questions about a worktree from INSIDE the distro — a host
+   * stat of a distro path never sees it. `HEAD --not --remotes` is
+   * upstream-config independent: it counts commits on no remote ref at all.
+   * Throws when the probe answers with neither marker set (a broken git, a
+   * missing distro), so the caller fails closed rather than reading "clean".
+   */
+  async inspectWorktree(distro: string, worktree: string): Promise<WorktreeInspection> {
+    const wt = shq(worktree);
+    const { stdout } = await this.deps.wsl(
+      distro,
+      `if [ ! -e ${shq(`${worktree}/.git`)} ]; then echo ${WT_MISSING_MARKER}; exit 0; fi\n` +
+        `echo "${WT_DIRTY_MARKER}$(git -C ${wt} status --porcelain | wc -l)"\n` +
+        `echo "${WT_UNPUSHED_MARKER}$(git -C ${wt} rev-list --count HEAD --not --remotes)"`,
+      { timeoutMs: GIT_TIMEOUT_MS }
+    );
+    const lines = stdout.split('\n').map(l => l.trim());
+    if (lines.includes(WT_MISSING_MARKER)) return { exists: false, dirty: false, unpushed: false };
+    // A marker with no digits after it (git printed an error instead of a count)
+    // is NOT zero — it is an unanswered question, and the caller holds the row.
+    const count = (marker: string): number | undefined => {
+      const raw = lines
+        .find(l => l.startsWith(marker))
+        ?.slice(marker.length)
+        .trim();
+      return raw !== undefined && /^\d+$/.test(raw) ? Number(raw) : undefined;
+    };
+    const dirty = count(WT_DIRTY_MARKER);
+    const unpushed = count(WT_UNPUSHED_MARKER);
+    if (dirty === undefined || unpushed === undefined) {
+      throw new Error(
+        `Sandbox worktree probe for ${worktree} answered without its markers: ${lastLine({ stdout }) ?? '(no output)'}`
+      );
+    }
+    return { exists: true, dirty: dirty > 0, unpushed: unpushed > 0 };
   }
 
   private async worktreeExists(spec: SandboxUpSpec): Promise<boolean> {

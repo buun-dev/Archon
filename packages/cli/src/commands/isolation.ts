@@ -16,10 +16,12 @@ import {
   isPatchEquivalent,
 } from '@archon/git';
 import { getIsolationProvider } from '@archon/isolation';
+import { isHostVisibleEnv } from '@archon/isolation/types';
 import {
   removeEnvironment,
   listContainerEnvironments,
   cleanupContainerEnvironments,
+  type ContainerCleanupReport,
   type RemoveEnvironmentResult,
 } from '@archon/core/services/cleanup-service';
 import {
@@ -124,6 +126,15 @@ export async function isolationCleanupCommand(daysStale = 7): Promise<void> {
     console.log(`\nCleaning: ${env.branch_name ?? env.workflow_id}`);
     console.log(`  Path: ${env.working_path}`);
 
+    // A container env's worktree is a distro path the worktree provider cannot
+    // reach (`fatal: unknown commit` at best); its teardown is the container
+    // reap's below, which addresses the stack rather than the path.
+    if (env.provider && !isHostVisibleEnv(env.provider)) {
+      console.log('  Status: Skipped — container env; left to the container reap');
+      skipped++;
+      continue;
+    }
+
     // Same lock the cleanup-service sweeps use: a run that can still claim the
     // environment blocks removal, even when the conversation recency filter
     // marks the env stale.
@@ -162,25 +173,55 @@ export async function isolationCleanupCommand(daysStale = 7): Promise<void> {
   // Reap orphaned container environments (terminal / run-less, older than the
   // threshold). Paused runs' containers are deliberately skipped (awaited state).
   const containerReport = await cleanupContainerEnvironments(daysStale);
-  const containerTotal =
-    containerReport.removed.length + containerReport.skipped.length + containerReport.errors.length;
-  if (containerTotal > 0) {
+  if (
+    containerReport.removed.length +
+      containerReport.reconciled.length +
+      containerReport.skipped.length +
+      containerReport.errors.length >
+    0
+  ) {
     console.log('\nContainer environments:');
-    for (const id of containerReport.removed) {
-      console.log(`  Removed: ${id.slice(0, 8)}`);
-    }
-    for (const s of containerReport.skipped) {
-      console.log(`  Skipped: ${s.id.slice(0, 8)} — ${s.reason}`);
-    }
-    for (const e of containerReport.errors) {
-      console.error(`  Failed: ${e.id.slice(0, 8)} — ${e.error}`);
-    }
-    console.log(
-      `Container cleanup: ${String(containerReport.removed.length)} removed, ` +
-        `${String(containerReport.skipped.length)} skipped, ` +
-        `${String(containerReport.errors.length)} failed`
-    );
+    printContainerReport(containerReport);
   }
+}
+
+/**
+ * The container reap alone — `archon isolation reap [--days <n>] [--json]`.
+ * This is the scheduled reclaim for container runs (design D9): the second
+ * brain's timer runs it and reads the `--json` report. Deliberately no worktree
+ * sweep: that one is `isolation cleanup`, with its own threshold.
+ */
+export async function isolationReapCommand(
+  daysStale = 7,
+  options: { json?: boolean } = {}
+): Promise<void> {
+  const report = await cleanupContainerEnvironments(daysStale);
+  if (options.json) {
+    console.log(JSON.stringify({ daysStale, ...report }, null, 2));
+    return;
+  }
+  printContainerReport(report);
+}
+
+function printContainerReport(report: ContainerCleanupReport): void {
+  for (const id of report.removed) {
+    console.log(`  Removed: ${id.slice(0, 8)}`);
+  }
+  for (const id of report.reconciled) {
+    console.log(`  Reconciled: ${id.slice(0, 8)} (no stack, no worktree)`);
+  }
+  for (const s of report.skipped) {
+    console.log(`  Skipped: ${s.id.slice(0, 8)} — ${s.reason}`);
+  }
+  for (const e of report.errors) {
+    console.error(`  Failed: ${e.id.slice(0, 8)} — ${e.error}`);
+  }
+  console.log(
+    `Container reap: ${String(report.removed.length)} removed, ` +
+      `${String(report.reconciled.length)} reconciled, ` +
+      `${String(report.skipped.length)} skipped, ` +
+      `${String(report.errors.length)} failed`
+  );
 }
 
 /**

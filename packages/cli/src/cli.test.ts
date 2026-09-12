@@ -393,6 +393,7 @@ Commands:
                              scratch worktree of HEAD
   isolation list             List all active worktrees/environments
   isolation cleanup [days]   Remove stale environments (default: 7 days)
+  isolation reap [days]      Reclaim container environments older than N days (default: 7); --json for the report
   isolation cleanup --merged Remove environments with branches merged into main
   complete <branch> [...]    Complete branch lifecycle (remove worktree + branches)
   serve                      Start the web UI server (binary installs download it on first run)

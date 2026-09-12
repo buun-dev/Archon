@@ -340,11 +340,11 @@ describe('ContainerProvider.reattach (resume / D8 recovery)', () => {
 
     const env = await provider.reattach('/home/bunny/archon/worktrees/marphob-page/task-x');
 
-    // The container may be stopped after a kill/docker-restart, so `start` runs
-    // BEFORE the id is resolved (D8).
+    // The stack may be stopped after a kill, a docker restart, or a terminal
+    // run's `compose stop` (which stops db as well as agent), so `start` runs
+    // over EVERY service BEFORE the id is resolved (D8).
     const started = runners.calls.docker.find(a => a.includes('start'));
-    expect(started).toContain('archon-marphob-page-task-x');
-    expect(started).toContain('agent');
+    expect(started).toEqual(['compose', '-p', 'archon-marphob-page-task-x', 'start']);
 
     expect(env.provider).toBe('container');
     if (env.provider !== 'container') throw new Error('expected a container environment');
@@ -353,6 +353,140 @@ describe('ContainerProvider.reattach (resume / D8 recovery)', () => {
     expect(env.branchName).toBe(toBranchName('sandbox/task-x'));
     // reattach must NOT re-run the lifecycle (no re-provision on resume).
     expect(runners.calls.wsl).toHaveLength(0);
+  });
+});
+
+describe('ContainerProvider.stop (terminal run)', () => {
+  test('stops EVERY service of the compose project for the working path, and nothing else', async () => {
+    const runners = makeRunners();
+    const provider = new ContainerProvider({ ...runners, loadConfig: async () => null });
+
+    await provider.stop('/home/u/archon/worktrees/marphob-page/task-x');
+
+    expect(runners.calls.docker).toEqual([['compose', '-p', 'archon-marphob-page-task-x', 'stop']]);
+    // A stop is not a teardown: nothing runs in the distro, the worktree stays.
+    expect(runners.calls.wsl).toHaveLength(0);
+  });
+});
+
+describe('ContainerProvider.inspect (reap evidence)', () => {
+  const WT = '/home/u/archon/worktrees/marphob-page/task-x';
+  /** A docker fake whose `compose ls` lists the given projects. */
+  const dockerListing =
+    (projects: string[], calls: string[][]) =>
+    async (args: string[]): Promise<{ stdout: string; stderr: string }> => {
+      calls.push(args);
+      if (args[0] === 'compose' && args[1] === 'ls') {
+        return { stdout: JSON.stringify(projects.map(Name => ({ Name }))), stderr: '' };
+      }
+      return { stdout: '', stderr: '' };
+    };
+  /** A wsl fake that answers the worktree probe with the given marker lines. */
+  const wslAnswering =
+    (stdout: string, scripts: string[]): WslRunner =>
+    async (_distro, script) => {
+      scripts.push(script);
+      return { stdout, stderr: '' };
+    };
+
+  test('a live stack over a clean, pushed worktree', async () => {
+    const runners = makeRunners();
+    const docker: string[][] = [];
+    const scripts: string[] = [];
+    const provider = new ContainerProvider({
+      ...runners,
+      docker: dockerListing(['archon-marphob-page-task-x', 'archon-bunshee-task-y'], docker),
+      wsl: wslAnswering('ARCHON_WT_DIRTY=0\nARCHON_WT_UNPUSHED=0\n', scripts),
+      loadConfig: async () => null,
+    });
+
+    const result = await provider.inspect(WT);
+
+    expect(result).toEqual({
+      stackExists: true,
+      worktreeExists: true,
+      dirty: false,
+      unpushed: false,
+    });
+    // The stack question goes to compose's own listing, never a host stat.
+    expect(docker).toContainEqual(['compose', 'ls', '--all', '--format', 'json']);
+    // The worktree questions run INSIDE the distro, against the worktree itself.
+    const script = scripts.join('\n');
+    expect(script).toContain(`git -C ${WT} status --porcelain`);
+    expect(script).toContain(`git -C ${WT} rev-list --count HEAD --not --remotes`);
+  });
+
+  test('uncommitted changes and unpushed commits are both reported', async () => {
+    const runners = makeRunners();
+    const provider = new ContainerProvider({
+      ...runners,
+      docker: dockerListing(['archon-marphob-page-task-x'], []),
+      wsl: wslAnswering('ARCHON_WT_DIRTY=3\nARCHON_WT_UNPUSHED=1\n', []),
+      loadConfig: async () => null,
+    });
+
+    expect(await provider.inspect(WT)).toEqual({
+      stackExists: true,
+      worktreeExists: true,
+      dirty: true,
+      unpushed: true,
+    });
+  });
+
+  test('a ghost: no compose project and no worktree in the distro', async () => {
+    const runners = makeRunners();
+    const provider = new ContainerProvider({
+      ...runners,
+      docker: dockerListing(['archon-bunshee-task-y'], []),
+      wsl: wslAnswering('ARCHON_WT_MISSING\n', []),
+      loadConfig: async () => null,
+    });
+
+    expect(await provider.inspect(WT)).toEqual({
+      stackExists: false,
+      worktreeExists: false,
+      dirty: false,
+      unpushed: false,
+    });
+  });
+
+  test('a marker with no count after it (git errored) throws rather than reading as zero', async () => {
+    const runners = makeRunners();
+    const provider = new ContainerProvider({
+      ...runners,
+      docker: dockerListing(['archon-marphob-page-task-x'], []),
+      wsl: wslAnswering('ARCHON_WT_DIRTY=0\nARCHON_WT_UNPUSHED=\n', []),
+      loadConfig: async () => null,
+    });
+
+    await expect(provider.inspect(WT)).rejects.toThrow(/worktree probe/);
+  });
+
+  test('a probe that answers with neither marker set throws — the caller must fail closed', async () => {
+    const runners = makeRunners();
+    const provider = new ContainerProvider({
+      ...runners,
+      docker: dockerListing(['archon-marphob-page-task-x'], []),
+      wsl: wslAnswering('fatal: not a git repository\n', []),
+      loadConfig: async () => null,
+    });
+
+    await expect(provider.inspect(WT)).rejects.toThrow(/worktree probe/);
+  });
+
+  test('a compose listing that cannot be read throws rather than reading as "no stack"', async () => {
+    const runners = makeRunners();
+    const provider = new ContainerProvider({
+      ...runners,
+      docker: async (): Promise<{ stdout: string; stderr: string }> => ({
+        stdout: 'error during connect',
+        stderr: '',
+      }),
+      wsl: wslAnswering('ARCHON_WT_DIRTY=0\nARCHON_WT_UNPUSHED=0\n', []),
+      loadConfig: async () => null,
+    });
+
+    await expect(provider.inspect(WT)).rejects.toThrow(/compose ls/);
   });
 });
 

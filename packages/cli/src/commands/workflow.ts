@@ -505,10 +505,15 @@ function containerProviderDeps(): ContainerProviderDeps {
  */
 function isContainerCapableProvider(
   provider: IIsolationProvider
-): provider is IIsolationProvider & Pick<ContainerProvider, 'reattach' | 'writeBackBackend'> {
-  const candidate = provider as Partial<Pick<ContainerProvider, 'reattach' | 'writeBackBackend'>>;
+): provider is IIsolationProvider &
+  Pick<ContainerProvider, 'reattach' | 'writeBackBackend' | 'stop'> {
+  const candidate = provider as Partial<
+    Pick<ContainerProvider, 'reattach' | 'writeBackBackend' | 'stop'>
+  >;
   return (
-    typeof candidate.writeBackBackend === 'function' && typeof candidate.reattach === 'function'
+    typeof candidate.writeBackBackend === 'function' &&
+    typeof candidate.reattach === 'function' &&
+    typeof candidate.stop === 'function'
   );
 }
 
@@ -2537,6 +2542,11 @@ async function runWorkflowWithOwnedSource(
   // drives auto-teardown (D6): tearing a repo run down would delete the worktree
   // and branch its PR is opened from.
   let containerWriteBack: ContainerWriteBackBackend | undefined;
+  // A repo container run's end-of-run verb (sandbox-lifecycle D8): STOP the
+  // whole stack — agent and the repo's services — on every terminal outcome, so
+  // the RAM goes back and the worktree, branch, volumes and row stay for a
+  // resume or the reap. Set by the repo container branches only.
+  let containerStop: (() => Promise<void>) | undefined;
 
   // Between-run continuation (#2747): resolve the declared adoption BEFORE any
   // lane decision — it dictates the lane, fail-loud (never a silent fresh
@@ -3015,6 +3025,7 @@ async function runWorkflowWithOwnedSource(
           );
         }
         containerWriteBack = provider.writeBackBackend(isolatedEnv.workingPath);
+        containerStop = (): Promise<void> => provider.stop(isolatedEnv.workingPath);
         containerEnvId = envRecord.id;
       }
       getLog().info({ path: workingCwd }, 'worktree_created');
@@ -3052,6 +3063,7 @@ async function runWorkflowWithOwnedSource(
     }
     execContext = reattached.execContext;
     containerWriteBack = provider.writeBackBackend(matchingEnv.working_path);
+    containerStop = (): Promise<void> => provider.stop(matchingEnv.working_path);
     containerEnvId = matchingEnv.id;
   } else if (options.noWorktree) {
     getLog().info({ cwd }, 'workflow.running_without_isolation');
@@ -3220,6 +3232,19 @@ async function runWorkflowWithOwnedSource(
               `\nWARNING: could not remove the isolation container on ${signal}: ` +
                 `${(destroyErr as Error).message}. Remove it manually: ` +
                 'docker ps -a --filter label=diy.archon.managed=true'
+            );
+          }
+        }
+        // A repo container run's stack is stopped, not destroyed (D8) — here for
+        // the same reason as above: the forced exit skips the teardown `finally`.
+        if (containerStop) {
+          try {
+            await containerStop();
+          } catch (stopErr) {
+            console.error(
+              `\nWARNING: could not stop the sandbox stack on ${signal}: ` +
+                `${(stopErr as Error).message}. The scheduled reap reclaims it; or run ` +
+                '`docker compose ls` and `docker compose -p <project> stop` now.'
             );
           }
         }
@@ -3541,6 +3566,30 @@ async function runWorkflowWithOwnedSource(
           'workflow.container_destroy_failed'
         );
         containerTeardownError = destroyErr as Error;
+      }
+    }
+    // Repo container run (D8): every terminal outcome stops the stack; a PAUSED
+    // run keeps the agent the engine already suspended. Nothing is destroyed —
+    // the worktree and branch are the run's output, the row is its resume handle,
+    // and the reap is what reclaims them later. A stack that will not stop is
+    // surfaced the way a leaked folder container is: loud, and fatal to an
+    // otherwise-successful run.
+    if (containerStop && !runPaused) {
+      try {
+        await containerStop();
+        console.log('Sandbox stack stopped (worktree and branch kept).');
+        getLog().info({ envId: containerEnvId }, 'workflow.sandbox_stack_stopped');
+      } catch (stopErr) {
+        console.error(
+          `\nWARNING: failed to stop the sandbox stack: ${(stopErr as Error).message}\n` +
+            'It is still running. The scheduled reap reclaims it after the threshold; to free ' +
+            'it now: `docker compose ls`, then `docker compose -p <project> stop`.'
+        );
+        getLog().error(
+          { err: stopErr as Error, envId: containerEnvId },
+          'workflow.sandbox_stack_stop_failed'
+        );
+        containerTeardownError = stopErr as Error;
       }
     }
   }

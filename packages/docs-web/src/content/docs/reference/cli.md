@@ -890,6 +890,37 @@ stays resumable, and removing its environment deletes the local branch that
 conversations still pass the activity filter; the live-run lock is what keeps them on
 disk until no run can claim them.
 
+### `isolation reap [days]`
+
+Reclaim container environments only — no worktree sweep. This is the scheduled reclaim
+for container runs: put it on a timer.
+
+```bash
+# Default: 7 days
+archon isolation reap
+
+# Custom threshold; machine-readable report
+archon isolation reap 3 --json
+```
+
+A repo-kind container run's stack is **stopped**, never destroyed, when the run ends
+(the worktree, its `sandbox/<slug>` branch, and the run's volumes stay for `--resume`).
+The reap is what reclaims them, by four rules, in order:
+
+- a row owned by a running, pending, or paused run is never touched;
+- a row whose compose project **and** distro worktree are both gone is a ghost and is
+  marked `destroyed` at any age (`reconciled` in the report);
+- a row owned by a **failed** run is released only past the threshold and only when its
+  worktree is gone, or clean with every commit on a remote — checked inside the WSL
+  distro, where the worktree lives. Uncommitted or unpushed work holds the row
+  (`skipped` with `kind: "held-work"`; push or `workflow abandon` to release it);
+- any other row past the threshold is reaped.
+
+A probe that cannot answer — an unreachable distro, an unreadable compose listing —
+holds the row and is listed under `errors`; the reap never reads silence as "clean".
+Folder-project container environments keep the plain claimability rule: a failed
+run's overlay volume is its only copy.
+
 ### `validate workflows [name]`
 
 Validate workflow YAML definitions and their referenced resources (command files, MCP configs, skill directories).

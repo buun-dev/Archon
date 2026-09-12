@@ -19,7 +19,12 @@ import type {
   PrState,
   ContainerBackendConfig,
   SandboxHostConfig,
+  SandboxInspection,
 } from '@archon/isolation';
+import {
+  isTerminalRunStatus,
+  type WorkflowRunStatus,
+} from '@archon/workflows/schemas/workflow-run';
 import {
   hasUncommittedChanges,
   worktreeExists,
@@ -113,10 +118,27 @@ export interface ContainerEnvSummary {
   runStatus: string | null;
 }
 
+/**
+ * Why a container env was left alone this pass. `held-work` is the one an
+ * operator has to act on (push or abandon); `age` and `live-run` resolve
+ * themselves.
+ */
+export type ContainerSkipKind = 'live-run' | 'age' | 'held-work';
+
 export interface ContainerCleanupReport {
   removed: string[];
-  skipped: { id: string; reason: string }[];
+  /** Rows flipped to `destroyed` because neither their stack nor their worktree exists (D11). */
+  reconciled: string[];
+  skipped: { id: string; kind: ContainerSkipKind; reason: string }[];
   errors: { id: string; error: string }[];
+}
+
+/** The repo-kind sandbox provider, addressed at the machine's configured distro. */
+function repoSandboxProvider(): ContainerProvider {
+  return new ContainerProvider({
+    loadHostConfig: async (): Promise<SandboxHostConfig | null> =>
+      (await loadGlobalConfig()).isolation?.container ?? null,
+  });
 }
 
 /**
@@ -150,10 +172,7 @@ export async function reclaimContainerEnv(envId: string): Promise<void> {
     // worktree in the distro. Addressed by working path, as every provider method
     // is; the machine's `isolation.container` says which distro and where the
     // base clones live.
-    await new ContainerProvider({
-      loadHostConfig: async (): Promise<SandboxHostConfig | null> =>
-        (await loadGlobalConfig()).isolation?.container ?? null,
-    }).destroy(row.working_path);
+    await repoSandboxProvider().destroy(row.working_path);
     await isolationEnvDb.updateStatus(envId, 'destroyed');
     return;
   }
@@ -203,11 +222,22 @@ export async function listContainerEnvironments(): Promise<readonly ContainerEnv
  * garbage (No-Autonomous-Lifecycle-Mutation Across Process Boundaries), and is
  * surfaced by `isolation list` with its age instead. All pruning is label-scoped
  * (via the tracking row), never a bare `docker prune`.
+ *
+ * Repo-kind rows get two more answers, both read from where the estate lives
+ * (compose's listing, git inside the distro) rather than from a host stat:
+ * - a row whose stack AND worktree are both gone is a ghost — flipped to
+ *   `destroyed` at any age, since there is nothing left to claim (D11);
+ * - a FAILED run's row is released after the threshold when its worktree is
+ *   gone or clean with every commit on a remote — the branch then holds all the
+ *   run could resume from, and a reap loses nothing (D10). Uncommitted or
+ *   unpushed work holds the row and is reported as `held-work`.
+ * Folder-kind rows keep the claimability rule alone: their overlay volume is a
+ * failed run's only copy.
  */
 export async function cleanupContainerEnvironments(
   daysStale = STALE_THRESHOLD_DAYS
 ): Promise<ContainerCleanupReport> {
-  const report: ContainerCleanupReport = { removed: [], skipped: [], errors: [] };
+  const report: ContainerCleanupReport = { removed: [], reconciled: [], skipped: [], errors: [] };
   const rows = await isolationEnvDb.listActiveContainerEnvironments();
   if (rows.length === 0) return report;
 
@@ -230,17 +260,50 @@ export async function cleanupContainerEnvironments(
       getLog().warn({ err, envId: row.id }, 'container_env_reap_lookup_failed');
       continue;
     }
-    if (liveRun) {
-      report.skipped.push({
-        id: row.id,
-        reason: `run ${liveRun.id.slice(0, 8)} is ${liveRun.status}`,
-      });
+    const liveRunLabel = liveRun ? `run ${liveRun.id.slice(0, 8)} is ${liveRun.status}` : '';
+    // Only a terminal live run (failed — terminal AND resumable) can be released
+    // below; a running, pending or paused run is being worked and is never probed.
+    if (liveRun && !isTerminalRunStatus(liveRun.status as WorkflowRunStatus)) {
+      report.skipped.push({ id: row.id, kind: 'live-run', reason: liveRunLabel });
+      continue;
+    }
+    const codebase = await codebaseDb.getCodebase(row.codebase_id);
+    if (codebase?.kind !== 'folder') {
+      let inspection: SandboxInspection;
+      try {
+        inspection = await repoSandboxProvider().inspect(row.working_path);
+      } catch (err) {
+        report.errors.push({
+          id: row.id,
+          error: `inspect failed (NOT reaped): ${(err as Error).message}`,
+        });
+        getLog().warn({ err, envId: row.id }, 'container_env_inspect_failed');
+        continue;
+      }
+      if (!inspection.stackExists && !inspection.worktreeExists) {
+        await isolationEnvDb.updateStatus(row.id, 'destroyed');
+        report.reconciled.push(row.id);
+        getLog().info({ envId: row.id, runId: liveRun?.id }, 'container_env_ghost_reconciled');
+        continue;
+      }
+      if (liveRun && inspection.worktreeExists && (inspection.dirty || inspection.unpushed)) {
+        const work = [
+          ...(inspection.dirty ? ['uncommitted changes'] : []),
+          ...(inspection.unpushed ? ['unpushed commits'] : []),
+        ].join(', ');
+        report.skipped.push({ id: row.id, kind: 'held-work', reason: `${liveRunLabel}: ${work}` });
+        continue;
+      }
+    } else if (liveRun) {
+      report.skipped.push({ id: row.id, kind: 'live-run', reason: liveRunLabel });
       continue;
     }
     if (row.days_since_created < daysStale) {
+      const age = `${Math.floor(row.days_since_created)}d old (< ${daysStale}d threshold)`;
       report.skipped.push({
         id: row.id,
-        reason: `${Math.floor(row.days_since_created)}d old (< ${daysStale}d threshold)`,
+        kind: 'age',
+        reason: liveRun ? `${liveRunLabel}; ${age}` : age,
       });
       continue;
     }
@@ -251,8 +314,8 @@ export async function cleanupContainerEnvironments(
       // the one function keeps the scheduled and on-demand paths from drifting.
       await reclaimContainerEnv(row.id);
       report.removed.push(row.id);
-      // No runId: the reap only happens when no run can still claim this env.
-      getLog().info({ envId: row.id }, 'container_env_reaped');
+      // runId only when a FAILED run was released (D10); otherwise no run could claim this env.
+      getLog().info({ envId: row.id, runId: liveRun?.id }, 'container_env_reaped');
     } catch (err) {
       report.errors.push({ id: row.id, error: (err as Error).message });
       getLog().warn({ err, envId: row.id }, 'container_env_reap_failed');

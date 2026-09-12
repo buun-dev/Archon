@@ -14,6 +14,7 @@ import {
   isolationCompleteCommand,
   isolationCleanupCommand,
   isolationCleanupMergedCommand,
+  isolationReapCommand,
 } from './isolation';
 
 const mockLogger = {
@@ -73,7 +74,7 @@ const mockCleanupMergedWorktrees = mock<typeof CleanupService.cleanupMergedWorkt
   Promise.resolve({ removed: [], skipped: [] })
 );
 const mockCleanupContainerEnvironments = mock<typeof CleanupService.cleanupContainerEnvironments>(
-  () => Promise.resolve({ removed: [], skipped: [], errors: [] })
+  () => Promise.resolve({ removed: [], reconciled: [], skipped: [], errors: [] })
 );
 
 mock.module('@archon/core/services/cleanup-service', () => ({
@@ -811,5 +812,92 @@ describe('isolationCleanupCommand', () => {
     expect(consoleLogSpy).toHaveBeenCalledWith(
       '\nCleanup complete: 0 cleaned, 1 skipped, 0 failed'
     );
+  });
+
+  // findStaleEnvironments returns container rows too; their worktree is a distro
+  // path the worktree provider cannot see, and their teardown is the container
+  // reap's. The sweep must leave them to it rather than fail on each one.
+  it('leaves a stale CONTAINER row to the container reap instead of the worktree provider', async () => {
+    mockFindStaleEnvironments.mockResolvedValueOnce([
+      {
+        ...mockEnv,
+        id: 'env-container-1',
+        provider: 'container',
+        working_path: '/home/u/archon/worktrees/repo/task-x',
+      },
+    ]);
+
+    await isolationCleanupCommand(7);
+
+    expect(mockDestroyWorktree).not.toHaveBeenCalled();
+    expect(mockUpdateStatus).not.toHaveBeenCalled();
+    expect(consoleLogSpy).toHaveBeenCalledWith(
+      '  Status: Skipped — container env; left to the container reap'
+    );
+    expect(mockCleanupContainerEnvironments).toHaveBeenCalledWith(7);
+  });
+});
+
+describe('isolationReapCommand', () => {
+  let consoleLogSpy: ReturnType<typeof spyOn>;
+  let consoleErrorSpy: ReturnType<typeof spyOn>;
+
+  beforeEach(() => {
+    consoleLogSpy = spyOn(console, 'log').mockImplementation(() => {});
+    consoleErrorSpy = spyOn(console, 'error').mockImplementation(() => {});
+    mockFindStaleEnvironments.mockReset();
+    mockFindStaleEnvironments.mockResolvedValue([]);
+    mockDestroyWorktree.mockReset();
+    mockCleanupContainerEnvironments.mockReset();
+    mockCleanupContainerEnvironments.mockResolvedValue({
+      removed: ['aa271d53-0000'],
+      reconciled: ['35c7d928-0000', '24449ed7-0000'],
+      skipped: [
+        { id: 'e1e1e1e1-0000', kind: 'held-work', reason: 'run r1 is failed: unpushed commits' },
+      ],
+      errors: [{ id: 'e2e2e2e2-0000', error: 'inspect failed (NOT reaped): distro unreachable' }],
+    });
+  });
+
+  afterEach(() => {
+    consoleLogSpy.mockRestore();
+    consoleErrorSpy.mockRestore();
+  });
+
+  it('runs ONLY the container reap at the given threshold — no worktree sweep', async () => {
+    await isolationReapCommand(7);
+
+    expect(mockCleanupContainerEnvironments).toHaveBeenCalledWith(7);
+    expect(mockFindStaleEnvironments).not.toHaveBeenCalled();
+    expect(mockDestroyWorktree).not.toHaveBeenCalled();
+    expect(consoleLogSpy).toHaveBeenCalledWith('  Removed: aa271d53');
+    expect(consoleLogSpy).toHaveBeenCalledWith('  Reconciled: 35c7d928 (no stack, no worktree)');
+    expect(consoleLogSpy).toHaveBeenCalledWith(
+      '  Skipped: e1e1e1e1 — run r1 is failed: unpushed commits'
+    );
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
+      '  Failed: e2e2e2e2 — inspect failed (NOT reaped): distro unreachable'
+    );
+    expect(consoleLogSpy).toHaveBeenCalledWith(
+      'Container reap: 1 removed, 2 reconciled, 1 skipped, 1 failed'
+    );
+  });
+
+  it('--json prints the report as one JSON document and nothing else', async () => {
+    await isolationReapCommand(3, { json: true });
+
+    expect(mockCleanupContainerEnvironments).toHaveBeenCalledWith(3);
+    expect(consoleLogSpy).toHaveBeenCalledTimes(1);
+    expect(consoleErrorSpy).not.toHaveBeenCalled();
+    const printed = JSON.parse(String(consoleLogSpy.mock.calls[0]?.[0])) as unknown;
+    expect(printed).toEqual({
+      daysStale: 3,
+      removed: ['aa271d53-0000'],
+      reconciled: ['35c7d928-0000', '24449ed7-0000'],
+      skipped: [
+        { id: 'e1e1e1e1-0000', kind: 'held-work', reason: 'run r1 is failed: unpushed commits' },
+      ],
+      errors: [{ id: 'e2e2e2e2-0000', error: 'inspect failed (NOT reaped): distro unreachable' }],
+    });
   });
 });

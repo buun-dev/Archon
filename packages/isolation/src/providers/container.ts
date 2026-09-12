@@ -90,6 +90,22 @@ export const SANDBOX_COMPOSE_FILE = join(
 );
 
 const DOCKER_QUERY_TIMEOUT_MS = 30 * 1000;
+/** `compose stop` waits for each container's stop grace period (10 s default). */
+const COMPOSE_STOP_TIMEOUT_MS = 2 * 60 * 1000;
+
+/**
+ * What the reap asks about a sandbox: is its compose project still known to
+ * Docker, and what does its worktree hold. Every answer comes from the side of
+ * the boundary that can see it — compose's own listing, git inside the distro.
+ */
+export interface SandboxInspection {
+  stackExists: boolean;
+  worktreeExists: boolean;
+  /** Uncommitted changes in the worktree; false when it is absent. */
+  dirty: boolean;
+  /** Commits on no remote ref; false when the worktree is absent. */
+  unpushed: boolean;
+}
 /** The preflight's whole budget is seconds — it must never look like provisioning. */
 const WSL_PROBE_TIMEOUT_MS = 20 * 1000;
 
@@ -474,6 +490,40 @@ export class ContainerProvider implements IIsolationProvider {
   }
 
   /**
+   * Stop every service of a run's stack (D8): the agent AND whatever the repo's
+   * overlay declares. A terminal run frees its RAM this way and keeps its
+   * worktree, branch, volumes and row; `reattach` starts the stack again.
+   * Throws on a docker failure — the CLI surfaces a stack it could not stop.
+   */
+  async stop(workingPath: string): Promise<void> {
+    const project = composeProjectFromWorkingPath(workingPath);
+    await this.docker(['compose', '-p', project, 'stop'], { timeout: COMPOSE_STOP_TIMEOUT_MS });
+  }
+
+  /**
+   * The reap's evidence for one sandbox (D10, D11). Throws on any probe that
+   * cannot answer — an unreadable compose listing, a worktree probe without its
+   * markers — so the caller holds the row rather than reading silence as "gone".
+   */
+  async inspect(workingPath: string): Promise<SandboxInspection> {
+    const { repo, slug } = repoSlugFromWorkingPath(workingPath);
+    const project = composeProjectFor(repo, slug);
+    const { stdout } = await this.docker(['compose', 'ls', '--all', '--format', 'json'], {
+      timeout: DOCKER_QUERY_TIMEOUT_MS,
+    });
+    let entries: { Name?: string }[];
+    try {
+      entries = JSON.parse(stdout || '[]') as { Name?: string }[];
+    } catch {
+      throw new Error(`docker compose ls did not answer with JSON: ${stdout.trim().slice(0, 200)}`);
+    }
+    const stackExists = entries.some(e => e.Name === project);
+    const host = await this.host();
+    const wt = await this.lifecycle.inspectWorktree(host.distro, workingPath);
+    return { stackExists, worktreeExists: wt.exists, dirty: wt.dirty, unpushed: wt.unpushed };
+  }
+
+  /**
    * Best-effort teardown (mirrors WorktreeProvider.destroy's contract): composes
    * the stack down `-v` and removes the worktree + `sandbox/<slug>` branch in the
    * distro. Every step is best-effort inside the lifecycle — the run is already
@@ -642,12 +692,14 @@ export class ContainerProvider implements IIsolationProvider {
 
   /**
    * Resolve the compose `agent` service to a concrete container id (2a). `start`
-   * first so a resume after a docker restart re-runs the stopped service; harmless
-   * on a fresh `up`. Fails loud when nothing resolves — a silent '' would build a
-   * broken execContext that only surfaces at the first node exec.
+   * first — every service, since a terminal run's `stop` (D8) stops the repo's
+   * services as well as the agent — so a resume after a stop or a docker restart
+   * re-runs what is stopped; harmless on a fresh `up`. Fails loud when nothing
+   * resolves — a silent '' would build a broken execContext that only surfaces at
+   * the first node exec.
    */
   private async resolveContainerId(project: string): Promise<string> {
-    await this.docker(['compose', '-p', project, 'start', 'agent'], {
+    await this.docker(['compose', '-p', project, 'start'], {
       timeout: DOCKER_QUERY_TIMEOUT_MS,
     }).catch(() => undefined);
     const { stdout } = await this.docker(['compose', '-p', project, 'ps', '-q', 'agent'], {

@@ -250,6 +250,7 @@ const mockSelectIsolationProvider = mock((providerType?: string) =>
           applyChanges: mock(() => Promise.reject(new Error('no overlay write-back'))),
           discardChanges: mock(() => Promise.reject(new Error('no overlay write-back'))),
         })),
+        stop: mock(() => Promise.resolve()),
         reattach: mock(() => Promise.reject(new Error('reattach not stubbed for this test'))),
       }
     : mockGetIsolationProvider()
@@ -3255,6 +3256,120 @@ describe('workflowRunCommand', () => {
     expect(isolationDb.create).toHaveBeenLastCalledWith(
       expect.objectContaining({ provider: 'container' })
     );
+  });
+
+  // Design D8: a repo-kind container run's stack is STOPPED when the run ends —
+  // every terminal outcome — and never destroyed: the worktree, its branch and
+  // the env row are the run's durable output (`--resume` reattaches). A paused
+  // run is the engine's to suspend; the CLI leaves it alone.
+  describe('repo container run end (D8)', () => {
+    /** Never called by a repo container run's end: the worktree is the run's output. */
+    const destroy = mock(() => Promise.resolve());
+
+    /** Drive one repo-kind container dispatch through workflowRunCommand. */
+    async function dispatchContainerRun(
+      stop: ReturnType<typeof mock>,
+      result: unknown
+    ): Promise<void> {
+      destroy.mockClear();
+      const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+      const { executeWorkflow } = await import('@archon/workflows/executor');
+      const conversationDb = await import('@archon/core/db/conversations');
+      const codebaseDb = await import('@archon/core/db/codebases');
+      const core = await import('@archon/core');
+      const isolation = await import('@archon/isolation');
+
+      (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+        workflows: [makeTestWorkflowWithSource({ name: 'assist', description: 'Help' })],
+        errors: [],
+      });
+      (conversationDb.getOrCreateConversation as ReturnType<typeof mock>).mockResolvedValueOnce({
+        id: 'conv-d8',
+      });
+      (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
+        id: 'cb-d8',
+        default_cwd: '/test/path',
+      });
+      (core.loadRepoConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+        isolation: { provider: 'container' },
+      });
+      (isolation.selectIsolationProvider as ReturnType<typeof mock>).mockImplementationOnce(() => ({
+        providerType: 'container' as const,
+        create: mock(() =>
+          Promise.resolve({
+            provider: 'container',
+            id: '/home/u/archon/worktrees/repo/task-d8',
+            workingPath: '/home/u/archon/worktrees/repo/task-d8',
+            branchName: 'sandbox/task-d8',
+            status: 'active',
+            createdAt: new Date(),
+            metadata: { adopted: false },
+            execContext: { kind: 'container' as const, containerId: 'cid-d8' },
+            project: 'archon-repo-task-d8',
+          })
+        ),
+        healthCheck: mock(() => Promise.resolve(true)),
+        writeBackBackend: mock(() => ({
+          suspend: mock(() => Promise.resolve()),
+          finalize: mock(() => Promise.resolve({ requiresApproval: false })),
+          applyChanges: mock(() => Promise.reject(new Error('no overlay write-back'))),
+          discardChanges: mock(() => Promise.reject(new Error('no overlay write-back'))),
+        })),
+        stop,
+        destroy,
+        reattach: mock(() => Promise.reject(new Error('reattach not stubbed for this test'))),
+      }));
+      (conversationDb.updateConversation as ReturnType<typeof mock>).mockResolvedValueOnce(
+        undefined
+      );
+      (executeWorkflow as ReturnType<typeof mock>).mockResolvedValueOnce(result);
+
+      await workflowRunCommand('/test/path', 'assist', 'hello');
+    }
+
+    it('stops the whole stack when the run completes; the env row is never destroyed', async () => {
+      const stop = mock(() => Promise.resolve());
+
+      await dispatchContainerRun(stop, { success: true, workflowRunId: 'run-d8' });
+
+      expect(stop).toHaveBeenCalledWith('/home/u/archon/worktrees/repo/task-d8');
+      expect(destroy).not.toHaveBeenCalled();
+      expect(consoleSpy).toHaveBeenCalledWith('Sandbox stack stopped (worktree and branch kept).');
+    });
+
+    it('stops the stack when the run fails too — the RAM leak is the same either way', async () => {
+      const stop = mock(() => Promise.resolve());
+
+      await expect(
+        dispatchContainerRun(stop, { success: false, workflowRunId: 'run-d8', error: 'boom' })
+      ).rejects.toThrow();
+
+      expect(stop).toHaveBeenCalledWith('/home/u/archon/worktrees/repo/task-d8');
+    });
+
+    it('leaves a PAUSED run alone — the engine already suspended the agent for resume', async () => {
+      const stop = mock(() => Promise.resolve());
+
+      await dispatchContainerRun(stop, { success: true, paused: true, workflowRunId: 'run-d8' });
+
+      expect(stop).not.toHaveBeenCalled();
+    });
+
+    it('a stack that will not stop fails an otherwise-successful run, loudly', async () => {
+      const stop = mock(() => Promise.reject(new Error('compose stop: daemon gone')));
+      const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
+
+      try {
+        await expect(
+          dispatchContainerRun(stop, { success: true, workflowRunId: 'run-d8' })
+        ).rejects.toThrow(/daemon gone/);
+        expect(errorSpy).toHaveBeenCalledWith(
+          expect.stringContaining('failed to stop the sandbox stack')
+        );
+      } finally {
+        errorSpy.mockRestore();
+      }
+    });
   });
 
   // Slice 4, foreground half. CHARACTERIZATION, not a red-first test: this ordering

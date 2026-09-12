@@ -91,6 +91,7 @@ export type {
   ContainerPrerequisites,
   RepoSandboxConfigLoader,
   SandboxHostConfigLoader,
+  SandboxInspection,
 } from './providers/container';
 export type { RepoSandboxConfig, SandboxHostConfig } from './backends/sandbox';
 
