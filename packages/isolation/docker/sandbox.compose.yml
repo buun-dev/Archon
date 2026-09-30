@@ -38,6 +38,11 @@ services:
       GH_TOKEN: ${GH_TOKEN:-}
       # Browsers live in the SHARED cache volume below, not the container layer.
       PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
+      # Repos pin different Playwright versions, and a plain `playwright install`
+      # (every repo's provision step runs one) prunes every revision its own checkout
+      # doesn't use — i.e. every OTHER repo's browser — which the firewalled container
+      # then can't re-download. Set here so no process in any stack can GC the cache.
+      PLAYWRIGHT_SKIP_BROWSER_GC: "1"
     volumes:
       - ${ARCHON_WORKTREE}:${ARCHON_WORKTREE}
       # The worktree's .git file references the base clone's gitdir by absolute
