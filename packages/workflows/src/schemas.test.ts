@@ -6,6 +6,7 @@ import {
   bodySessionCursorsSchema,
   bodySessionCursorAncestrySchema,
 } from './schemas/workflow-run';
+import { containsSubRun } from './schemas/dag-node';
 import {
   isExecNode,
   isGateNode,
@@ -240,6 +241,48 @@ describe('persisted workflow continuation schemas', () => {
         ...scheduled,
         resumeAt: '2026-08-27T10:00:00.000Z',
       }).success
+    ).toBe(false);
+  });
+});
+
+// The repo-kind sandbox refuses a `workflow:` child before its run row exists: a child
+// run would execute on the host, outside the run's container.
+describe('containsSubRun', () => {
+  const parse = (node: unknown): DagNode => dagNodeSchema.parse(node) as DagNode;
+
+  test('finds a workflow: node at the top level, fan-out included', () => {
+    expect(containsSubRun([parse({ id: 'child', workflow: 'other' })])).toBe(true);
+    expect(
+      containsSubRun([parse({ id: 'many', workflow: 'other', fan_out: { items: '$a.output' } })])
+    ).toBe(true);
+  });
+
+  test('finds a workflow: node inside a loop_group body', () => {
+    const loop = parse({
+      id: 'lg',
+      loop_group: {
+        until: 'DONE',
+        max_iterations: 1,
+        nodes: [{ id: 'child', workflow: 'other' }],
+      },
+    });
+    expect(containsSubRun([parse({ id: 'a', bash: 'echo a' }), loop])).toBe(true);
+  });
+
+  test('a graph with no workflow: node starts no child run', () => {
+    expect(
+      containsSubRun([
+        parse({ id: 'a', prompt: 'do a' }),
+        parse({ id: 'b', bash: 'echo b' }),
+        parse({ id: 'later', wait: { duration_ms: 1 } }),
+        parse({
+          id: 'lg',
+          loop_group: { until: 'DONE', max_iterations: 1, nodes: [{ id: 'r', prompt: 'r' }] },
+        }),
+        // Expanded in this run at execution time: no child run row, and its target's
+        // nodes are not visible here (the node-time guard covers what it expands to).
+        parse({ id: 'cf', include: 'other', fan_out: { items: '$a.output', as: 'item' } }),
+      ])
     ).toBe(false);
   });
 });

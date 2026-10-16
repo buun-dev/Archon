@@ -2296,14 +2296,32 @@ export function isOutputFormatEnforced(node: DagNode | IncludeDirective): boolea
 /**
  * Whether these nodes hold a durable world-wait (`wait:`), at the top level or inside a
  * `loop_group` body. The one owner of the question: the loader's ordering rules and the
- * container refusal (`assertNoDurableWaitForContainer`, which the engine and the CLI both
- * call) ask it here.
+ * container refusal (`assertNoDurableWaitForContainer`, which the engine calls and the
+ * CLI reaches through `assertWorkflowRunnableInSandbox`) ask it here.
  */
 export function containsDurableWait(nodes: readonly (DagNode | IncludeDirective)[]): boolean {
   return nodes.some(node => {
     if (isIncludeDirective(node)) return false;
     if (isWaitNode(node)) return true;
     return isLoopGroupNode(node) && containsDurableWait(node.loop_group.nodes);
+  });
+}
+
+/**
+ * Whether these nodes start a child run — a `workflow:` node, its `fan_out:` form
+ * included — at the top level or inside a `loop_group` body, walked like
+ * {@link containsDurableWait} (the loader rejects a `workflow:` node in a loop body
+ * today; the walk does not depend on that). The one owner of the question for the
+ * repo-kind sandbox's up-front refusal (`assertWorkflowRunnableInSandbox`). A `compose_fan_out` is expanded
+ * inside the same run at execution time, so it starts no child run and its target's
+ * nodes are not visible here; the dag-executor's node-time guard refuses a `workflow:`
+ * node reached that way.
+ */
+export function containsSubRun(nodes: readonly (DagNode | IncludeDirective)[]): boolean {
+  return nodes.some(node => {
+    if (isIncludeDirective(node)) return false;
+    if (isWorkflowNode(node)) return true;
+    return isLoopGroupNode(node) && containsSubRun(node.loop_group.nodes);
   });
 }
 

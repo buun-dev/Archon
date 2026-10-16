@@ -6,14 +6,20 @@
  * import it without an import cycle between those two large files.
  */
 
-import { containsDurableWait, type DagNode, type IncludeDirective } from './schemas/dag-node';
+import {
+  containsDurableWait,
+  containsSubRun,
+  type DagNode,
+  type IncludeDirective,
+} from './schemas/dag-node';
 
 /**
  * Refuse a fresh container run of a workflow that holds a durable wait: server
  * continuation cannot rewire the container, so a run parked on the wait could never
- * continue in it. The engine refuses at dispatch; a launcher that writes its own run row
- * and builds the container first calls this before either, so the refusal leaves
- * nothing behind.
+ * continue in it. The engine refuses at dispatch, for folder containers and repo
+ * sandboxes alike; a launcher that writes its own run row and builds the container
+ * first calls this (through {@link assertWorkflowRunnableInSandbox} for a sandbox)
+ * before either, so the refusal leaves nothing behind.
  */
 export function assertNoDurableWaitForContainer(workflow: {
   name: string;
@@ -22,6 +28,27 @@ export function assertNoDurableWaitForContainer(workflow: {
   if (containsDurableWait(workflow.nodes)) {
     throw new Error(
       `Workflow '${workflow.name}' contains a durable wait, which is not supported in container isolation because server continuation cannot rewire the container. Run it without container isolation.`
+    );
+  }
+}
+
+/**
+ * Everything a repo-kind sandbox run refuses about the workflow itself, judged before
+ * the run row and the stack exist: a durable wait ({@link assertNoDurableWaitForContainer})
+ * and a `workflow:` sub-run. A child run starts without the parent's execution context,
+ * so it would execute on the host against a working path that exists only in the
+ * container. A folder container binds host visibility and dispatches children, so this
+ * is the sandbox's check only. The dag-executor still refuses a sub-run at node time,
+ * which also covers one a `compose_fan_out` expands at run time.
+ */
+export function assertWorkflowRunnableInSandbox(workflow: {
+  name: string;
+  nodes: readonly (DagNode | IncludeDirective)[];
+}): void {
+  assertNoDurableWaitForContainer(workflow);
+  if (containsSubRun(workflow.nodes)) {
+    throw new Error(
+      `Workflow '${workflow.name}' contains a workflow: sub-run, which is not supported in a repo-kind container run: a child run would execute on the host, outside the run's container. Run the workflow without container isolation, or move the child's nodes into this workflow.`
     );
   }
 }

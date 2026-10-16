@@ -22,7 +22,7 @@ import {
   createRegisteredContainerEnv,
   createRegisteredWorktree,
 } from '@archon/core/workflows/registered-worktree';
-import { assertNoDurableWaitForContainer } from '@archon/workflows/container-context';
+import { assertWorkflowRunnableInSandbox } from '@archon/workflows/container-context';
 import {
   prepareRunAiConfiguration,
   assertRunCredentials,
@@ -585,7 +585,7 @@ function taskBranchSelection(
 
 /** What a fresh repo dispatch is about to do, as far as its isolation provider cares. */
 interface RepoDispatchIsolation {
-  workflow: Parameters<typeof assertNoDurableWaitForContainer>[0];
+  workflow: Parameters<typeof assertWorkflowRunnableInSandbox>[0];
   /** The dispatch cuts a fresh isolated checkout. */
   isolates: boolean;
   /** The checkout's branch selection; read only when it isolates. */
@@ -604,7 +604,8 @@ interface RepoDispatchIsolation {
  * - for a container that the dispatch isolates, in this order: a branch selection the
  *   sandbox cannot cut and a repo `isolation` section without `provision` (the checks
  *   `ContainerProvider.create` also runs, from their one owner), a workflow with a
- *   durable wait (the engine's own refusal), then any prerequisite outside the repo
+ *   durable wait (the engine's own refusal) or a `workflow:` sub-run (the dag-executor
+ *   refuses one again at node time), then any prerequisite outside the repo
  *   that is absent (the WSL distro, the repo's base clone inside it, the docker daemon,
  *   the runner image), which `create` probes again;
  * - for a container, a workflow pinned to the live checkout (`worktree.enabled: false`),
@@ -622,7 +623,7 @@ async function resolveRepoIsolationProvider(
   if (dispatch.isolates) {
     assertContainerRequestSupported({ workflowType: 'task', taskBranch: dispatch.taskBranch });
     assertRepoSandboxConfigComplete(repoConfig.isolation ?? null);
-    assertNoDurableWaitForContainer(dispatch.workflow);
+    assertWorkflowRunnableInSandbox(dispatch.workflow);
     await assertContainerPrerequisites(basename(repoRoot), {
       host: (await loadGlobalConfig()).isolation?.container ?? null,
     });

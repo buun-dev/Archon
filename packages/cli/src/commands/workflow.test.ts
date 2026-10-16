@@ -8959,6 +8959,28 @@ describe('workflowRunCommand — repo container isolation', () => {
     expect(mockSelectIsolationProvider).not.toHaveBeenCalled();
   });
 
+  // A child run would execute on the host, outside the sandbox; the node-time guard used
+  // to refuse it only after the stack was provisioned. (The loader already rejects a
+  // `workflow:` node inside a loop_group body.)
+  for (const [form, node] of [
+    ['a workflow: sub-run', { id: 'child', workflow: 'other' }],
+    ['a workflow: fan-out', { id: 'many', workflow: 'other', fan_out: { items: '["a"]' } }],
+  ] as const) {
+    it(`refuses ${form} on a container repo before any run row exists`, async () => {
+      await arrangeContainerRepo({ name: 'assist', description: 'Help', nodes: [node] });
+
+      await expect(
+        workflowRunCommand(createTestWorkflowHost(), '/test/path', 'assist', 'hello')
+      ).rejects.toThrow(
+        "Workflow 'assist' contains a workflow: sub-run, which is not supported in a repo-kind container run"
+      );
+      expect(mockAssertContainerPrerequisites).not.toHaveBeenCalled();
+      expect(mockStartRunLiveOwner).not.toHaveBeenCalled();
+      expect(mockCreateWorkflowRun).not.toHaveBeenCalled();
+      expect(mockSelectIsolationProvider).not.toHaveBeenCalled();
+    });
+  }
+
   it('refuses a container repo without isolation.provision before any run row exists', async () => {
     await arrangeContainerRepo(undefined, { isolation: { provider: 'container' } });
 
@@ -10031,6 +10053,13 @@ describe('workflowRunCommand — detach', () => {
       { nodes: [{ id: 'delay', wait: { duration_ms: 1000 } }] },
       COMPLETE,
       /Workflow 'assist' contains a durable wait, which is not supported in container isolation/,
+    ],
+    [
+      'a workflow: sub-run',
+      {},
+      { nodes: [{ id: 'child', workflow: 'other' }] },
+      COMPLETE,
+      /Workflow 'assist' contains a workflow: sub-run, which is not supported in a repo-kind container run/,
     ],
     [
       'a missing isolation.provision',
