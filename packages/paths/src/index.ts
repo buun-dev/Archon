@@ -80,6 +80,9 @@ export type { DetachedInstallContext, DetachedInstallContextKey } from './detach
 // Env loader
 export { loadArchonEnv, isVerboseBoot, getPluginsPath, getArchonEnvNames } from './env-loader';
 
+// Windows host path to WSL2 node-visible path
+export { toNodeVisiblePath } from './wsl-path';
+
 // Logger
 export {
   createLogger,
