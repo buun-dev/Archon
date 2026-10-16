@@ -46,7 +46,8 @@
       "src/container/docker-exec.test.ts",
       "src/container/overlay.test.ts",
       "src/container/overlay-scripts.test.ts",
-      "src/backends/sandbox.test.ts"
+      "src/backends/sandbox.test.ts",
+      "src/providers/container.test.ts"
     ]
   ]
 }

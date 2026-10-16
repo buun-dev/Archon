@@ -17,6 +17,10 @@ export type {
   WorktreeMetadata,
   WorktreeEnvironment,
   IsolatedEnvironment,
+  ContainerEnvironment,
+  ContainerEnvironmentMetadata,
+  IContainerIsolationProvider,
+  SandboxInspection,
   DestroyOptions,
   WorktreeDestroyOptions,
   DestroyResult,
@@ -93,7 +97,14 @@ export {
 } from './errors';
 
 // --- Factory ---
-export { getIsolationProvider, configureIsolation, resetIsolationProvider } from './factory';
+export {
+  getIsolationProvider,
+  configureIsolation,
+  resetIsolationProvider,
+  selectIsolationProvider,
+  assertIsolationProviderRecognized,
+  isContainerIsolationProvider,
+} from './factory';
 
 // --- Resolver ---
 export { IsolationResolver } from './resolver';
@@ -101,6 +112,20 @@ export type { IsolationResolverDeps } from './resolver';
 
 // --- Provider ---
 export { WorktreeProvider, resolveRepoLocalOverride } from './providers/worktree';
+export {
+  ContainerProvider,
+  assertContainerPrerequisites,
+  composeProjectFor,
+  composeProjectFromWorkingPath,
+  SANDBOX_COMPOSE_FILE,
+} from './providers/container';
+export type {
+  ContainerProviderDeps,
+  ContainerPrerequisiteDeps,
+  ContainerPrerequisites,
+  RepoSandboxConfigLoader,
+  SandboxHostConfigLoader,
+} from './providers/container';
 
 // --- PR state lookup ---
 export { getPrState } from './pr-state';

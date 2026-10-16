@@ -10,6 +10,7 @@ import { isDeepStrictEqual } from 'node:util';
 import type { RepoPath, BranchName } from '@archon/git';
 import type { ExecutionContext } from '@archon/provider-contract';
 import type {
+  ContainerWriteBackBackend,
   WriteBackFinalizeResult,
   WriteBackApplySummary,
 } from '@archon/workflows/container-context';
@@ -185,6 +186,41 @@ export type WorktreeCreationEnvironment = WorktreeEnvironment<
   CreatedWorktreeMetadata | AdoptedWorktreeMetadata
 >;
 
+export interface ContainerEnvironmentMetadata {
+  /** The request `create` was given. Absent on reattach, which has only the working path. */
+  request?: IsolationRequest;
+}
+
+/**
+ * Container isolation environment — the WSL sandbox substrate. Carries the
+ * container {@link ExecutionContext} the engine threads into every node so
+ * bash/script/AI exec runs `docker exec <containerId> -w <workingPath>`, plus the
+ * compose `project` used to re-address the stack on resume/teardown. Unlike a worktree
+ * env its `workingPath` is a distro path the Windows host cannot stat — but the
+ * container mounts it at that same path, so one string addresses it on both sides
+ * and nothing translates it.
+ *
+ * Deliberately not a member of {@link IsolatedEnvironment}: the resolver and worktree
+ * registration read worktree provenance off that type. A container env comes only
+ * from an {@link IContainerIsolationProvider}.
+ */
+export interface ContainerEnvironment extends IsolatedEnvironmentBase {
+  provider: 'container';
+  branchName: BranchName;
+  /** Container execution context — `containerId` and `execUser`, nothing more. */
+  execContext: Extract<ExecutionContext, { kind: 'container' }>;
+  /** Compose project `archon-<repo>-<slug>` — re-addresses the stack on resume/teardown. */
+  project: string;
+  /**
+   * The base branch actually resolved at create time (baseOverride ?? config ??
+   * codebase default ?? autodetect). Snapshotted into the env-row metadata so a
+   * RESUME reads a FIXED base, not a config label that may have moved since
+   * dispatch. Absent on reattach (a resume reads the snapshot, not this).
+   */
+  baseBranch?: BranchName;
+  metadata: ContainerEnvironmentMetadata;
+}
+
 /**
  * Isolation-record metadata carrying a worktree's creation proof (null when adopted)
  * and whether that creation made the checked-out branch.
@@ -302,6 +338,41 @@ export interface IIsolationProvider {
   adopt?(path: string): Promise<IsolatedEnvironment | null>;
 
   healthCheck(envId: string): Promise<boolean>;
+}
+
+/**
+ * What the reap asks about a sandbox: is its compose project still known to
+ * Docker, and what does its worktree hold. Every answer comes from the side of
+ * the boundary that can see it — compose's own listing, git inside the distro.
+ */
+export interface SandboxInspection {
+  stackExists: boolean;
+  worktreeExists: boolean;
+  /** Uncommitted changes in the worktree; false when it is absent. */
+  dirty: boolean;
+  /** Commits on no remote ref; false when the worktree is absent. */
+  unpushed: boolean;
+}
+
+/**
+ * Provider interface for repo-kind container isolation (the WSL sandbox).
+ *
+ * Separate from {@link IIsolationProvider}, whose `create` returns a worktree
+ * environment with creation provenance. A sandbox is addressed by its working
+ * path `<worktree-root>/<repo>/<slug>` from create to teardown.
+ *
+ * Error contract:
+ * - `create`, `reattach`, `stop` and `inspect` throw on failure
+ * - `destroy` is best-effort and returns a `DestroyResult`
+ */
+export interface IContainerIsolationProvider {
+  readonly providerType: 'container';
+  create(request: IsolationRequest): Promise<ContainerEnvironment>;
+  reattach(workingPath: string): Promise<ContainerEnvironment>;
+  writeBackBackend(workingPath: string): ContainerWriteBackBackend;
+  stop(workingPath: string): Promise<void>;
+  inspect(workingPath: string): Promise<SandboxInspection>;
+  destroy(workingPath: string): Promise<DestroyResult>;
 }
 
 // --- Type Guards ---
