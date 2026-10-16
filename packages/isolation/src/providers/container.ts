@@ -365,7 +365,7 @@ export async function assertContainerPrerequisites(
     await dockerPreflight(
       host.image,
       (args, options) => docker(args, { timeout: options?.timeout ?? DOCKER_QUERY_TIMEOUT_MS }),
-      `build the runner image \`${host.image}\` (this fork builds it with ~/.archon/sandbox/build-runner.sh), ` +
+      `build the runner image \`${host.image}\` with ~/.archon/sandbox/build-runner.sh, ` +
         'or name an existing image in ~/.archon/config.yaml `isolation.container.image`'
     );
   } catch (err) {

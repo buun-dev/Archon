@@ -372,7 +372,8 @@ async function resolveUserGithubEnvForWorkflow(
  * Called at both ends of an invocation. At run start it removes what an earlier
  * invocation left, so a resume cannot keep a readable credential after it has
  * been disconnected or after fresh resolution fails. At run end it removes what
- * THIS invocation delivered, once the run reached a status nothing resumes from.
+ * THIS invocation delivered, on every exit except paused: a paused run is live at
+ * a gate, and its resume re-enters the run-start clear and re-delivers the file.
  */
 async function clearManagedProviderCredentialFiles(artifactsDir: string): Promise<void> {
   for (const relativePath of MANAGED_PROVIDER_CREDENTIAL_RELATIVE_PATHS) {
