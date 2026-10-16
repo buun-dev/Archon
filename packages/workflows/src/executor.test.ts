@@ -4666,6 +4666,29 @@ describe('executeWorkflow', () => {
       await expect(readFile(piAuthPath, 'utf8')).rejects.toThrow();
     });
 
+    it('removes the managed credential file when the DAG reports a rejected terminal write', async () => {
+      mockExecuteDagWorkflow.mockRejectedValueOnce(
+        new TerminalStatusWriteError(new Error('terminal completion write failed'))
+      );
+      await expect(run(makeDeliveringDeps(makeStore()))).rejects.toThrow(
+        'terminal completion write failed'
+      );
+      await expect(readFile(piAuthPath, 'utf8')).rejects.toThrow();
+    });
+
+    it('removes the managed credential file when the backstop fails a stuck running run', async () => {
+      // No readable final record and a row still 'running': the finally backstop fails it.
+      const failWorkflowRun = mock(async () => {});
+      const store = makeStore({
+        getWorkflowRun: mock(async () => null),
+        getWorkflowRunStatus: mock(async () => 'running' as const),
+        failWorkflowRun,
+      });
+      await run(makeDeliveringDeps(store));
+      expect(failWorkflowRun).toHaveBeenCalled();
+      await expect(readFile(piAuthPath, 'utf8')).rejects.toThrow();
+    });
+
     it('keeps the managed credential file while the run is paused', async () => {
       await run(makeDeliveringDeps(storeWithStatus('paused')));
       expect(await readFile(piAuthPath, 'utf8')).toBe(CREDENTIAL);

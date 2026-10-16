@@ -3505,17 +3505,6 @@ export async function executeWorkflow(
 
     // executeDagWorkflow throws on fatal errors; check DB status for result
     const finalStatus = await deps.store.getWorkflowRun(workflowRun.id);
-    // A run nothing will resume must not leave its provider credential readable on
-    // disk. `paused` is a live run at a gate and re-enters the run-start clear on
-    // resume; an unreadable status leaves the file rather than act on a record that
-    // no longer describes the run.
-    if (
-      finalStatus?.status === 'completed' ||
-      finalStatus?.status === 'failed' ||
-      finalStatus?.status === 'cancelled'
-    ) {
-      await clearManagedProviderCredentialFilesAtExit(artifactsDir, workflowRun.id);
-    }
     // Sub-run re-entry (#2121 Phase 2): if this run is a `workflow:` child that just
     // reached a terminal state, re-enter its paused parent in-process. Guarded to be
     // a no-op on the synchronous first-run path (parent still 'running').
@@ -3615,9 +3604,6 @@ export async function executeWorkflow(
     // event, or the user's failure notification. Terminal telemetry is reported by
     // the run store after the write commits.
     //
-    // The run is failing: its credential file must not outlive it.
-    await clearManagedProviderCredentialFilesAtExit(artifactsDir, workflowRun.id);
-
     // Log to file (separate from database - non-blocking)
     try {
       await logWorkflowError(logDir, workflowRun.id, err.message);
@@ -3681,17 +3667,34 @@ export async function executeWorkflow(
     // calling failWorkflowRun (e.g. a generator cleanup that exits without
     // throwing). Only fires when the process stays alive long enough to run
     // this finally — see #1561 for the originating zombie-state incident.
-    if (workflowRun && !terminalStatusWriteFailed) {
+    if (workflowRun) {
       const runId = workflowRun.id;
-      const backstopStatus = await deps.store.getWorkflowRunStatus(runId).catch(() => null);
-      if (backstopStatus === 'running') {
-        getLog().warn({ workflowRunId: runId }, 'executor.backstop_triggered');
-        await requireTerminalStatusWrite(
-          deps.store.failWorkflowRun(runId, 'Workflow exited without finalizing — see logs', {
-            exitReason: 'not_finalized',
-          }),
-          { workflowRunId: runId, site: 'executor.backstop_fail_failed' }
-        );
+      // `paused` is the one status whose file stays. Anything else, including a status
+      // that could not be read, clears: resume re-delivers, so clearing is never unsafe.
+      let keepCredentialFile = false;
+      try {
+        if (!terminalStatusWriteFailed) {
+          const backstopStatus = await deps.store.getWorkflowRunStatus(runId).catch(() => null);
+          keepCredentialFile = backstopStatus === 'paused';
+          if (backstopStatus === 'running') {
+            getLog().warn({ workflowRunId: runId }, 'executor.backstop_triggered');
+            await requireTerminalStatusWrite(
+              deps.store.failWorkflowRun(runId, 'Workflow exited without finalizing — see logs', {
+                exitReason: 'not_finalized',
+              }),
+              { workflowRunId: runId, site: 'executor.backstop_fail_failed' }
+            );
+          }
+        }
+      } finally {
+        // A file-delivered provider credential outlives the process that wrote it, so
+        // every exit but a pause clears it here, where all exits converge: the DAG
+        // returning, an engine throw, a rejected terminal write (which skips the
+        // backstop), and a stuck `running` the backstop just failed. A paused run is
+        // live at a gate and re-enters the run-start clear on resume.
+        if (!keepCredentialFile) {
+          await clearManagedProviderCredentialFilesAtExit(artifactsDir, runId);
+        }
       }
     }
   }
