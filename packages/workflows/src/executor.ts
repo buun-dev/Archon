@@ -133,6 +133,7 @@ export type {
   ChildIsolationResult,
 } from './child-isolation';
 import { safeSendMessage, runWithAdoptedRunDir, type SendMessageContext } from './executor-shared';
+import { nodePathBindingFor, runWithNodePaths, type NodeVisibility } from './node-path';
 import { GITHUB_TOKEN_KEYS, resolveGithubTokenOverrides } from './utils/github-token-policy';
 import {
   hasRunModelOverrides,
@@ -736,6 +737,14 @@ export type ExecuteWorkflowOptions = ResumePayload & {
    * write-back. Absent for host runs.
    */
   container?: ContainerRunContext;
+  /**
+   * The form in which this run's paths reach its nodes. `'host'` (default) delivers
+   * them as the engine holds them; `'wsl'` delivers the WSL2 form (`C:\a` →
+   * `/mnt/c/a`) for a container that runs inside the distro of a Windows host, and
+   * requires a container `execContext`. The engine itself keeps host paths either
+   * way; only delivery sites convert, through `toNodePath`.
+   */
+  nodeVisibility?: NodeVisibility;
   /**
    * Per-child isolation resolver (#2121 slice 2, PR-A). A structural port the
    * engine calls once per `workflow:` child whose node declares
@@ -2038,6 +2047,7 @@ export async function executeWorkflow(
     baseOverride: callerBaseOverride,
     execContext = { kind: 'host' },
     container: containerCtx,
+    nodeVisibility = 'host',
     resolveChildIsolation,
     inputs: suppliedInputs,
     modelOverrideLayer,
@@ -2047,6 +2057,14 @@ export async function executeWorkflow(
     continuationMode,
     cutFromCommit,
   } = opts;
+
+  // WSL paths only open inside the distro; delivering them to host nodes would point
+  // every run path at nothing.
+  if (nodeVisibility === 'wsl' && execContext.kind !== 'container') {
+    throw new Error(
+      `Invalid options for workflow '${workflow.name}': nodeVisibility 'wsl' requires a container execution context, but execContext is '${execContext.kind}'.`
+    );
+  }
 
   const executionUserId = preCreatedRun ? (preCreatedRun.user_id ?? undefined) : origin?.userId;
   const modelOverrides =
@@ -3423,53 +3441,55 @@ export async function executeWorkflow(
         }
       : workflowRun;
 
-    // The adopted-dir scope (#2747) encloses only the DAG: a child sub-run spawned
-    // from a node re-enters
-    // `executeWorkflow` and scopes its own (absent) adoption.
+    // The adopted-dir scope (#2747) and the node-path binding enclose only the DAG: a
+    // child sub-run spawned from a node re-enters `executeWorkflow` and scopes its own
+    // (absent) adoption and its own node visibility, never its parent's.
     const dagSummary = await runWithAdoptedRunDir(adoptedRunDir, () =>
-      executeDagWorkflow({
-        deps,
-        platform,
-        conversationId,
-        cwd,
-        workflow,
-        workflowRun: runForDag,
-        workflowProvider: resolvedProvider,
-        workflowModel: resolvedModel,
-        artifactsDir,
-        stateDir,
-        logDir,
-        baseBranch,
-        docsDir,
-        config,
-        configuredCommandFolder,
-        issueContext,
-        priorCompletedNodes: dagPriorCompletedNodes,
-        aiProfile,
-        workflowPreset,
-        scopeArtifactsDir,
-        execContext,
-        containerCtx,
-        // Sub-run closure (#2121 Phase 2): captures executeWorkflow (this module — no
-        // import cycle) so a `workflow:` node can spawn a governed child run in-process.
-        // Also captures the per-child isolation resolver (slice 2, PR-A) so an
-        // `isolation: 'worktree'` child gets its own worktree cwd.
-        runChildWorkflow: (childArgs: RunChildWorkflowArgs): Promise<ChildWorkflowOutcome> =>
-          runChildWorkflow(
-            deps,
-            platform,
-            childArgs,
-            resolvedModelOverrides,
-            effectiveRunConfig,
-            resolveChildIsolation
-          ),
-        priorUsage: dagPriorUsage,
-        priorNodeSessions,
-        // Container runs resolve from the capture like every other run: it is bind-mounted
-        // read-only at the SAME absolute path inside the container, so one source-roots
-        // value means the same thing on both sides of the boundary.
-        workflowSourceRoots,
-      })
+      runWithNodePaths(nodePathBindingFor(nodeVisibility), () =>
+        executeDagWorkflow({
+          deps,
+          platform,
+          conversationId,
+          cwd,
+          workflow,
+          workflowRun: runForDag,
+          workflowProvider: resolvedProvider,
+          workflowModel: resolvedModel,
+          artifactsDir,
+          stateDir,
+          logDir,
+          baseBranch,
+          docsDir,
+          config,
+          configuredCommandFolder,
+          issueContext,
+          priorCompletedNodes: dagPriorCompletedNodes,
+          aiProfile,
+          workflowPreset,
+          scopeArtifactsDir,
+          execContext,
+          containerCtx,
+          // Sub-run closure (#2121 Phase 2): captures executeWorkflow (this module — no
+          // import cycle) so a `workflow:` node can spawn a governed child run in-process.
+          // Also captures the per-child isolation resolver (slice 2, PR-A) so an
+          // `isolation: 'worktree'` child gets its own worktree cwd.
+          runChildWorkflow: (childArgs: RunChildWorkflowArgs): Promise<ChildWorkflowOutcome> =>
+            runChildWorkflow(
+              deps,
+              platform,
+              childArgs,
+              resolvedModelOverrides,
+              effectiveRunConfig,
+              resolveChildIsolation
+            ),
+          priorUsage: dagPriorUsage,
+          priorNodeSessions,
+          // Container runs resolve from the capture like every other run: it is bind-mounted
+          // read-only at the SAME absolute path inside the container, so one source-roots
+          // value means the same thing on both sides of the boundary.
+          workflowSourceRoots,
+        })
+      )
     );
 
     // executeDagWorkflow throws on fatal errors; check DB status for result

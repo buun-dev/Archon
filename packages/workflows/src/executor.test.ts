@@ -198,6 +198,7 @@ import {
 } from './schemas';
 import type { WorkflowRunConfigMetadata } from './schemas/run-config';
 import { substituteWorkflowVariables } from './executor-shared';
+import { currentNodeVisibility, runWithNodePaths, type NodeVisibility } from './node-path';
 import { TerminalStatusWriteError } from './terminal-status-write';
 
 // --- Helpers ---
@@ -937,6 +938,71 @@ describe('executeWorkflow', () => {
           }
         )
       ).rejects.toThrow('durable wait, which is not supported in container isolation');
+    });
+
+    it('refuses nodeVisibility wsl without a container execution context', async () => {
+      const store = makeStore();
+
+      await expect(
+        executeWorkflow(
+          makeDeps(store),
+          makePlatform(),
+          'conv-1',
+          '/tmp/ops',
+          makeWorkflow(),
+          'msg',
+          { conversationId: 'db-conv-1' },
+          { nodeVisibility: 'wsl', execContext: { kind: 'host' } }
+        )
+      ).rejects.toThrow("nodeVisibility 'wsl' requires a container execution context");
+
+      expect(store.createWorkflowRun).not.toHaveBeenCalled();
+      expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
+    });
+
+    it("binds the run's node visibility around its DAG", async () => {
+      let seen: NodeVisibility | undefined;
+      mockExecuteDagWorkflow.mockImplementation(async () => {
+        seen = currentNodeVisibility();
+        return undefined;
+      });
+
+      await executeWorkflow(
+        makeDeps(makeStore()),
+        makePlatform(),
+        'conv-1',
+        '/tmp/ops',
+        makeWorkflow(),
+        'msg',
+        { conversationId: 'db-conv-1' },
+        { nodeVisibility: 'wsl', execContext: { kind: 'container', containerId: 'cid' } }
+      );
+
+      expect(seen).toBe('wsl');
+    });
+
+    // A `workflow:` child re-enters executeWorkflow inside its parent's DAG scope. It
+    // runs on the host, so its own binding must shadow the parent's WSL one.
+    it("binds a host run's own visibility inside an enclosing wsl scope", async () => {
+      let seen: NodeVisibility | undefined;
+      mockExecuteDagWorkflow.mockImplementation(async () => {
+        seen = currentNodeVisibility();
+        return undefined;
+      });
+
+      await runWithNodePaths({ visibility: 'wsl', toNode: p => '/node' + p }, () =>
+        executeWorkflow(
+          makeDeps(makeStore()),
+          makePlatform(),
+          'conv-1',
+          '/tmp/ops',
+          makeWorkflow(),
+          'msg',
+          { conversationId: 'db-conv-1' }
+        )
+      );
+
+      expect(seen).toBe('host');
     });
 
     it('fails a container run resumed without a container context, pointing at the CLI', async () => {

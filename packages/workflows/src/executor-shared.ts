@@ -32,6 +32,7 @@ import {
   type TemplateToken,
 } from './output-ref';
 import { parsePackagedResourceReference } from './packaged-workflow';
+import { toNodePath } from './node-path';
 
 /** Lazy-initialized logger */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -585,6 +586,10 @@ export interface TemplateReferences {
  * Every variable and every `options.references` grammar resolves in one scan of the
  * template: a substituted value is inserted verbatim and never read as template syntax.
  *
+ * Callers pass host paths. The path-valued variables ($ARTIFACTS_DIR, $STATE_DIR,
+ * $ADOPTED_RUN_DIR, $TYPED_ARTIFACTS_FILE) are delivered through `toNodePath`, in the
+ * form the run's nodes can open.
+ *
  * When issueContext is undefined, context variables are replaced with empty string
  * to avoid sending literal "$CONTEXT" to the AI.
  */
@@ -620,7 +625,7 @@ export function substituteWorkflowVariables(
 
   const tokens: TemplateToken[] = [
     variable('WORKFLOW_ID', () => workflowId),
-    variable('ARTIFACTS_DIR', () => artifactsDir),
+    variable('ARTIFACTS_DIR', () => toNodePath(artifactsDir)),
     // Engine-controlled like $ARTIFACTS_DIR — substituted even under shellSafe,
     // or `bash:`/`script:` bodies would never see it. The state directory is threaded
     // from the executor to every substitution site; a site that forgot to pass it would
@@ -634,7 +639,7 @@ export function substituteWorkflowVariables(
             'please report it as a bug.'
         );
       }
-      return options.stateDir;
+      return toNodePath(options.stateDir);
     }),
     // $ADOPTED_RUN_DIR (#2747) resolves only under an explicit adoption. A run
     // that references it without one throws — mirroring $BASE_BRANCH/$STATE_DIR —
@@ -648,7 +653,7 @@ export function substituteWorkflowVariables(
             "to read an earlier run's artifacts by reference."
         );
       }
-      return options?.adoptedRunDir ?? currentAdoptedRunDir() ?? '';
+      return toNodePath(options?.adoptedRunDir ?? currentAdoptedRunDir() ?? '');
     }),
     // $TYPED_ARTIFACTS_FILE is delivered by every executable invocation context (bash,
     // script, agent prompt, loop attempt), and to exec subprocesses as TYPED_ARTIFACTS_FILE.
@@ -664,7 +669,7 @@ export function substituteWorkflowVariables(
             'if you are seeing this from one of those, please report it as a bug.'
         );
       }
-      return options.typedArtifactsFile;
+      return toNodePath(options.typedArtifactsFile);
     }),
     variable('BASE_BRANCH', () => {
       if (!baseBranch) {

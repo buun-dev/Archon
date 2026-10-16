@@ -114,7 +114,9 @@
     ],
     [
       "src/executor-shared.test.ts",
-      "src/subprocess.test.ts"
+      "src/subprocess.test.ts",
+      "src/node-path.test.ts",
+      "src/exec-environment.test.ts"
     ],
     [
       "src/provider-events.test.ts"

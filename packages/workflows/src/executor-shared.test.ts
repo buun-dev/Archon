@@ -21,6 +21,7 @@ mock.module('@archon/paths', () => ({
 
 import type { IWorkflowPlatform } from './deps';
 import { nodeFailureKindSchema } from './schemas/node-execution';
+import { runWithNodePaths } from './node-path';
 import {
   substituteWorkflowVariables,
   buildPromptWithContext,
@@ -190,6 +191,42 @@ describe('substituteWorkflowVariables', () => {
       { typedArtifactsFile: '' }
     );
     expect(prompt).toBe('Read []');
+  });
+
+  describe("run paths in the node's form", () => {
+    const pathTemplate = '$ARTIFACTS_DIR $STATE_DIR $ADOPTED_RUN_DIR $TYPED_ARTIFACTS_FILE';
+    const substitutePaths = (): string =>
+      substituteWorkflowVariables(
+        pathTemplate,
+        'run-1',
+        'msg',
+        '/host/artifacts',
+        'main',
+        'docs/',
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        {
+          stateDir: '/host/state',
+          adoptedRunDir: '/host/adopted',
+          typedArtifactsFile: '/host/typed.json',
+        }
+      ).prompt;
+
+    it('delivers each path through the bound node form', async () => {
+      const prompt = await runWithNodePaths(
+        { visibility: 'wsl', toNode: p => '/node' + p },
+        async () => substitutePaths()
+      );
+      expect(prompt).toBe(
+        '/node/host/artifacts /node/host/state /node/host/adopted /node/host/typed.json'
+      );
+    });
+
+    it('delivers each path unchanged when unbound', () => {
+      expect(substitutePaths()).toBe('/host/artifacts /host/state /host/adopted /host/typed.json');
+    });
   });
 
   it('leaves the INPUTS_ variable of an input named typed_artifacts_file alone', () => {
