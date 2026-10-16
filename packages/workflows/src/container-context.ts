@@ -6,6 +6,26 @@
  * import it without an import cycle between those two large files.
  */
 
+import { containsDurableWait, type DagNode, type IncludeDirective } from './schemas/dag-node';
+
+/**
+ * Refuse a fresh container run of a workflow that holds a durable wait: server
+ * continuation cannot rewire the container, so a run parked on the wait could never
+ * continue in it. The engine refuses at dispatch; a launcher that writes its own run row
+ * and builds the container first calls this before either, so the refusal leaves
+ * nothing behind.
+ */
+export function assertNoDurableWaitForContainer(workflow: {
+  name: string;
+  nodes: readonly (DagNode | IncludeDirective)[];
+}): void {
+  if (containsDurableWait(workflow.nodes)) {
+    throw new Error(
+      `Workflow '${workflow.name}' contains a durable wait, which is not supported in container isolation because server continuation cannot rewire the container. Run it without container isolation.`
+    );
+  }
+}
+
 /**
  * Summary of the changes an overlay upper layer holds relative to the read-only
  * lower (the live project root). By overlayfs construction the upper layer IS the

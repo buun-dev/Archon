@@ -55,8 +55,6 @@ import {
   pendingWorkflowWaitDeadline,
   runAttention,
   isScheduledWorkflowResume,
-  isWaitNode,
-  isIncludeDirective,
   runMayPersistSessions,
   SUBRUN_METADATA_KEYS,
   readSubrunMetadata,
@@ -113,7 +111,7 @@ import { keepAwake } from './utils/keep-awake';
 import { getWorkflowEventEmitter } from './event-emitter';
 import { TerminalStatusWriteError, requireTerminalStatusWrite } from './terminal-status-write';
 import type { ExecutionContext } from '@archon/provider-contract';
-import type { ContainerRunContext } from './container-context';
+import { assertNoDurableWaitForContainer, type ContainerRunContext } from './container-context';
 export type { ContainerRunContext, ContainerWriteBackBackend } from './container-context';
 // Re-exported so callers driving the capture-first sequence need only this module.
 export {
@@ -2079,20 +2077,12 @@ export async function executeWorkflow(
     throw new Error('Cannot supply a run config when resuming an existing workflow run.');
   }
 
-  const containsWait = (nodes: readonly (DagNode | IncludeDirective)[]): boolean =>
-    nodes.some(node => {
-      if (isIncludeDirective(node)) return false;
-      if (isWaitNode(node)) return true;
-      return isLoopGroupNode(node) && containsWait(node.loop_group.nodes);
-    });
   // Fresh dispatch only — a resume of a run that already committed to this shape has
   // nothing left to refuse. `isContinuation`, not `preCreatedRun === undefined`: a row
   // pre-created by a launching process (#2872) is still a fresh dispatch and must meet
   // the same refusal.
-  if (!isContinuation && execContext.kind === 'container' && containsWait(workflow.nodes)) {
-    throw new Error(
-      `Workflow '${workflow.name}' contains a durable wait, which is not supported in container isolation because server continuation cannot rewire the container. Run it without container isolation.`
-    );
+  if (!isContinuation && execContext.kind === 'container') {
+    assertNoDurableWaitForContainer(workflow);
   }
 
   if (preCreatedRun !== undefined) {

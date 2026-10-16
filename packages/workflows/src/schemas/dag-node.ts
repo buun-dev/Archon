@@ -2293,6 +2293,20 @@ export function isOutputFormatEnforced(node: DagNode | IncludeDirective): boolea
   return !ignoredFieldsForNode(node)?.fields.includes('output_format');
 }
 
+/**
+ * Whether these nodes hold a durable world-wait (`wait:`), at the top level or inside a
+ * `loop_group` body. The one owner of the question: the loader's ordering rules and the
+ * container refusal (`assertNoDurableWaitForContainer`, which the engine and the CLI both
+ * call) ask it here.
+ */
+export function containsDurableWait(nodes: readonly (DagNode | IncludeDirective)[]): boolean {
+  return nodes.some(node => {
+    if (isIncludeDirective(node)) return false;
+    if (isWaitNode(node)) return true;
+    return isLoopGroupNode(node) && containsDurableWait(node.loop_group.nodes);
+  });
+}
+
 export function isIncludeDirective(node: DagNode | IncludeDirective): node is IncludeDirective {
   const candidate = node as { kind?: unknown; include?: unknown };
   return (

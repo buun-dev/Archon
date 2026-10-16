@@ -43,6 +43,7 @@ import {
   effortLevelSchema,
   sandboxSettingsSchema,
   betasSchema,
+  containsDurableWait,
 } from './schemas/dag-node';
 import type { NestedKeySpec } from './schemas/dag-node';
 import {
@@ -1069,11 +1070,7 @@ export function validateDagStructure(
     return seen;
   };
 
-  const hasDurableWait = (node: DagNode | IncludeDirective): boolean => {
-    if (isIncludeDirective(node)) return false;
-    if (isWaitNode(node)) return true;
-    return isLoopGroupNode(node) && node.loop_group.nodes.some(hasDurableWait);
-  };
+  const hasDurableWait = (node: DagNode | IncludeDirective): boolean => containsDurableWait([node]);
   const canSuspend = (node: DagNode | IncludeDirective): boolean => {
     if (isIncludeDirective(node)) return false;
     if (isGateNode(node) || isWaitNode(node) || isWorkflowNode(node)) return true;

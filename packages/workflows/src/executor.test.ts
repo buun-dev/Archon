@@ -940,6 +940,42 @@ describe('executeWorkflow', () => {
       ).rejects.toThrow('durable wait, which is not supported in container isolation');
     });
 
+    it('refuses a durable wait nested in a loop_group body', async () => {
+      const workflow = resolveWorkflow(
+        workflowDefinitionSchema.parse({
+          name: 'container-group-wait',
+          description: 'a wait inside a loop_group body',
+          nodes: [
+            {
+              id: 'refine',
+              loop_group: {
+                until: 'DONE',
+                max_iterations: 2,
+                nodes: [{ id: 'delay', wait: { duration_ms: 1000 } }],
+              },
+            },
+          ],
+        })
+      );
+      const store = makeStore();
+
+      await expect(
+        executeWorkflow(
+          makeDeps(store),
+          makePlatform(),
+          'conv-1',
+          '/tmp/ops',
+          workflow,
+          'msg',
+          { conversationId: 'db-conv-1' },
+          { execContext: { kind: 'container', containerId: 'cid' } }
+        )
+      ).rejects.toThrow(
+        "Workflow 'container-group-wait' contains a durable wait, which is not supported in container isolation"
+      );
+      expect(store.createWorkflowRun).not.toHaveBeenCalled();
+    });
+
     it('refuses nodeVisibility wsl without a container execution context', async () => {
       const store = makeStore();
 
