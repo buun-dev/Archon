@@ -60,6 +60,10 @@ const keyClassifications = {
     kind: 'unavailable',
     reason: 'container isolation is resolved before run dispatch',
   },
+  isolation: {
+    kind: 'unavailable',
+    reason: 'the repo-kind isolation provider is selected before run dispatch',
+  },
   botName: {
     kind: 'unavailable',
     reason: 'the bot identity is process-scoped and has no per-run consumer',

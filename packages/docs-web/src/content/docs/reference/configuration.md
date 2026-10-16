@@ -477,6 +477,39 @@ container:
 
 **Prerequisites:** Docker, and the runner image built once with `bun run build:runner-image` (tags `archon-runner:<version>` + `:latest`). Container mode is **folder-project-only** (a repo project errors). Pausing workflows (approval/interactive gates) **are** supported — a pause `docker stop`s the container (near-zero resources while awaiting a decision) and resume rediscovers and restarts it. Neither `$ARTIFACTS_DIR` nor `$STATE_DIR` is mounted into the container — see [Container runs and run output](#container-runs-and-run-output) below. For the full flow, pause economics, and security posture, see the [Container isolation guide](/guides/container-isolation/) and `packages/isolation/docker/SECURITY.md`.
 
+### Container isolation (repo projects)
+
+**Repo projects** run in a git worktree on the host by default. A repo opts into running that worktree inside a per-run WSL2 sandbox with an `isolation` section in its `.archon/config.yaml`:
+
+```yaml
+isolation:
+  provider: container # 'worktree' (default) or 'container'
+  compose: .archon/sandbox.compose.yml # optional compose overlay, relative to the repo root
+  provision: bun install # required for 'container': the one command run in the fresh container
+```
+
+- `provider` selects the strategy. `worktree` is the default.
+- `compose` names the repo's compose overlay, relative to the repo root, declaring the services the repo needs beside the agent. Optional.
+- `provision` is the command Archon runs inside the fresh container to make the worktree ready. It is required with `provider: container`, because the repo owns its setup.
+
+The loader does not validate these values; the provider checks them where they become a decision, and refuses a misconfigured container dispatch before any run or worktree exists.
+
+The machine side lives in the global `~/.archon/config.yaml` under `isolation.container`. Every key is optional:
+
+```yaml
+isolation:
+  container:
+    distro: Ubuntu # WSL distro that hosts the sandbox (default: Ubuntu)
+    image: archon-runner:latest # runner image (default: archon-runner:latest)
+    repoRoot: ~/archon/repos # distro path holding repo clones; ~ is the distro home (default: ~/archon/repos)
+    worktreeRoot: ~/archon/worktrees # distro path each run's worktree is cut under (default: ~/archon/worktrees)
+    gitIdentity: # stamped on the worktree when the dispatch carries no identity of its own
+      email: you@example.com
+      name: Your Name # optional
+```
+
+**Folder projects ignore `isolation`.** They choose in-place or the Docker backend through the `container` section above. The global `isolation.container` section is also distinct from the top-level `container` section, whose keys are the folder backend's `docker run` flags.
+
 ### Container runs and run output
 
 Container runs are the one place where a run's output is **not** addressable from the host

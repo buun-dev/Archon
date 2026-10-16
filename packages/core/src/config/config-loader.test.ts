@@ -211,6 +211,17 @@ describe('config-loader', () => {
   });
 
   describe('loadGlobalConfig', () => {
+    test('loadGlobalConfig returns isolation.container verbatim', async () => {
+      mockFsReadFile.mockResolvedValue(`
+isolation:
+  container:
+    distro: Ubuntu-24.04
+`);
+      expect((await loadGlobalConfig()).isolation).toEqual({
+        container: { distro: 'Ubuntu-24.04' },
+      });
+    });
+
     test('returns empty object when file does not exist', async () => {
       const error = new Error('ENOENT') as NodeJS.ErrnoException;
       error.code = 'ENOENT';
@@ -395,6 +406,20 @@ workflows:
   });
 
   describe('loadRepoConfig', () => {
+    test('loadRepoConfig returns the isolation section verbatim', async () => {
+      mockFsReadFile.mockResolvedValue(`
+isolation:
+  provider: container
+  compose: .archon/sandbox.compose.yml
+  provision: bun install
+`);
+      expect((await loadRepoConfig('/repo')).isolation).toEqual({
+        provider: 'container',
+        compose: '.archon/sandbox.compose.yml',
+        provision: 'bun install',
+      });
+    });
+
     test('loads post-create commands and per-command timeout', async () => {
       mockFsReadFile.mockResolvedValue(
         'worktree:\n  postCreate: ["  bun install  ", "./setup.sh"]\n  postCreateTimeout: 75000'

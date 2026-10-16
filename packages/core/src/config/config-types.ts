@@ -52,6 +52,7 @@ import type {
   ProviderDefaultsMap,
 } from '@archon/providers/types';
 import type { RawAliasesConfig, RawTiersConfig } from '@archon/workflows/model-validation';
+import type { SandboxHostConfig } from '@archon/isolation';
 import {
   workflowRunContinuationConfigSchema,
   type WorkflowRunConfigLayer,
@@ -206,6 +207,17 @@ export interface GlobalConfig {
    */
   container?: ContainerConfig;
 
+  /**
+   * Machine-side settings for repo-kind container isolation (the WSL sandbox
+   * `ContainerProvider` brings up when a repo's `.archon/config.yaml` says
+   * `isolation.provider: container`). Every field is optional; the defaults are
+   * the layout the lifecycle grew up on. Distinct from `container` above, whose
+   * fields are the folder backend's `docker run` flags.
+   */
+  isolation?: {
+    container?: SandboxHostConfig;
+  };
+
   /** Operator policy for live tool attention and quota continuation. */
   workflows?: WorkflowContinuationConfig;
 }
@@ -278,6 +290,27 @@ export interface RepoConfig {
    * Overrides global `container` per-field.
    */
   container?: ContainerConfig;
+
+  /**
+   * Isolation strategy for this repo-kind project.
+   *
+   * `worktree` (default) runs on the host in a git worktree; `container` runs the
+   * worktree inside the WSL sandbox (via the ContainerProvider, which mounts the
+   * worktree at its own path). Folder projects ignore this: they select in-place
+   * vs the folder container backend through the `container` section above.
+   *
+   * With `provider: container`, `provision` is the one command Archon runs inside
+   * the fresh container to make the worktree ready (required: the repo owns its
+   * setup), and `compose` names the repo's compose overlay, relative to the repo
+   * root, declaring the services the repo needs beside the agent (optional).
+   * Neither is validated at load time (the loader is fail-soft), so the
+   * provider checks them where they become a decision.
+   */
+  isolation?: {
+    provider?: 'worktree' | 'container';
+    compose?: string;
+    provision?: string;
+  };
 
   /**
    * Per-project environment variables injected into Claude SDK subprocess env.
