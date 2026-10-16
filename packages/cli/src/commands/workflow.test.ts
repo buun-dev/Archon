@@ -130,6 +130,7 @@ import {
   resolveDetachedRunEncryptionEnv,
   maybePrintTierNotice,
   resolveContainerBackendConfig,
+  containerProviderDeps,
   pendingDurableWait,
   hasUnresolvedWriteback,
   buildNodeSummaries,
@@ -318,9 +319,100 @@ mock.module('@archon/paths', () => ({
 }));
 
 // Mock @archon/isolation (getIsolationProvider moved here from @archon/core)
-const { worktreeRegistrationMetadata } = await import('@archon/isolation');
+const {
+  worktreeRegistrationMetadata,
+  assertIsolationProviderRecognized,
+  isContainerIsolationProvider,
+} = await import('@archon/isolation');
+
+/** The sandbox every repo container dispatch in this file creates. */
+const REPO_SANDBOX = {
+  workingPath: '/home/u/archon/worktrees/repo/task-assist',
+  branchName: 'sandbox/task-assist',
+  baseBranch: 'trunk',
+  project: 'archon-repo-task-assist',
+  containerId: 'cid-repo',
+} as const;
+
+/**
+ * A repo container provider double. `create`, `writeBackBackend` and `stop` are what a
+ * fresh run drives; `reattach` and `destroy` reject, because a fresh run that reached
+ * either one would be resuming or tearing down the run's output.
+ */
+function makeRepoContainerProvider(
+  stop = mock((_workingPath: string): Promise<void> => Promise.resolve())
+): {
+  providerType: 'container';
+  create: Mock<(request: unknown) => Promise<unknown>>;
+  writeBack: Record<
+    'suspend' | 'finalize' | 'applyChanges' | 'discardChanges',
+    Mock<() => Promise<unknown>>
+  >;
+  writeBackBackend: Mock<(workingPath: string) => unknown>;
+  stop: Mock<(workingPath: string) => Promise<void>>;
+  reattach: Mock<() => Promise<never>>;
+  destroy: Mock<() => Promise<never>>;
+} {
+  const writeBack = {
+    suspend: mock((): Promise<unknown> => Promise.resolve()),
+    finalize: mock((): Promise<unknown> => Promise.resolve({ requiresApproval: false })),
+    applyChanges: mock((): Promise<unknown> => Promise.reject(new Error('no overlay write-back'))),
+    discardChanges: mock(
+      (): Promise<unknown> => Promise.reject(new Error('no overlay write-back'))
+    ),
+  };
+  return {
+    providerType: 'container',
+    create: mock(
+      (_request: unknown): Promise<unknown> =>
+        Promise.resolve({
+          id: REPO_SANDBOX.workingPath,
+          provider: 'container',
+          workingPath: REPO_SANDBOX.workingPath,
+          branchName: REPO_SANDBOX.branchName,
+          baseBranch: REPO_SANDBOX.baseBranch,
+          project: REPO_SANDBOX.project,
+          execContext: {
+            kind: 'container',
+            containerId: REPO_SANDBOX.containerId,
+            execUser: '1000',
+          },
+          status: 'active',
+          createdAt: new Date(),
+          metadata: {},
+        })
+    ),
+    writeBack,
+    writeBackBackend: mock((_workingPath: string): unknown => writeBack),
+    stop,
+    reattach: mock(() => Promise.reject(new Error('a fresh run never reattaches'))),
+    destroy: mock(() => Promise.reject(new Error('a run end never destroys the sandbox'))),
+  };
+}
+
+/**
+ * Its own mock, not the real factory: the real one builds a ContainerProvider that shells
+ * `wsl.exe` and `docker`. A worktree selection answers an inert stand-in, because the
+ * worktree path creates through `createRegisteredWorktree`, which asks
+ * `getIsolationProvider` itself, so the tests that stub that mock still reach it.
+ */
+const mockSelectIsolationProvider = mock(
+  (
+    providerType?: string,
+    _deps?: unknown
+  ): ReturnType<typeof makeRepoContainerProvider> | { providerType: 'worktree' } =>
+    providerType === 'container' ? makeRepoContainerProvider() : { providerType: 'worktree' }
+);
+/** The prerequisite probe shells `wsl.exe` and `docker`; it passes unless a test says otherwise. */
+const mockAssertContainerPrerequisites = mock(
+  (_repo: string, _deps?: unknown): Promise<unknown> => Promise.resolve({})
+);
 mock.module('@archon/isolation', () => ({
   worktreeRegistrationMetadata,
+  assertIsolationProviderRecognized,
+  isContainerIsolationProvider,
+  selectIsolationProvider: mockSelectIsolationProvider,
+  assertContainerPrerequisites: mockAssertContainerPrerequisites,
   configureIsolation: mock(() => undefined),
   // Marked rather than reimplemented: these tests prove a failure path routes
   // through the classifier, while what the real one produces is the isolation
@@ -377,6 +469,7 @@ mock.module('@archon/core', () => ({
   generateAndSetTitle: mock(() => Promise.resolve()),
   resolveTitleRequest: mock((provider: string) => Promise.resolve({ provider, options: {} })),
   loadRepoConfig: mock(() => Promise.resolve({})),
+  loadGlobalConfig: mock(() => Promise.resolve({})),
   getUserAiPrefs: mock(() => Promise.resolve({})),
   createWorkflowStore: mock(() => ({
     getCodebaseEnvVars: async () => ({}),
@@ -395,6 +488,8 @@ mock.module('@archon/core/config/config-loader', () => ({
   loadConfig: (...args: Parameters<typeof mockedCore.loadConfig>) => mockedCore.loadConfig(...args),
   loadRepoConfig: (...args: Parameters<typeof mockedCore.loadRepoConfig>) =>
     mockedCore.loadRepoConfig(...args),
+  loadGlobalConfig: (...args: Parameters<typeof mockedCore.loadGlobalConfig>) =>
+    mockedCore.loadGlobalConfig(...args),
 }));
 mock.module('@archon/core/handlers/clone', () => ({
   registerRepository: (
@@ -4347,9 +4442,12 @@ describe('workflowRunCommand', () => {
     });
     const core = await import('@archon/core');
     const gitModule = await import('@archon/git');
-    (core.loadRepoConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
-      worktree: { remote: ' upstream ' },
-    });
+    // Read twice: once for the isolation provider before the run row, once by the reuse
+    // check.
+    const repoConfig = { worktree: { remote: ' upstream ' } };
+    (core.loadRepoConfig as ReturnType<typeof mock>)
+      .mockResolvedValueOnce(repoConfig)
+      .mockResolvedValueOnce(repoConfig);
     // isAncestorOf returns true by default — no warning expected
     (conversationDb.updateConversation as ReturnType<typeof mock>).mockResolvedValueOnce(undefined);
     (executeWorkflow as ReturnType<typeof mock>).mockResolvedValueOnce({
@@ -8634,6 +8732,375 @@ describe('resolveCliExitCode', () => {
   });
 });
 
+describe('containerProviderDeps', () => {
+  it("reads the repo's worktree and isolation sections and the machine's isolation.container", async () => {
+    const core = await import('@archon/core');
+    const loadRepoConfig = core.loadRepoConfig as ReturnType<typeof mock>;
+    const repoConfig = {
+      worktree: { baseBranch: 'trunk' },
+      isolation: { provider: 'container', provision: 'bun install', compose: 'sandbox.yml' },
+    };
+    loadRepoConfig.mockClear();
+    loadRepoConfig.mockResolvedValueOnce(repoConfig).mockResolvedValueOnce(repoConfig);
+    (core.loadGlobalConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      isolation: { container: { distro: 'Arch' } },
+    });
+
+    const deps = containerProviderDeps('/repo/root');
+
+    expect(await deps.loadConfig?.('/repo/root')).toEqual({ baseBranch: 'trunk' });
+    expect(await deps.loadRepoSandboxConfig?.('/repo/root')).toEqual(repoConfig.isolation);
+    expect(await deps.loadHostConfig?.()).toEqual({ distro: 'Arch' });
+    expect(loadRepoConfig.mock.calls).toEqual([['/repo/root'], ['/repo/root']]);
+  });
+
+  it('answers null for each section neither config declares', async () => {
+    const deps = containerProviderDeps('/repo/root');
+
+    expect(await deps.loadConfig?.('/repo/root')).toBeNull();
+    expect(await deps.loadRepoSandboxConfig?.('/repo/root')).toBeNull();
+    expect(await deps.loadHostConfig?.()).toBeNull();
+  });
+});
+
+describe('workflowRunCommand — repo container isolation', () => {
+  let consoleSpy: ReturnType<typeof spyOn>;
+
+  beforeEach(async () => {
+    consoleSpy = spyOn(console, 'log').mockImplementation(() => {});
+    mockSelectIsolationProvider.mockClear();
+    mockAssertContainerPrerequisites.mockClear();
+    mockCreateWorkflowRun.mockClear();
+    mockStartRunLiveOwner.mockClear();
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+    (executeWorkflow as ReturnType<typeof mock>).mockClear();
+    const isolationDb = await import('@archon/core/db/isolation-environments');
+    (isolationDb.create as ReturnType<typeof mock>).mockClear();
+    (isolationDb.updateMetadata as ReturnType<typeof mock>).mockClear();
+  });
+
+  afterEach(() => {
+    consoleSpy.mockRestore();
+  });
+
+  /** Arrange a repo-kind project whose `.archon/config.yaml` asks for a container. */
+  async function arrangeContainerRepo(): Promise<void> {
+    const codebaseDb = await import('@archon/core/db/codebases');
+    const core = await import('@archon/core');
+    mockDiscoverWorkflowsWithConfig.mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'assist', description: 'Help' })],
+      errors: [],
+    });
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'cb-repo',
+      name: 'owner/repo',
+      default_cwd: '/test/path',
+      default_branch: 'main',
+      kind: 'repo',
+    });
+    (core.loadRepoConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      isolation: { provider: 'container' },
+    });
+  }
+
+  /**
+   * Arrange one container dispatch that reaches the engine. The provider double is
+   * returned so a test can read what the run did with it.
+   */
+  async function arrangeContainerDispatch(
+    result: unknown,
+    provider = makeRepoContainerProvider()
+  ): Promise<ReturnType<typeof makeRepoContainerProvider>> {
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+    await arrangeContainerRepo();
+    mockSelectIsolationProvider.mockReturnValueOnce(provider);
+    (executeWorkflow as ReturnType<typeof mock>).mockResolvedValueOnce(result);
+    return provider;
+  }
+
+  it('selects the container isolation provider when repo config asks for it', async () => {
+    const isolation = await import('@archon/isolation');
+    const isolationDb = await import('@archon/core/db/isolation-environments');
+    const worktreeProviderCalls = (isolation.getIsolationProvider as ReturnType<typeof mock>).mock
+      .calls.length;
+    const provider = await arrangeContainerDispatch({ success: true, workflowRunId: 'run-c' });
+
+    await workflowRunCommand(createTestWorkflowHost(), '/test/path', 'assist', 'hello');
+
+    expect(mockSelectIsolationProvider).toHaveBeenCalledWith(
+      'container',
+      expect.objectContaining({
+        loadConfig: expect.any(Function),
+        loadRepoSandboxConfig: expect.any(Function),
+        loadHostConfig: expect.any(Function),
+      })
+    );
+    expect(provider.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        workflowType: 'task',
+        identifier: expect.stringMatching(/^assist-\d+$/),
+        codebaseId: 'cb-repo',
+        canonicalRepoPath: '/test/path',
+        baseBranch: 'main',
+      })
+    );
+    // The row records the provider that created the env: upstream lists, guards and
+    // reclaims container rows by it.
+    expect(isolationDb.create).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        provider: 'container',
+        working_path: REPO_SANDBOX.workingPath,
+        branch_name: REPO_SANDBOX.branchName,
+        metadata: expect.objectContaining({
+          container_project: REPO_SANDBOX.project,
+          base_branch: REPO_SANDBOX.baseBranch,
+        }),
+      })
+    );
+    // ...and no host worktree was cut beside it.
+    expect((isolation.getIsolationProvider as ReturnType<typeof mock>).mock.calls).toHaveLength(
+      worktreeProviderCalls
+    );
+  });
+
+  it('passes the engine nodeVisibility wsl, the container exec context, and a writeBack auto container context', async () => {
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+    const provider = await arrangeContainerDispatch({ success: true, workflowRunId: 'run-c' });
+
+    await workflowRunCommand(createTestWorkflowHost(), '/test/path', 'assist', 'hello');
+
+    const call = (executeWorkflow as ReturnType<typeof mock>).mock.calls.at(-1);
+    const opts = call?.[7] as {
+      nodeVisibility?: string;
+      execContext?: unknown;
+      container?: unknown;
+      baseBranch?: string;
+      ownedWorktree?: unknown;
+    };
+    expect(call?.[3]).toBe(REPO_SANDBOX.workingPath);
+    expect(opts.nodeVisibility).toBe('wsl');
+    expect(opts.execContext).toEqual({
+      kind: 'container',
+      containerId: REPO_SANDBOX.containerId,
+      execUser: '1000',
+    });
+    // `auto` and a `finalize` that never asks for approval: a repo sandbox writes commits
+    // to its own branch, so there is no overlay to gate.
+    expect(opts.container).toEqual({
+      envId: 'iso-123',
+      writeBack: 'auto',
+      backend: provider.writeBack,
+    });
+    expect(provider.writeBackBackend).toHaveBeenCalledWith(REPO_SANDBOX.workingPath);
+    // The base the sandbox was cut from, which `$BASE_BRANCH` must agree with.
+    expect(opts.baseBranch).toBe(REPO_SANDBOX.baseBranch);
+    expect(opts.ownedWorktree).toBeUndefined();
+  });
+
+  it('never reuses a --branch worktree for a container run', async () => {
+    const isolationDb = await import('@archon/core/db/isolation-environments');
+    (isolationDb.findActiveByWorkflow as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'env-host',
+      working_path: '/worktrees/feat-x',
+      provider: 'worktree',
+      branch_name: 'feat-x',
+      workflow_type: 'task',
+      workflow_id: 'feat-x',
+      metadata: {},
+    });
+    const provider = await arrangeContainerDispatch({ success: true, workflowRunId: 'run-c' });
+
+    await workflowRunCommand(createTestWorkflowHost(), '/test/path', 'assist', 'hello', {
+      branchName: 'feat-x',
+    });
+
+    // The request reaches the sandbox, which owns the refusal of a named branch.
+    expect(provider.create).toHaveBeenCalledWith(
+      expect.objectContaining({ taskBranch: { kind: 'new', branch: 'feat-x' } })
+    );
+    expect(isolationDb.updateMetadata).not.toHaveBeenCalled();
+  });
+
+  it('still refuses --container on a repo project, naming isolation.provider', async () => {
+    const codebaseDb = await import('@archon/core/db/codebases');
+    mockDiscoverWorkflowsWithConfig.mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'assist', description: 'Help' })],
+      errors: [],
+    });
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'cb-repo',
+      name: 'owner/repo',
+      default_cwd: '/test/path',
+      kind: 'repo',
+    });
+
+    await expect(
+      workflowRunCommand(createTestWorkflowHost(), '/test/path', 'assist', 'hello', {
+        container: true,
+      })
+    ).rejects.toThrow(
+      /--container.*For a repo project, set isolation\.provider: container in \.archon\/config\.yaml\./
+    );
+    expect(mockAssertContainerPrerequisites).not.toHaveBeenCalled();
+    expect(mockCreateWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  // Refused before the row (D6): the probe runs before `startRunLiveOwner` and the run row,
+  // so a machine without the sandbox prerequisites leaves nothing behind to clean up.
+  it('fails a container dispatch with absent prerequisites before any run row exists', async () => {
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+    const core = await import('@archon/core');
+    await arrangeContainerRepo();
+    (core.loadGlobalConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      isolation: { container: { distro: 'Arch' } },
+    });
+    mockAssertContainerPrerequisites.mockRejectedValueOnce(
+      new Error(
+        "Container isolation is unavailable: the WSL distro 'Arch' is not reachable. " +
+          'This repo asks for container isolation (`isolation.provider: container` in ' +
+          '.archon/config.yaml); set it to `worktree` to run on the host instead.'
+      )
+    );
+
+    await expect(
+      workflowRunCommand(createTestWorkflowHost(), '/test/path', 'assist', 'hello')
+    ).rejects.toThrow(/isolation\.provider/);
+    // The repo's basename names its base clone; the machine's section rides along.
+    expect(mockAssertContainerPrerequisites).toHaveBeenCalledWith('path', {
+      host: { distro: 'Arch' },
+    });
+    expect(mockStartRunLiveOwner).not.toHaveBeenCalled();
+    expect(mockCreateWorkflowRun).not.toHaveBeenCalled();
+    expect(mockSelectIsolationProvider).not.toHaveBeenCalled();
+    expect(executeWorkflow).not.toHaveBeenCalled();
+  });
+
+  it('refuses a misspelled isolation.provider before any run row exists', async () => {
+    const codebaseDb = await import('@archon/core/db/codebases');
+    const core = await import('@archon/core');
+    mockDiscoverWorkflowsWithConfig.mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'assist', description: 'Help' })],
+      errors: [],
+    });
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'cb-repo',
+      name: 'owner/repo',
+      default_cwd: '/test/path',
+      kind: 'repo',
+    });
+    (core.loadRepoConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      isolation: { provider: 'contaner' },
+    });
+
+    await expect(
+      workflowRunCommand(createTestWorkflowHost(), '/test/path', 'assist', 'hello')
+    ).rejects.toThrow(/Unknown isolation\.provider 'contaner'/);
+    expect(mockAssertContainerPrerequisites).not.toHaveBeenCalled();
+    expect(mockStartRunLiveOwner).not.toHaveBeenCalled();
+    expect(mockCreateWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  // A terminal run stops its stack (agent and the repo's services) to free the machine,
+  // and keeps the worktree, branch and row: they are the run's output and its resume
+  // handle. A paused run's agent was already suspended by the engine.
+  describe('repo container run end', () => {
+    it('stops the stack on completion', async () => {
+      const provider = await arrangeContainerDispatch({ success: true, workflowRunId: 'run-c' });
+
+      await workflowRunCommand(createTestWorkflowHost(), '/test/path', 'assist', 'hello');
+
+      expect(provider.stop).toHaveBeenCalledTimes(1);
+      expect(provider.stop).toHaveBeenCalledWith(REPO_SANDBOX.workingPath);
+      expect(provider.destroy).not.toHaveBeenCalled();
+      expect(consoleSpy).toHaveBeenCalledWith('Sandbox stack stopped (worktree and branch kept).');
+    });
+
+    it('stops the stack on failure', async () => {
+      const provider = await arrangeContainerDispatch({
+        success: false,
+        workflowRunId: 'run-c',
+        error: 'boom',
+      });
+
+      await expect(
+        workflowRunCommand(createTestWorkflowHost(), '/test/path', 'assist', 'hello')
+      ).rejects.toThrow('Workflow failed');
+
+      expect(provider.stop).toHaveBeenCalledWith(REPO_SANDBOX.workingPath);
+      expect(provider.destroy).not.toHaveBeenCalled();
+    });
+
+    it("leaves a paused run's stack running", async () => {
+      const provider = await arrangeContainerDispatch({
+        success: true,
+        paused: true,
+        workflowRunId: 'run-c',
+      });
+
+      await workflowRunCommand(createTestWorkflowHost(), '/test/path', 'assist', 'hello');
+
+      expect(provider.stop).not.toHaveBeenCalled();
+    });
+
+    it('a stack that will not stop fails an otherwise-successful run', async () => {
+      const provider = await arrangeContainerDispatch(
+        { success: true, workflowRunId: 'run-c' },
+        makeRepoContainerProvider(
+          mock(
+            (_workingPath: string): Promise<void> =>
+              Promise.reject(new Error('compose stop: daemon gone'))
+          )
+        )
+      );
+      const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
+
+      try {
+        await expect(
+          workflowRunCommand(createTestWorkflowHost(), '/test/path', 'assist', 'hello')
+        ).rejects.toThrow(/daemon gone/);
+        expect(provider.stop).toHaveBeenCalledTimes(1);
+        expect(errorSpy).toHaveBeenCalledWith(
+          expect.stringContaining(`failed to stop the sandbox stack ${REPO_SANDBOX.project}`)
+        );
+      } finally {
+        errorSpy.mockRestore();
+      }
+    });
+
+    it('a signal mid-run stops the stack before the forced exit', async () => {
+      const { executeWorkflow } = await import('@archon/workflows/executor');
+      await arrangeContainerRepo();
+      const provider = makeRepoContainerProvider();
+      mockSelectIsolationProvider.mockReturnValueOnce(provider);
+      // The forced exit ends the chain; neutered so the handler can run in-process.
+      const exitSpy = spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+      const sigtermBefore = process.listeners('SIGTERM');
+      let stopsAtSignal = -1;
+      (executeWorkflow as ReturnType<typeof mock>).mockImplementationOnce(async () => {
+        const handler = process
+          .listeners('SIGTERM')
+          .find(listener => !sigtermBefore.includes(listener)) as (() => void) | undefined;
+        expect(handler).toBeDefined();
+        handler?.();
+        for (let i = 0; i < 5; i++) await new Promise(resolve => setTimeout(resolve, 0));
+        stopsAtSignal = provider.stop.mock.calls.length;
+        return { success: false, workflowRunId: 'run-c', error: 'interrupted' };
+      });
+
+      try {
+        await expect(
+          workflowRunCommand(createTestWorkflowHost(), '/test/path', 'assist', 'hello')
+        ).rejects.toThrow('Workflow failed');
+        expect(stopsAtSignal).toBe(1);
+        expect(provider.stop).toHaveBeenCalledWith(REPO_SANDBOX.workingPath);
+        expect(exitSpy).toHaveBeenCalledWith(1);
+      } finally {
+        exitSpy.mockRestore();
+      }
+    });
+  });
+});
+
 describe('workflowRunCommand — detach', () => {
   let consoleSpy: ReturnType<typeof spyOn>;
   let stdoutSpy: ReturnType<typeof spyOn>;
@@ -8848,6 +9315,124 @@ describe('workflowRunCommand — detach', () => {
     }
 
     expect(consoleSpy).not.toHaveBeenCalledWith("Started 'assist' in the background.");
+  });
+
+  // A repo whose config asks for container isolation has prerequisites outside the repo
+  // (the distro, the base clone, the docker daemon, the runner image) that only the
+  // child would otherwise discover, after this process wrote the row and printed
+  // `Started`. The same pre-flight that refuses an unresolvable --adopt refuses them (D6).
+  it('refuses a container dispatch with absent prerequisites before writing the run row', async () => {
+    jest.useRealTimers();
+    const core = await import('@archon/core');
+    mockDiscoverWorkflowsWithConfig.mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'assist', description: 'Help' })],
+      errors: [],
+    });
+    (core.loadRepoConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      isolation: { provider: 'container' },
+    });
+    mockAssertContainerPrerequisites.mockRejectedValueOnce(
+      new Error(
+        "Container isolation is unavailable: the WSL distro 'Ubuntu' is not reachable. " +
+          'This repo asks for container isolation (`isolation.provider: container` in ' +
+          '.archon/config.yaml); set it to `worktree` to run on the host instead.'
+      )
+    );
+    mockCreateWorkflowRun.mockClear();
+
+    const child = createDetachedChildFixture();
+    const spawnSpy = spyOn(Bun, 'spawn').mockReturnValue(child.child);
+    const savedArgv = process.argv;
+    process.argv = ['bun', '/abs/cli.ts', 'workflow', 'run', 'assist', 'hello', '--detach'];
+
+    try {
+      await expect(
+        workflowRunCommand(createTestWorkflowHost(), '/test/path', 'assist', 'hello', {
+          detach: true,
+        })
+      ).rejects.toThrow(/isolation\.provider/);
+      // No child, and no row.
+      expect(spawnSpy).not.toHaveBeenCalled();
+      expect(mockCreateWorkflowRun).not.toHaveBeenCalled();
+    } finally {
+      process.argv = savedArgv;
+      spawnSpy.mockRestore();
+    }
+
+    expect(consoleSpy).not.toHaveBeenCalledWith("Started 'assist' in the background.");
+  });
+
+  // The silent-fallback half: `isolation: { provider: contaner }` used to miss the
+  // `=== 'container'` test and run on the host, and nothing said so.
+  it('refuses a misspelled isolation.provider rather than launching a host run', async () => {
+    jest.useRealTimers();
+    const core = await import('@archon/core');
+    mockDiscoverWorkflowsWithConfig.mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'assist', description: 'Help' })],
+      errors: [],
+    });
+    (core.loadRepoConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      isolation: { provider: 'contaner' },
+    });
+    mockCreateWorkflowRun.mockClear();
+
+    const child = createDetachedChildFixture();
+    const spawnSpy = spyOn(Bun, 'spawn').mockReturnValue(child.child);
+    const savedArgv = process.argv;
+    process.argv = ['bun', '/abs/cli.ts', 'workflow', 'run', 'assist', 'hello', '--detach'];
+
+    try {
+      await expect(
+        workflowRunCommand(createTestWorkflowHost(), '/test/path', 'assist', 'hello', {
+          detach: true,
+        })
+      ).rejects.toThrow(/Unknown isolation\.provider 'contaner'/);
+      expect(spawnSpy).not.toHaveBeenCalled();
+      expect(mockCreateWorkflowRun).not.toHaveBeenCalled();
+    } finally {
+      process.argv = savedArgv;
+      spawnSpy.mockRestore();
+    }
+  });
+
+  // The sandbox cuts its own `sandbox/<slug>` branch and refuses a named one, so a pinned
+  // `--branch` would make every detached container launch fail in the child.
+  it('pins no --branch on the child of a container launch', async () => {
+    const core = await import('@archon/core');
+    mockDiscoverWorkflowsWithConfig.mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'assist', description: 'Help' })],
+      errors: [],
+    });
+    (core.loadRepoConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      isolation: { provider: 'container' },
+    });
+    mockAssertContainerPrerequisites.mockClear();
+    mockCreateWorkflowRun.mockClear();
+
+    const child = createDetachedChildFixture();
+    const spawnSpy = spyOn(Bun, 'spawn').mockReturnValue(child.child);
+    const savedArgv = process.argv;
+    process.argv = ['bun', '/abs/cli.ts', 'workflow', 'run', 'assist', 'hello', '--detach'];
+
+    let spawnCmd: string[] = [];
+    try {
+      const commandPromise = workflowRunCommand(
+        createTestWorkflowHost(),
+        '/test/path',
+        'assist',
+        'hello',
+        { detach: true }
+      );
+      await finishStartupWindow(commandPromise, spawnSpy);
+      spawnCmd = firstDetachedSpawnOptions(spawnSpy).cmd.slice();
+    } finally {
+      process.argv = savedArgv;
+      spawnSpy.mockRestore();
+    }
+
+    expect(mockAssertContainerPrerequisites).toHaveBeenCalledTimes(1);
+    expect(mockCreateWorkflowRun).toHaveBeenCalledTimes(1);
+    expect(spawnCmd).not.toContain('--branch');
   });
 
   it('hands the detached child the sealed validated layer instead of a mutable path', async () => {

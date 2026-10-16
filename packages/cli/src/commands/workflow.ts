@@ -19,6 +19,7 @@ import { providerRegistry } from '@archon/providers';
 import { getApprovalDecisions } from '@archon/workflows/schemas/dag-node';
 import { withBranchLaunchSource } from '@archon/core/workflows/branch-launch-source';
 import {
+  createRegisteredContainerEnv,
   createRegisteredWorktree,
   type RegisteredWorktree,
 } from '@archon/core/workflows/registered-worktree';
@@ -40,7 +41,7 @@ import type { NodeState } from '@archon/workflows/schemas/node-state';
 import { existsSync, readdirSync, statSync, type Dirent } from 'node:fs';
 import * as archonPaths from '@archon/paths';
 import { registerRepository, registerFolder } from '@archon/core/handlers/clone';
-import { loadConfig, loadRepoConfig } from '@archon/core/config/config-loader';
+import { loadConfig, loadGlobalConfig, loadRepoConfig } from '@archon/core/config/config-loader';
 import { InvalidCodebaseDefaultCwdError } from '@archon/core/utils/codebase-path';
 import { toPersistedMessageMetadata } from '@archon/core/types';
 import type { WorkflowHost } from '@archon/core/workflows/host-store';
@@ -91,8 +92,19 @@ import {
   getIsolationProvider,
   resolveFolderBackend,
   classifyIsolationError,
+  selectIsolationProvider,
+  isContainerIsolationProvider,
+  assertIsolationProviderRecognized,
+  assertContainerPrerequisites,
 } from '@archon/isolation';
-import type { ExecutionContext, ContainerBackend, ContainerBackendConfig } from '@archon/isolation';
+import type {
+  ExecutionContext,
+  ContainerBackend,
+  ContainerBackendConfig,
+  ContainerProviderDeps,
+  IContainerIsolationProvider,
+  TaskIsolationRequest,
+} from '@archon/isolation';
 import type { TaskBranchSelection } from '@archon/isolation';
 import {
   createLogger,
@@ -106,7 +118,7 @@ import {
   captureDetachedInstallContext,
   type DetachedInstallContext,
 } from '@archon/paths';
-import { isAbsolute, join, resolve } from 'node:path';
+import { basename, isAbsolute, join, resolve } from 'node:path';
 import {
   applyWorkflowRunConfigLayer,
   WORKFLOW_RUN_CONFIG_METADATA_KEY,
@@ -514,6 +526,40 @@ export function resolveContainerBackendConfig(
     memoryMb: memoryMb ?? 4096,
     pidsLimit: pidsLimit ?? 512,
   };
+}
+
+/**
+ * What a repo's `ContainerProvider` reads from config: the repo's `worktree` section (its
+ * base branch) and `isolation` section (compose overlay and provision command), both from
+ * the checkout at `repoRoot`, and the machine's `isolation.container` section.
+ */
+export function containerProviderDeps(repoRoot: string): ContainerProviderDeps {
+  return {
+    loadConfig: async () => (await loadRepoConfig(repoRoot)).worktree ?? null,
+    loadRepoSandboxConfig: async () => (await loadRepoConfig(repoRoot)).isolation ?? null,
+    loadHostConfig: async () => (await loadGlobalConfig()).isolation?.container ?? null,
+  };
+}
+
+/**
+ * The `isolation.provider` a fresh isolating repo dispatch runs under, refused when it
+ * cannot run: a value nothing implements, or a container whose prerequisites outside the
+ * repo (the WSL distro, the repo's base clone inside it, the docker daemon, the runner
+ * image) are absent. Both launch paths call this before the run row is written, so a
+ * refused dispatch leaves no row, worktree or stack behind (D6). `ContainerProvider.create`
+ * probes again before it provisions.
+ */
+async function resolveRepoIsolationProvider(
+  repoRoot: string
+): Promise<Parameters<typeof selectIsolationProvider>[0]> {
+  const provider = (await loadRepoConfig(repoRoot)).isolation?.provider;
+  assertIsolationProviderRecognized(provider);
+  if (provider === 'container') {
+    await assertContainerPrerequisites(basename(repoRoot), {
+      host: (await loadGlobalConfig()).isolation?.container ?? null,
+    });
+  }
+  return provider;
 }
 
 /**
@@ -2429,6 +2475,13 @@ async function runWorkflowWithOwnedSource(
     // Surface worktree-option conflicts synchronously in the parent rather than
     // letting the child fail after fork.
     assertNoWorktreeOptionsForFolder(detachIsFolder, options);
+    // The repo's isolation provider, and a container's prerequisites, are refused here
+    // too: the child would find them missing only after this process wrote the row and
+    // printed `Started`.
+    const detachRepoIsolationProvider =
+      !options.noWorktree && wantsIsolation && detachCodebase && !detachIsFolder
+        ? await resolveRepoIsolationProvider(detachCodebase.default_cwd)
+        : undefined;
 
     // Between-run continuation (#2747): refuse an unresolvable declaration HERE — this
     // is the exact failure that vanished into a child log. `resolveWorkflowAdoption` is
@@ -2567,10 +2620,13 @@ async function runWorkflowWithOwnedSource(
     // Pin a generated branch only when isolating AND the caller didn't pass
     // --branch (an explicit --branch is already in argv). Without this, the child
     // would generate its own timestamped branch and fork a second worktree.
-    // Never pin a branch for folder projects — they run in place with no worktree.
+    // Never pin a branch for folder projects — they run in place with no worktree — or
+    // for a container sandbox, which cuts its own `sandbox/<slug>` branch and refuses a
+    // named one.
     if (
       wantsIsolation &&
       !detachIsFolder &&
+      detachRepoIsolationProvider !== 'container' &&
       options.branchName === undefined &&
       options.adoptRunId === undefined
     ) {
@@ -2749,6 +2805,14 @@ async function runWorkflowWithOwnedSource(
   // Overlay mode the backend actually mounted (fuse = unprivileged; native =
   // CAP_SYS_ADMIN, gate-bypassable). Threaded to the engine for the H4 run-start warning.
   let containerOverlayMode: 'fuse' | 'native' | undefined;
+  // A repo-kind container run's sandbox, set by its create only. The engine drives its
+  // write-back port and this process stops its stack when the run ends. `containerBackend`
+  // stays undefined for it, so no folder destroy path can tear down the run's worktree.
+  let repoContainer:
+    | (Awaited<ReturnType<typeof createRegisteredContainerEnv>> & {
+        provider: IContainerIsolationProvider;
+      })
+    | undefined;
 
   // Between-run continuation (#2747): resolve the declared adoption BEFORE any
   // lane decision — it dictates the lane, fail-loud (never a silent fresh
@@ -2939,14 +3003,15 @@ async function runWorkflowWithOwnedSource(
 
   const isFolderCodebase = codebase?.kind === 'folder';
 
-  // Container isolation is folder-project-only in v1. A repo-kind project (or a
-  // bare git repo / unregistered non-git cwd) with --container fails fast rather
-  // than silently running a worktree/in-place — no surprising isolation downgrade.
+  // `--container` selects the folder backend only. A repo-kind project (or a bare git
+  // repo / unregistered non-git cwd) with --container fails fast rather than silently
+  // running a worktree/in-place — no surprising isolation downgrade. A repo opts into its
+  // sandbox through its own config instead.
   if (options.container && !isFolderCodebase) {
     throw new Error(
-      'Container isolation is folder-project-only for now. Run --container against a ' +
-        'registered folder project (or add --folder to register this directory as one). ' +
-        'Repo projects use worktree isolation.'
+      'Container isolation through --container is folder-project-only. Run --container ' +
+        'against a registered folder project (or add --folder to register this directory as ' +
+        'one). For a repo project, set isolation.provider: container in .archon/config.yaml.'
     );
   }
 
@@ -2960,6 +3025,13 @@ async function runWorkflowWithOwnedSource(
   // caller declared intent). Fail fast before any worktree work.
   assertNoWorktreeOptionsForFolder(isFolderCodebase, options);
   assertWorkflowNotWorktreePinnedForFolder(isFolderCodebase, pinnedEnabled, workflow.name);
+
+  // The repo's isolation provider, recognized and (for a container) probed before the
+  // live owner and the run row below. The condition is the isolation branch's own.
+  const repoIsolationProvider =
+    wantsIsolation && codebase && !isFolderCodebase
+      ? await resolveRepoIsolationProvider(codebase.default_cwd)
+      : undefined;
 
   let setupPreparedRun: WorkflowRun | undefined;
   let executionSubmitted = false;
@@ -3116,9 +3188,20 @@ async function runWorkflowWithOwnedSource(
 
       // Configure isolation with repo config loader (same as orchestrator)
       configureWorktreeIsolation();
+      const selectedProvider = selectIsolationProvider(
+        repoIsolationProvider,
+        containerProviderDeps(codebase.default_cwd)
+      );
+      // The worktree path keeps creating through `createRegisteredWorktree`, which reads
+      // the same shared provider itself.
+      const containerProvider = isContainerIsolationProvider(selectedProvider)
+        ? selectedProvider
+        : undefined;
 
-      // Check for existing worktree (only when explicit --branch)
-      const existingEnv = existingBranchEnv;
+      // Check for existing worktree (only when explicit --branch). A container run never
+      // reuses one: a host worktree has no container to execute in, and the sandbox
+      // refuses a named branch itself.
+      const existingEnv = containerProvider ? undefined : existingBranchEnv;
 
       if (existingEnv && (await getIsolationProvider().healthCheck(existingEnv.working_path))) {
         if (options.fromBranch) {
@@ -3184,7 +3267,7 @@ async function runWorkflowWithOwnedSource(
           'worktree_creating'
         );
 
-        let created: RegisteredWorktree;
+        let created: RegisteredWorktree | undefined;
         try {
           if (!preparedSource)
             throw new Error('Worktree setup requires a captured workflow source');
@@ -3230,51 +3313,72 @@ async function runWorkflowWithOwnedSource(
             codebase.default_cwd,
             codebase.id
           );
-          created = await createRegisteredWorktree(host.records.isolation, {
-            request: {
-              workflowType: 'task',
-              identifier: branchIdentifier,
-              taskBranch: adoptedTaskBranch
-                ? adoptedTaskBranch
-                : options.branchName
-                  ? {
-                      kind: 'new',
-                      branch: git.toBranchName(options.branchName),
-                      ...(options.fromBranch?.trim()
-                        ? { fromBranch: git.toBranchName(options.fromBranch.trim()) }
-                        : {}),
-                    }
-                  : options.fromBranch?.trim()
-                    ? { kind: 'new', fromBranch: git.toBranchName(options.fromBranch.trim()) }
-                    : undefined,
-              baseBranch: codebaseDefaultBranch
-                ? git.toBranchName(codebaseDefaultBranch)
-                : undefined,
-              baseOverride: flagBase ? git.toBranchName(flagBase) : undefined,
-              codebaseId: codebase.id,
-              // owner/repo name lets resolveOwnerRepo use the registered identity
-              // instead of the _local/<basename> path fallback (#2022, #2227)
-              codebaseName: codebase.name,
-              canonicalRepoPath: git.toRepoPath(codebase.default_cwd),
-              description: `CLI workflow: ${workflowName}`,
-            },
-            setupExecutor: createRunWorktreeSetupExecutor(
-              host.deps,
-              setupRun,
-              preparedAiConfiguration.config
-            ),
-            createdByPlatform: 'cli',
-          });
+          const request: TaskIsolationRequest = {
+            workflowType: 'task',
+            identifier: branchIdentifier,
+            taskBranch: adoptedTaskBranch
+              ? adoptedTaskBranch
+              : options.branchName
+                ? {
+                    kind: 'new',
+                    branch: git.toBranchName(options.branchName),
+                    ...(options.fromBranch?.trim()
+                      ? { fromBranch: git.toBranchName(options.fromBranch.trim()) }
+                      : {}),
+                  }
+                : options.fromBranch?.trim()
+                  ? { kind: 'new', fromBranch: git.toBranchName(options.fromBranch.trim()) }
+                  : undefined,
+            baseBranch: codebaseDefaultBranch ? git.toBranchName(codebaseDefaultBranch) : undefined,
+            baseOverride: flagBase ? git.toBranchName(flagBase) : undefined,
+            codebaseId: codebase.id,
+            // owner/repo name lets resolveOwnerRepo use the registered identity
+            // instead of the _local/<basename> path fallback (#2022, #2227)
+            codebaseName: codebase.name,
+            canonicalRepoPath: git.toRepoPath(codebase.default_cwd),
+            description: `CLI workflow: ${workflowName}`,
+          };
+          if (containerProvider) {
+            // The sandbox provisions itself, so no worktree setup executor runs.
+            const registered = await createRegisteredContainerEnv(host.records.isolation, {
+              request,
+              provider: containerProvider,
+              createdByPlatform: 'cli',
+            });
+            repoContainer = { ...registered, provider: containerProvider };
+          } else {
+            created = await createRegisteredWorktree(host.records.isolation, {
+              request,
+              setupExecutor: createRunWorktreeSetupExecutor(
+                host.deps,
+                setupRun,
+                preparedAiConfiguration.config
+              ),
+              createdByPlatform: 'cli',
+            });
+          }
         } catch (createError) {
           getLog().error({ err: createError, branch: branchIdentifier }, 'worktree.create_failed');
           throw createError;
         }
 
-        workingCwd = created.env.workingPath;
-        isolationEnvId = created.envId;
-        ownedWorktree = created.ownedWorktree;
-        cutFromCommit = created.cutFromCommit;
-        getLog().info({ path: workingCwd }, 'worktree_created');
+        if (repoContainer) {
+          // No `ownedWorktree`: the sandbox's worktree lives in the distro, and a run end
+          // stops its stack rather than removing it.
+          workingCwd = repoContainer.env.workingPath;
+          isolationEnvId = repoContainer.envId;
+          execContext = repoContainer.env.execContext;
+          getLog().info(
+            { path: workingCwd, project: repoContainer.env.project },
+            'container_sandbox_created'
+          );
+        } else if (created) {
+          workingCwd = created.env.workingPath;
+          isolationEnvId = created.envId;
+          ownedWorktree = created.ownedWorktree;
+          cutFromCommit = created.cutFromCommit;
+          getLog().info({ path: workingCwd }, 'worktree_created');
+        }
       }
     } else if (options.noWorktree) {
       getLog().info({ cwd }, 'workflow.running_without_isolation');
@@ -3357,6 +3461,19 @@ async function runWorkflowWithOwnedSource(
             );
           }
         }
+        // A repo sandbox's stack is stopped, never destroyed, for the same reason: the
+        // forced exit skips the `finally` that would stop it.
+        if (repoContainer && !containerPreserved) {
+          const { provider, env } = repoContainer;
+          try {
+            await provider.stop(env.workingPath);
+          } catch (stopErr) {
+            console.error(
+              `\nWARNING: could not stop the sandbox stack ${env.project} on ${signal}: ` +
+                `${(stopErr as Error).message}. Stop it with \`docker compose -p ${env.project} stop\`.`
+            );
+          }
+        }
         // Reclaim the staged capture for the same reason: the ownership `finally` —
         // whose whole premise is "whichever way we leave" — never runs. Ctrl-C during
         // isolation resolution or worktree creation would otherwise strand a complete
@@ -3431,9 +3548,16 @@ async function runWorkflowWithOwnedSource(
       });
       // Container run context for the engine (Phase C): the write-back backend port +
       // env id + policy. The executor drives suspend-on-pause and the write-back gate
-      // through this. Absent for host/in-place runs.
-      const containerRunCtx =
-        containerBackend && containerEnvId
+      // through this. Absent for host/in-place runs. A repo sandbox writes commits to its
+      // own branch and has no overlay to gate, so its `finalize` never asks for approval
+      // and `auto` never applies anything.
+      const containerRunCtx = repoContainer
+        ? {
+            envId: repoContainer.envId,
+            writeBack: 'auto' as const,
+            backend: repoContainer.provider.writeBackBackend(repoContainer.env.workingPath),
+          }
+        : containerBackend && containerEnvId
           ? {
               envId: containerEnvId,
               writeBack: workflow.container?.write_back ?? ('approve' as const),
@@ -3457,10 +3581,13 @@ async function runWorkflowWithOwnedSource(
         codebaseId: codebase?.id,
         source: workflowSource,
         parseWarnings: workflowEntry?.parseWarnings,
-        baseBranch: codebaseDefaultBranch,
+        // A sandbox resolved its base when it was cut; `$BASE_BRANCH` must agree with it.
+        baseBranch: repoContainer?.env.baseBranch ?? codebaseDefaultBranch,
         baseOverride: flagBase,
         execContext,
         container: containerRunCtx,
+        // A sandbox runs inside the WSL distro, so its nodes get run paths in that form.
+        nodeVisibility: repoContainer ? ('wsl' as const) : ('host' as const),
         resolveChildIsolation,
       };
       if (options.resume && resumable) {
@@ -3672,6 +3799,29 @@ async function runWorkflowWithOwnedSource(
             'workflow.container_destroy_failed'
           );
           containerTeardownError = destroyErr as Error;
+        }
+      }
+      // A repo sandbox stops its stack on every terminal outcome, so the agent and the
+      // repo's services give their memory back, and keeps the worktree, branch, volumes
+      // and row for a resume or `archon isolation cleanup`. A paused run's agent was
+      // already suspended by the engine. A stack that will not stop fails an
+      // otherwise-successful run, as a folder container that will not go does.
+      if (repoContainer && !runPaused) {
+        const { provider, env, envId } = repoContainer;
+        try {
+          await provider.stop(env.workingPath);
+          console.log('Sandbox stack stopped (worktree and branch kept).');
+          getLog().info({ envId, project: env.project }, 'workflow.sandbox_stack_stopped');
+        } catch (stopErr) {
+          console.error(
+            `\nWARNING: failed to stop the sandbox stack ${env.project}: ${(stopErr as Error).message}\n` +
+              `It is still running. Stop it with \`docker compose -p ${env.project} stop\`.`
+          );
+          getLog().error(
+            { err: stopErr as Error, envId, project: env.project },
+            'workflow.sandbox_stack_stop_failed'
+          );
+          containerTeardownError = stopErr as Error;
         }
       }
     }

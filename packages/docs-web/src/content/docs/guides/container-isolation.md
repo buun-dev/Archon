@@ -1,6 +1,6 @@
 ---
 title: Container Isolation
-description: Run folder-project workflows inside an overlay-isolated Docker container with governed, approval-gated write-back to the live root.
+description: Run folder-project workflows inside an overlay-isolated Docker container with governed, approval-gated write-back to the live root, or a repo project's runs inside a per-run WSL2 sandbox.
 category: guides
 area: workflows
 audience: [user]
@@ -11,7 +11,7 @@ sidebar:
 
 [Folder projects](/getting-started/concepts/#folder-projects) — directories with or without git, where Archon applies no git machinery — run **in place** at the live root by default: every write lands immediately. That is honest but ungoverned, and unsafe for unattended automation against real client data. **Container isolation** runs the whole workflow inside a Docker container over a **read-only mount of the project root plus a writable overlay upper layer**, so nothing touches the live folder until you approve it.
 
-This is folder-project-only. Repo projects use [git worktrees](/book/isolation/) and are unaffected.
+The overlay backend is folder-project-only. Repo projects use [git worktrees](/book/isolation/) by default; a repo can instead run each worktree inside a per-run WSL2 sandbox, described in [Repo projects (WSL sandbox)](#repo-projects-wsl-sandbox).
 
 ## How it works
 
@@ -104,6 +104,22 @@ Overlay mount mode is chosen least-privilege-first: `fuse-overlayfs` (only `--de
 Two Archon-owned host directories are bound into the container at their host paths: the run's frozen workflow source, read-only, and `$ARTIFACTS_DIR`, read-write. The artifacts bind is what lets an in-container node leave screenshots, reports, or the `evidence_policy` marker where the engine and the operator read them. It is the only host directory the container can write; its contents are run output and the host never executes them. On a rootful Linux daemon the container's root user owns what it writes there, so Archon hands the directory back to the host user when the container is suspended or destroyed.
 
 Before a named script or other capture-backed read is dispatched, Archon hashes the host capture and compares it with the run's pinned source identity. This refuses a mismatch present at that checkpoint; it does not close the check-to-exec race, contain a same-UID host process, or cancel parallel nodes already running.
+
+## Repo projects (WSL sandbox)
+
+A repo project selects the sandbox with `isolation.provider: container` in its own `.archon/config.yaml`, not with `--container`: `--container` drives the folder backend above and refuses a repo project. Each run then gets its own git worktree inside a WSL2 distro and a Docker Compose stack around it: Archon's agent service, plus whatever services the repo's compose overlay declares. The repo's `isolation.provision` command readies the worktree inside the fresh container. See [configuration](/reference/configuration/#container-isolation-repo-projects) for the repo's `isolation` section and the machine's `isolation.container` section.
+
+It needs a Windows host with WSL2 and Docker Desktop, plus:
+
+- the WSL distro named by `isolation.container.distro` (default `Ubuntu`);
+- a clone of the repo inside that distro, under `isolation.container.repoRoot`, which the sandbox cuts its worktrees from;
+- the runner image named by `isolation.container.image` on the Docker daemon.
+
+A dispatch whose provider is misspelled, or whose machine lacks any of these, is refused before any run, worktree or stack exists, and the error names the setting to correct.
+
+Each run cuts a fresh `sandbox/<slug>` branch from the base branch. `--branch`, `--from` and PR checkouts are refused, and a workflow with a durable wait is refused because a continuation cannot rewire the container. Only providers with the `containerExec` capability run inside it, which today means Claude (see [Provider support](#provider-support)).
+
+A run that completes or fails, or is interrupted with Ctrl-C, **stops** its stack, so the agent and the repo's services give their memory back. The worktree and its branch stay: they are the run's output. A paused run keeps its stack, and the engine stops only the agent while the run waits. `archon isolation cleanup` reclaims the sandboxes of finished runs.
 
 ## macOS / Linux notes
 
