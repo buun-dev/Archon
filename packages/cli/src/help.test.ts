@@ -252,6 +252,7 @@ Commands:
   isolation list             List all active worktrees/environments
   isolation cleanup [days]   Remove stale environments (default: 7 days)
   isolation cleanup --merged Remove environments with branches merged into the base branch
+  isolation reap [days]      Remove stale container environments only (default: 7 days)
   complete <branch> [...]    Complete branch lifecycle (remove worktree + branches)
   serve                      Start the web UI server (binary installs download server and UI on first run)
   skill add [path]           Add archon-cli into .claude/skills and .agents/skills
@@ -400,6 +401,10 @@ Examples:
     const options = scopedHelpOptions(['isolation', 'cleanup']);
     expect(options).toContain('--merged');
     expect(options).toContain('--include-closed');
+  });
+
+  it('renders --json in isolation reap --help', () => {
+    expect(scopedHelpOptions(['isolation', 'reap'])).toContain('--json');
   });
 
   it('renders --reason in workflow reject --help', () => {

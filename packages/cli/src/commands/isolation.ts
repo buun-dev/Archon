@@ -26,6 +26,7 @@ import {
   getCleanupRunLock,
   listContainerEnvironments,
   cleanupContainerEnvironments,
+  type ContainerCleanupReport,
   type RemoveEnvironmentResult,
 } from '@archon/core/services/cleanup-service';
 import {
@@ -211,30 +212,60 @@ export async function isolationCleanupCommand(daysStale = 7): Promise<void> {
     containerReport.errors.length;
   if (containerTotal > 0) {
     console.log('\nContainer environments:');
-    for (const id of containerReport.removed) {
-      console.log(`  Removed: ${id.slice(0, 8)}`);
-    }
-    for (const id of containerReport.reconciled) {
-      console.log(`  Reconciled: ${id.slice(0, 8)} (no stack, no worktree)`);
-    }
-    for (const s of containerReport.skipped) {
-      // A held-work reason says how to release the work. A live-run skip clears
-      // when its run ends, or, for a folder container held by a failed run, only
-      // when that run is resumed or abandoned; an age skip clears with time; a
-      // platform skip is policy (see ContainerSkipKind).
-      const label = s.kind === 'held-work' ? 'Held' : 'Skipped';
-      console.log(`  ${label}: ${s.id.slice(0, 8)} — ${s.reason}`);
-    }
-    for (const e of containerReport.errors) {
-      console.error(`  Failed: ${e.id.slice(0, 8)} — ${e.error}`);
-    }
-    console.log(
-      `Container cleanup: ${String(containerReport.removed.length)} removed, ` +
-        `${String(containerReport.reconciled.length)} reconciled, ` +
-        `${String(containerReport.skipped.length)} skipped, ` +
-        `${String(containerReport.errors.length)} failed`
-    );
+    printContainerReport(containerReport, 'Container cleanup');
   }
+}
+
+/**
+ * Reap container environments only — folder containers and repo sandboxes — under the
+ * same rules as the container half of `isolation cleanup`. It is the verb a scheduled
+ * reaper runs: `--json` prints one document, `{ daysStale, removed, reconciled,
+ * skipped: [{ id, kind, reason }], errors: [{ id, error }] }`, and nothing else on stdout.
+ */
+export async function isolationReapCommand(
+  daysStale = 7,
+  options: { json?: boolean } = {}
+): Promise<void> {
+  const report = await cleanupContainerEnvironments(daysStale);
+  if (options.json) {
+    console.log(JSON.stringify({ daysStale, ...report }, null, 2));
+    return;
+  }
+  printContainerReport(report, 'Container reap');
+}
+
+/** The `isolation reap` threshold: 7 when omitted; undefined when not a non-negative number. */
+export function parseReapDays(raw: string | undefined): number | undefined {
+  if (raw === undefined) return 7;
+  const days = Number(raw);
+  return Number.isNaN(days) || days < 0 ? undefined : days;
+}
+
+/** One line per container row the pass touched, then the counts under `summary`. */
+function printContainerReport(report: ContainerCleanupReport, summary: string): void {
+  for (const id of report.removed) {
+    console.log(`  Removed: ${id.slice(0, 8)}`);
+  }
+  for (const id of report.reconciled) {
+    console.log(`  Reconciled: ${id.slice(0, 8)} (no stack, no worktree)`);
+  }
+  for (const s of report.skipped) {
+    // A held-work reason says how to release the work. A live-run skip clears
+    // when its run ends, or, for a folder container held by a failed run, only
+    // when that run is resumed or abandoned; an age skip clears with time; a
+    // platform skip is policy (see ContainerSkipKind).
+    const label = s.kind === 'held-work' ? 'Held' : 'Skipped';
+    console.log(`  ${label}: ${s.id.slice(0, 8)} — ${s.reason}`);
+  }
+  for (const e of report.errors) {
+    console.error(`  Failed: ${e.id.slice(0, 8)} — ${e.error}`);
+  }
+  console.log(
+    `${summary}: ${String(report.removed.length)} removed, ` +
+      `${String(report.reconciled.length)} reconciled, ` +
+      `${String(report.skipped.length)} skipped, ` +
+      `${String(report.errors.length)} failed`
+  );
 }
 
 /**

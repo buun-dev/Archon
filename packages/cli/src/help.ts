@@ -355,6 +355,15 @@ const commandHelp: HelpEntry[] = [
     ],
   },
   {
+    command: 'isolation',
+    subcommand: 'reap',
+    spec: 'isolation reap [days]',
+    description: 'Remove stale container environments only (default: 7 days)',
+    scopedFlags: [
+      { spec: '--json', description: 'Print the report as one JSON document, for schedulers' },
+    ],
+  },
+  {
     command: 'complete',
     spec: 'complete <branch> [...]',
     description: 'Complete branch lifecycle (remove worktree + branches)',

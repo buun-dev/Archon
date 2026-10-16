@@ -1143,6 +1143,16 @@ describe('CLI argument parsing', () => {
     });
   });
 
+  // The operator's scheduled reaper runs exactly this argv.
+  describe('isolation reap flags', () => {
+    it('parses a scheduler reap with --json and --quiet in strict mode', () => {
+      const { values, positionals } = parseCliArgs(['isolation', 'reap', '7', '--json', '--quiet']);
+      expect(positionals).toEqual(['isolation', 'reap', '7']);
+      expect(values.json).toBe(true);
+      expect(values.quiet).toBe(true);
+    });
+  });
+
   describe('--cwd flag', () => {
     it('should parse --cwd with path', () => {
       const result = parseCliArgs(['--cwd', '/custom/path', 'workflow', 'list']);

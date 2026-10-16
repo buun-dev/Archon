@@ -14,6 +14,8 @@ import {
   isolationCompleteCommand,
   isolationCleanupCommand,
   isolationCleanupMergedCommand,
+  isolationReapCommand,
+  parseReapDays,
 } from './isolation';
 
 const mockLogger = {
@@ -1094,5 +1096,112 @@ describe('isolationCleanupCommand', () => {
 
     expect(mockDestroyWorktree).not.toHaveBeenCalled();
     expect(consoleErrorSpy.mock.calls.flat().join(' ')).toContain('rev-list failed');
+  });
+});
+
+/**
+ * `isolation reap` is the scheduler's verb: the container half of `isolation cleanup`,
+ * with a JSON report a job parses (the operator's reaper reads `removed`, `reconciled`,
+ * `skipped[{id,kind,reason}]` and `errors[{id,error}]`).
+ */
+describe('isolationReapCommand', () => {
+  let consoleLogSpy: ReturnType<typeof spyOn>;
+  let consoleErrorSpy: ReturnType<typeof spyOn>;
+  const REPORT: CleanupService.ContainerCleanupReport = {
+    removed: ['aa271d53-0000'],
+    reconciled: ['35c7d928-0000'],
+    skipped: [
+      {
+        id: 'e1e1e1e1-0000',
+        kind: 'held-work',
+        reason:
+          'unpushed commits in sandbox worktree /home/u/archon/worktrees/repo/task-x: push or ' +
+          'discard that work there, then re-run `archon isolation cleanup`',
+      },
+      { id: 'f0f0f0f0-0000', kind: 'age', reason: '2d old (< 7d threshold)' },
+    ],
+    errors: [{ id: 'e2e2e2e2-0000', error: 'inspect failed (NOT reaped): distro unreachable' }],
+  };
+
+  beforeEach(() => {
+    consoleLogSpy = spyOn(console, 'log').mockImplementation(() => {});
+    consoleErrorSpy = spyOn(console, 'error').mockImplementation(() => {});
+    mockCleanupContainerEnvironments.mockClear();
+    mockFindStaleEnvironments.mockClear();
+    mockDestroyWorktree.mockClear();
+  });
+
+  afterEach(() => {
+    consoleLogSpy.mockRestore();
+    consoleErrorSpy.mockRestore();
+  });
+
+  it('--json prints exactly one document: the threshold and the container report', async () => {
+    mockCleanupContainerEnvironments.mockResolvedValueOnce(REPORT);
+
+    await isolationReapCommand(3, { json: true });
+
+    expect(mockCleanupContainerEnvironments).toHaveBeenCalledWith(3);
+    expect(consoleLogSpy).toHaveBeenCalledTimes(1);
+    expect(consoleErrorSpy).not.toHaveBeenCalled();
+    const printed = String(consoleLogSpy.mock.calls[0]?.[0]);
+    expect(printed).toBe(JSON.stringify({ daysStale: 3, ...REPORT }, null, 2));
+    expect(JSON.parse(printed)).toEqual({
+      daysStale: 3,
+      removed: ['aa271d53-0000'],
+      reconciled: ['35c7d928-0000'],
+      skipped: REPORT.skipped,
+      errors: [{ id: 'e2e2e2e2-0000', error: 'inspect failed (NOT reaped): distro unreachable' }],
+    });
+  });
+
+  it('reaps container rows only: no worktree sweep runs', async () => {
+    await isolationReapCommand(undefined, { json: true });
+
+    expect(mockCleanupContainerEnvironments).toHaveBeenCalledWith(7);
+    expect(mockFindStaleEnvironments).not.toHaveBeenCalled();
+    expect(mockDestroyWorktree).not.toHaveBeenCalled();
+  });
+
+  it('without --json prints each row and the counts, as cleanup does', async () => {
+    mockCleanupContainerEnvironments.mockResolvedValueOnce(REPORT);
+
+    await isolationReapCommand(7);
+
+    expect(consoleLogSpy).toHaveBeenCalledWith('  Removed: aa271d53');
+    expect(consoleLogSpy).toHaveBeenCalledWith('  Reconciled: 35c7d928 (no stack, no worktree)');
+    expect(consoleLogSpy).toHaveBeenCalledWith(
+      '  Held: e1e1e1e1 — unpushed commits in sandbox worktree /home/u/archon/worktrees/repo/task-x: ' +
+        'push or discard that work there, then re-run `archon isolation cleanup`'
+    );
+    expect(consoleLogSpy).toHaveBeenCalledWith('  Skipped: f0f0f0f0 — 2d old (< 7d threshold)');
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
+      '  Failed: e2e2e2e2 — inspect failed (NOT reaped): distro unreachable'
+    );
+    expect(consoleLogSpy).toHaveBeenCalledWith(
+      'Container reap: 1 removed, 1 reconciled, 2 skipped, 1 failed'
+    );
+  });
+
+  it('without --json an empty pass still prints its counts', async () => {
+    await isolationReapCommand(7);
+
+    expect(consoleLogSpy).toHaveBeenCalledWith(
+      'Container reap: 0 removed, 0 reconciled, 0 skipped, 0 failed'
+    );
+  });
+});
+
+describe('parseReapDays', () => {
+  it('defaults to 7 and accepts any non-negative number', () => {
+    expect(parseReapDays(undefined)).toBe(7);
+    expect(parseReapDays('0')).toBe(0);
+    expect(parseReapDays('14')).toBe(14);
+    expect(parseReapDays('0.5')).toBe(0.5);
+  });
+
+  it('refuses a negative or non-numeric threshold', () => {
+    expect(parseReapDays('-1')).toBeUndefined();
+    expect(parseReapDays('soon')).toBeUndefined();
   });
 });

@@ -1529,6 +1529,35 @@ The output names each failed run whose environment it removed, with the reason:
 it afterwards fails with `the working path from the run no longer exists`; start a
 fresh run. To discard a failed run sooner, use `workflow abandon`.
 
+### `isolation reap [days]`
+
+Remove stale container environments only: the container half of
+[`isolation cleanup`](#isolation-cleanup-days), with the same rules for folder containers
+and repo sandboxes (live runs, held work, reconciled ghosts, age). It never touches
+worktree environments. `days` is any non-negative number (default: 7).
+
+```bash
+archon isolation reap
+archon isolation reap 7 --json --quiet
+```
+
+It is the verb for a scheduled reaper. With `--json` it prints one JSON document and
+nothing else on stdout:
+
+```json
+{
+  "daysStale": 7,
+  "removed": ["<env-id>"],
+  "reconciled": ["<env-id>"],
+  "skipped": [{ "id": "<env-id>", "kind": "held-work", "reason": "<why, and how to release it>" }],
+  "errors": [{ "id": "<env-id>", "error": "<what failed>" }]
+}
+```
+
+`kind` is `held-work`, `live-run`, `age`, or `platform`. Without `--json` it prints a line
+per environment and a `Container reap: <n> removed, <n> reconciled, <n> skipped, <n> failed`
+summary. A failed environment does not change the exit code; read `errors`.
+
 ### `validate workflows [name]`
 
 Validate workflow YAML definitions and their referenced resources (command files, MCP configs, skill directories).

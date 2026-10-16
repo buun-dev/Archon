@@ -1322,12 +1322,30 @@ async function main(): Promise<number> {
       }
 
       case 'isolation': {
-        const { isolationListCommand, isolationCleanupCommand, isolationCleanupMergedCommand } =
-          await loadRoute(() => import('./commands/isolation'), { database: true });
+        const {
+          isolationListCommand,
+          isolationCleanupCommand,
+          isolationCleanupMergedCommand,
+          isolationReapCommand,
+          parseReapDays,
+        } = await loadRoute(() => import('./commands/isolation'), { database: true });
         switch (subcommand) {
           case 'list':
             await isolationListCommand();
             break;
+
+          case 'reap': {
+            const days = parseReapDays(positionals[2]);
+            if (days === undefined) {
+              return await fail(
+                jsonFlag,
+                'Usage: archon isolation reap [days] [--json]\n' +
+                  '  days: reap container environments older than N days (default: 7)'
+              );
+            }
+            await isolationReapCommand(days, { json: jsonFlag });
+            break;
+          }
 
           case 'cleanup': {
             if (values.merged) {
@@ -1346,7 +1364,7 @@ async function main(): Promise<number> {
               subcommand === undefined
                 ? 'Missing isolation subcommand'
                 : `Unknown isolation subcommand: ${subcommand}`;
-            return await fail(jsonFlag, `${problem}\nAvailable: list, cleanup`);
+            return await fail(jsonFlag, `${problem}\nAvailable: list, cleanup, reap`);
           }
         }
         break;
