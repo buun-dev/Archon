@@ -250,7 +250,7 @@ export class SandboxLifecycle {
     await this.provision(spec);
 
     say('firewall: default-deny egress');
-    await this.firewall(spec);
+    await this.applyFirewall(spec.project);
     log.info({ project: spec.project, worktree: spec.worktree }, 'sandbox.up');
   }
 
@@ -435,21 +435,35 @@ export class SandboxLifecycle {
     );
   }
 
-  /** After provisioning, as root (NET_ADMIN). Fail-closed: a failure fails `up`. */
-  private async firewall(spec: SandboxUpSpec): Promise<void> {
-    await this.exec(
-      spec,
-      'firewall',
-      [
-        '--user',
-        'root',
-        'agent',
-        'bash',
-        '-lc',
-        'bash /usr/local/bin/init-firewall.sh /etc/archon/allowlist.txt',
-      ],
-      FIREWALL_TIMEOUT_MS
-    );
+  /**
+   * Default-deny egress in the running agent, as root (NET_ADMIN). `up` runs it after
+   * provisioning; a resume runs it after every `compose start`, because a stop/start
+   * gives the agent a fresh network namespace with no iptables or ipset rules. The
+   * script is idempotent and keeps the resolver the container started with in
+   * `/etc/archon-dns-upstream`, so a re-run does not forward its dnsmasq to itself.
+   * Fail-closed: any failure throws, and the caller must not hand the agent work.
+   */
+  async applyFirewall(project: string): Promise<void> {
+    try {
+      await this.deps.docker(
+        [
+          'compose',
+          '-p',
+          project,
+          'exec',
+          '-T',
+          '--user',
+          'root',
+          'agent',
+          'bash',
+          '-lc',
+          'bash /usr/local/bin/init-firewall.sh /etc/archon/allowlist.txt',
+        ],
+        { timeoutMs: FIREWALL_TIMEOUT_MS, onLine: this.deps.onLine }
+      );
+    } catch (err) {
+      throw new Error(`Sandbox firewall failed for ${project}: ${lastLine(err)}`, { cause: err });
+    }
   }
 
   private async run(

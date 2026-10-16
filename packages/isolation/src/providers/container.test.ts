@@ -493,6 +493,82 @@ describe('ContainerProvider.reattach (resume)', () => {
     // reattach must NOT re-run the lifecycle (no re-provision on resume).
     expect(runners.calls.wsl).toHaveLength(0);
   });
+
+  // A stop/start recreates the agent's network namespace, so the rules `up` applied
+  // are gone; the resumed run must not get open egress.
+  test('re-applies the firewall after the stack is started, before handing back the context', async () => {
+    const runners = makeRunners('cid-resumed');
+    const provider = new ContainerProvider({ ...runners, loadConfig: async () => null });
+
+    await provider.reattach('/home/bunny/archon/worktrees/marphob-page/task-x');
+
+    const verbs = runners.calls.docker.map(a =>
+      a.join(' ').includes('init-firewall.sh /etc/archon/allowlist.txt') ? 'firewall' : a[3]
+    );
+    expect(verbs).toEqual(['start', 'ps', 'firewall']);
+    const firewall = runners.calls.docker[2];
+    expect(firewall.slice(0, 8)).toEqual([
+      'compose',
+      '-p',
+      'archon-marphob-page-task-x',
+      'exec',
+      '-T',
+      '--user',
+      'root',
+      'agent',
+    ]);
+  });
+
+  test('a firewall failure throws, so nothing resumes unfirewalled, and the stack is stopped again', async () => {
+    const runners = makeRunners();
+    const docker = async (args: string[]): Promise<{ stdout: string; stderr: string }> => {
+      runners.calls.docker.push(args);
+      if (args.includes('--user')) {
+        const err = new Error('Command failed') as Error & { stderr?: string };
+        err.stderr = 'FATAL: cannot resolve github.com';
+        throw err;
+      }
+      if (args.includes('ps')) return { stdout: 'cid\n', stderr: '' };
+      return { stdout: '', stderr: '' };
+    };
+    const provider = new ContainerProvider({ ...runners, docker, loadConfig: async () => null });
+
+    await expect(
+      provider.reattach('/home/bunny/archon/worktrees/marphob-page/task-x')
+    ).rejects.toThrow(/firewall.*cannot resolve github\.com/s);
+    // The open-egress stack does not stay up waiting for a run that will not come.
+    expect(runners.calls.docker.at(-1)).toEqual([
+      'compose',
+      '-p',
+      'archon-marphob-page-task-x',
+      'stop',
+    ]);
+  });
+
+  test('a `compose start` failure is surfaced, not swallowed, and nothing after it runs', async () => {
+    const runners = makeRunners();
+    const docker = async (args: string[]): Promise<{ stdout: string; stderr: string }> => {
+      runners.calls.docker.push(args);
+      if (args.includes('start')) {
+        const err = new Error('Command failed') as Error & { stderr?: string };
+        err.stderr = 'Error response from daemon: network archon_default not found';
+        throw err;
+      }
+      if (args.includes('ps')) return { stdout: 'cid\n', stderr: '' };
+      return { stdout: '', stderr: '' };
+    };
+    const provider = new ContainerProvider({ ...runners, docker, loadConfig: async () => null });
+
+    const error = await provider.reattach('/home/bunny/archon/worktrees/marphob-page/task-x').then(
+      () => undefined,
+      (e: unknown) => e as Error
+    );
+
+    expect(error?.message).toContain('archon-marphob-page-task-x');
+    expect(error?.message).toContain('network archon_default not found');
+    expect((error?.cause as Error | undefined)?.message).toBe('Command failed');
+    expect(runners.calls.docker).toHaveLength(1);
+  });
 });
 
 describe('ContainerProvider.stop (terminal run)', () => {

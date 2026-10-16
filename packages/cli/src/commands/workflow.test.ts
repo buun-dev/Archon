@@ -9464,6 +9464,88 @@ describe('workflowResumeCommand — repo container run', () => {
     expect(provider.create).not.toHaveBeenCalled();
   });
 
+  // The engine suspended the agent at the gate. The answer's inline continuation is a
+  // resume like any other, so it must reattach (which starts the stack and re-applies
+  // the firewall) rather than run without a container context.
+  for (const action of ['approve', 'reject'] as const) {
+    it(`${action} of a paused container run continues it through reattach`, async () => {
+      const { executeWorkflow } = await import('@archon/workflows/executor');
+      const workflowDb = await import('@archon/core/db/workflows');
+      const pausedRun = {
+        ...sandboxRun,
+        status: 'paused',
+        metadata: {
+          ...sandboxRun.metadata,
+          approval: {
+            type: 'approval',
+            nodeId: 'gate',
+            message: 'Approve?',
+            ...(action === 'reject' ? { onRejectPrompt: 'Fix: $REJECTION_REASON' } : {}),
+          },
+        },
+      };
+      const lookup = workflowDb.getWorkflowRun as ReturnType<typeof mock>;
+      lookup.mockImplementation(async (id: string) =>
+        id === SANDBOX.runId ? { ...pausedRun } : null
+      );
+      mockDiscoverWorkflowsWithConfig.mockResolvedValue({
+        workflows: [makeTestWorkflowWithSource({ name: 'assist', description: 'Help' })],
+        errors: [],
+      });
+      const provider = makeRepoContainerProvider();
+      provider.reattach.mockImplementation(async () => reattachedSandbox());
+      mockSelectIsolationProvider.mockReturnValueOnce(provider);
+      await arrangeEngineResume();
+
+      try {
+        if (action === 'approve') {
+          await workflowApproveCommand(createTestWorkflowHost(), SANDBOX.runId, 'lgtm');
+        } else {
+          await workflowRejectCommand(createTestWorkflowHost(), SANDBOX.runId, 'needs work');
+        }
+      } finally {
+        lookup.mockImplementation(async () => null);
+        mockDiscoverWorkflowsWithConfig.mockReset();
+        mockDiscoverWorkflowsWithConfig.mockResolvedValue({ workflows: [], errors: [] });
+      }
+
+      expect(provider.reattach).toHaveBeenCalledWith(SANDBOX.workingPath);
+      expect(provider.create).not.toHaveBeenCalled();
+      const opts = (executeWorkflow as ReturnType<typeof mock>).mock.calls.at(-1)?.[7] as {
+        execContext?: unknown;
+      };
+      expect(opts.execContext).toEqual({
+        kind: 'container',
+        containerId: SANDBOX.containerId,
+        execUser: '1000',
+      });
+    });
+  }
+
+  // The engine suspends the agent when a run pauses at a gate; the resume's own end
+  // must leave that stack alone so the next answer can reattach to it.
+  it('a resume that pauses again keeps its stack: the run end stops nothing', async () => {
+    const { executeWorkflow, hydrateResumableRun } = await import('@archon/workflows/executor');
+    const provider = makeRepoContainerProvider();
+    provider.reattach.mockImplementation(async () => reattachedSandbox());
+    await arrangeSandboxResume(provider);
+    (hydrateResumableRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      preCreatedRun: { ...sandboxRun },
+      priorCompletedNodes: new Map([['node-a', 'done']]),
+    });
+    (executeWorkflow as ReturnType<typeof mock>).mockResolvedValueOnce({
+      success: true,
+      paused: true,
+      workflowRunId: SANDBOX.runId,
+    });
+
+    await workflowResumeCommand(createTestWorkflowHost(), SANDBOX.runId);
+
+    expect(provider.reattach).toHaveBeenCalledWith(SANDBOX.workingPath);
+    expect(provider.stop).not.toHaveBeenCalled();
+    expect(provider.destroy).not.toHaveBeenCalled();
+  });
+
   it('resume of a container run whose stack is gone fails with the reattach error and leaves the run resumable', async () => {
     const { executeWorkflow, hydrateResumableRun } = await import('@archon/workflows/executor');
     const workflowDb = await import('@archon/core/db/workflows');

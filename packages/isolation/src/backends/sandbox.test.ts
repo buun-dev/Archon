@@ -238,6 +238,36 @@ describe('SandboxLifecycle.up', () => {
   });
 });
 
+// A stop/start of the stack gives the agent a fresh network namespace with no
+// iptables or ipset rules, so a resume re-applies the firewall through here.
+describe('SandboxLifecycle.applyFirewall', () => {
+  test('runs the same root invocation `up` runs, against the named project', async () => {
+    const fresh = makeRunners();
+    await new SandboxLifecycle(fresh).up(SPEC);
+    const upFirewall = fresh.calls.docker.find(a => a.includes('--user'));
+
+    const again = makeRunners();
+    await new SandboxLifecycle(again).applyFirewall(SPEC.project);
+
+    expect(again.calls.docker).toEqual([upFirewall!]);
+    expect(again.calls.wsl).toHaveLength(0);
+  });
+
+  test('a failing firewall throws, naming the step and the project (fail closed)', async () => {
+    const { wsl, onLine } = makeRunners();
+    const docker: SandboxDockerRunner = async () => {
+      const err = new Error('Command failed') as Error & { stderr?: string };
+      err.stderr = 'FATAL: cannot resolve github.com';
+      throw err;
+    };
+    const lifecycle = new SandboxLifecycle({ wsl, docker, onLine });
+
+    await expect(lifecycle.applyFirewall(SPEC.project)).rejects.toThrow(
+      /firewall.*archon-bunshee-task-x.*cannot resolve github\.com/s
+    );
+  });
+});
+
 describe('SandboxLifecycle.down', () => {
   test('composes the stack down with its volumes, then removes the worktree and its branch in the distro', async () => {
     const { calls, wsl, docker, onLine } = makeRunners();

@@ -49,7 +49,7 @@ import type {
   WriteBackFinalizeResult,
 } from '@archon/workflows/container-context';
 
-import { dockerPreflight } from '../container/docker-exec';
+import { dockerPreflight, extractDockerError } from '../container/docker-exec';
 import {
   SANDBOX_HOST_DEFAULTS,
   SandboxLifecycle,
@@ -485,15 +485,32 @@ export class ContainerProvider implements IContainerIsolationProvider {
 
   /**
    * Reattach to an existing sandbox on RESUME. The container may be
-   * STOPPED after a kill or a docker restart — resolveContainerId `start`s the
-   * agent before resolving — so this rebuilds the container execContext from the
-   * working path WITHOUT re-running the lifecycle (no re-provision). Throws if
-   * the stack is gone (torn down); a resume then cannot continue in-container.
+   * STOPPED after a pause, a terminal run, a kill or a docker restart —
+   * resolveContainerId `start`s the stack before resolving — so this rebuilds the
+   * container execContext from the working path WITHOUT re-running the lifecycle
+   * (no re-provision). A start gives the agent a fresh network namespace, so the
+   * firewall is applied again before the context is handed back; if it fails, the
+   * stack is stopped again (best-effort) and the reattach throws, so no resume runs
+   * with open egress. Throws if the stack is gone (torn down); a resume then cannot
+   * continue in-container.
    */
   async reattach(workingPath: string): Promise<ContainerEnvironment> {
     const { repo, slug } = repoSlugFromWorkingPath(workingPath);
     const project = composeProjectFor(repo, slug);
     const containerId = await this.resolveContainerId(project);
+    try {
+      await this.lifecycle.applyFirewall(project);
+    } catch (firewallErr) {
+      await this.docker(['compose', '-p', project, 'stop'], {
+        timeout: COMPOSE_STOP_TIMEOUT_MS,
+      }).catch((stopErr: unknown) => {
+        log.warn(
+          { project, err: stopErr instanceof Error ? stopErr.message : String(stopErr) },
+          'container.reattach.stop_after_firewall_failure_failed'
+        );
+      });
+      throw firewallErr;
+    }
     return this.buildEnv(slug, workingPath, project, containerId);
   }
 
@@ -674,14 +691,22 @@ export class ContainerProvider implements IContainerIsolationProvider {
    * Resolve the compose `agent` service to a concrete container id. `start`
    * first — every service, since a terminal run's `stop` stops the repo's
    * services as well as the agent — so a resume after a stop or a docker restart
-   * re-runs what is stopped; harmless on a fresh `up`. Fails loud when nothing
-   * resolves — a silent '' would build a broken execContext that only surfaces at
-   * the first node exec.
+   * re-runs what is stopped; harmless on a fresh `up`. A start that fails fails
+   * here, carrying docker's own error: a stack that would not start cannot host the
+   * run. Fails loud when nothing resolves — a silent '' would build a broken
+   * execContext that only surfaces at the first node exec.
    */
   private async resolveContainerId(project: string): Promise<string> {
-    await this.docker(['compose', '-p', project, 'start'], {
-      timeout: DOCKER_QUERY_TIMEOUT_MS,
-    }).catch(() => undefined);
+    try {
+      await this.docker(['compose', '-p', project, 'start'], {
+        timeout: DOCKER_QUERY_TIMEOUT_MS,
+      });
+    } catch (err) {
+      throw new Error(
+        `Could not start the sandbox stack '${project}': ${extractDockerError(err)}`,
+        { cause: err }
+      );
+    }
     const { stdout } = await this.docker(['compose', '-p', project, 'ps', '-q', 'agent'], {
       timeout: DOCKER_QUERY_TIMEOUT_MS,
     });
