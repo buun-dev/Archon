@@ -2,6 +2,8 @@ import {
   classifyIsolationError,
   getIsolationProvider,
   worktreeRegistrationMetadata,
+  type ContainerEnvironment,
+  type IContainerIsolationProvider,
   type IIsolationStore,
   type TaskIsolationRequest,
   type WorktreeCreationEnvironment,
@@ -66,4 +68,55 @@ export async function createRegisteredWorktree(
     ...(created ? { ownedWorktree: { envId: record.id, creationId: created.creationId } } : {}),
     ...(created?.cutFromCommit !== undefined ? { cutFromCommit: created.cutFromCommit } : {}),
   };
+}
+
+export interface RegisteredContainerEnvInput {
+  request: TaskIsolationRequest;
+  /** The per-dispatch provider `selectIsolationProvider` built for this repo. */
+  provider: IContainerIsolationProvider;
+  /** The record's `workflow_id`; defaults to the request identifier. */
+  workflowId?: string;
+  createdByPlatform: string;
+  createdByUserId?: string;
+  /** Caller-owned record metadata; the sandbox keys always win. */
+  metadata?: Record<string, unknown>;
+}
+
+/**
+ * Create a repo-kind container sandbox and register its isolation record, the container
+ * sibling of {@link createRegisteredWorktree}. The row's `provider: 'container'` is what
+ * upstream's active-container predicate lists, what blocks codebase deletion, and what
+ * routes abandon and cancel to the container reclaim.
+ *
+ * The row carries the compose project, which re-addresses the stack, and the base the
+ * sandbox was cut from, so a resume reads a fixed base rather than a config value that
+ * may have moved. It gets no worktree registration id: the store mints one for worktree
+ * rows only.
+ *
+ * A provider failure is rethrown with the classified message; the original error stays
+ * on `cause`. The provider refuses a request it cannot honor before provisioning.
+ */
+export async function createRegisteredContainerEnv(
+  isolation: Pick<IIsolationStore, 'create'>,
+  input: RegisteredContainerEnvInput
+): Promise<{ env: ContainerEnvironment; envId: string }> {
+  let env: ContainerEnvironment;
+  try {
+    env = await input.provider.create(input.request);
+  } catch (err) {
+    const error = err instanceof Error ? err : new Error(String(err));
+    throw new Error(classifyIsolationError(error), { cause: error });
+  }
+  const record = await isolation.create({
+    codebase_id: input.request.codebaseId,
+    workflow_type: 'task',
+    workflow_id: input.workflowId ?? input.request.identifier,
+    provider: 'container',
+    working_path: env.workingPath,
+    branch_name: env.branchName,
+    created_by_platform: input.createdByPlatform,
+    ...(input.createdByUserId ? { created_by_user_id: input.createdByUserId } : {}),
+    metadata: { ...input.metadata, container_project: env.project, base_branch: env.baseBranch },
+  });
+  return { env, envId: record.id };
 }
