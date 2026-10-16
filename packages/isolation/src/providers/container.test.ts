@@ -1,9 +1,34 @@
-import { describe, test, expect } from 'bun:test';
-import { ContainerProvider, SANDBOX_COMPOSE_FILE } from './container';
+import { describe, test, expect, beforeEach, mock } from 'bun:test';
 import type { IsolationRequest } from '../types';
 import { toBranchName } from '@archon/git';
-import { getProjectRoot, toNodeVisiblePath } from '@archon/paths';
 import type { WslRunner } from '../backends/sandbox';
+
+const mockWarn = mock<(...args: unknown[]) => void>(() => undefined);
+
+// Silence the provider's and the lifecycle's loggers, keeping every other
+// @archon/paths export real (the provider resolves real project and script paths).
+const realPaths = { ...(await import('@archon/paths')) };
+const { getProjectRoot, toNodeVisiblePath } = realPaths;
+mock.module('@archon/paths', () => ({
+  ...realPaths,
+  createLogger: () => ({
+    fatal: () => undefined,
+    error: () => undefined,
+    warn: mockWarn,
+    info: () => undefined,
+    debug: () => undefined,
+    trace: () => undefined,
+    child: () => undefined,
+  }),
+}));
+
+// Loaded after the mock: container.ts and backends/sandbox.ts create their loggers
+// when the module is evaluated.
+const { ContainerProvider, SANDBOX_COMPOSE_FILE } = await import('./container');
+
+beforeEach(() => {
+  mockWarn.mockClear();
+});
 
 /**
  * Fake runners so create() is unit-testable without a real WSL distro / docker
@@ -174,6 +199,52 @@ describe('ContainerProvider.create', () => {
       } as IsolationRequest)
     ).rejects.toThrow(/pr|pull request/i);
   });
+
+  test('refuses a request that names an existing task branch', async () => {
+    const runners = makeRunners();
+    let probes = 0;
+    const provider = new ContainerProvider({
+      ...runners,
+      probeWsl: async () => {
+        probes += 1;
+        return {
+          stdout: 'ARCHON_WSL_OK\nARCHON_WSL_HOME=/home/u\nARCHON_BASE_CLONE_OK\n',
+          stderr: '',
+        };
+      },
+      loadConfig: async () => null,
+    });
+
+    const p = provider.create({
+      ...BASE_REQ,
+      workflowType: 'task',
+      identifier: 't',
+      taskBranch: { kind: 'existing', branch: toBranchName('feature-x') },
+    } as IsolationRequest);
+
+    await expect(p).rejects.toThrow(/cannot check out an existing or named branch \('feature-x'\)/);
+    await expect(p).rejects.toThrow(/fresh `sandbox\/<slug>` branch from the base/);
+    await expect(p).rejects.toThrow(/isolation\.provider/);
+    expect(probes).toBe(0);
+    expect(runners.calls.wsl).toHaveLength(0);
+    expect(runners.calls.docker).toHaveLength(0);
+  });
+
+  test('refuses a request that names the new task branch', async () => {
+    const runners = makeRunners();
+    const provider = new ContainerProvider({ ...runners, loadConfig: async () => null });
+
+    await expect(
+      provider.create({
+        ...BASE_REQ,
+        workflowType: 'task',
+        identifier: 't',
+        taskBranch: { kind: 'new', branch: toBranchName('feature/named') },
+      } as IsolationRequest)
+    ).rejects.toThrow(/existing or named branch \('feature\/named'\)/);
+    expect(runners.calls.wsl).toHaveLength(0);
+    expect(runners.calls.docker).toHaveLength(0);
+  });
 });
 
 /**
@@ -299,7 +370,7 @@ describe('ContainerProvider.writeBackBackend (engine port)', () => {
     const provider = new ContainerProvider({ ...runners, loadConfig: async () => null });
 
     const port = provider.writeBackBackend('/home/bunny/archon/worktrees/marphob-page/task-x');
-    // The engine passes an `isolation_environments` row id here, never a path (D5).
+    // The engine passes an `isolation_environments` row id here, never a path.
     await port.suspend('env-row-01H8XYZ');
 
     const stop = runners.calls.docker.find(a => a.includes('stop'));
@@ -322,7 +393,7 @@ describe('ContainerProvider.writeBackBackend (engine port)', () => {
   });
 });
 
-describe('ContainerProvider.reattach (resume / D8 recovery)', () => {
+describe('ContainerProvider.reattach (resume)', () => {
   test('restarts the agent then rebuilds the execContext from a working path', async () => {
     const runners = makeRunners('cid-resumed');
     const provider = new ContainerProvider({ ...runners, loadConfig: async () => null });
@@ -331,7 +402,7 @@ describe('ContainerProvider.reattach (resume / D8 recovery)', () => {
 
     // The stack may be stopped after a kill, a docker restart, or a terminal
     // run's `compose stop` (which stops db as well as agent), so `start` runs
-    // over EVERY service BEFORE the id is resolved (D8).
+    // over EVERY service BEFORE the id is resolved.
     const started = runners.calls.docker.find(a => a.includes('start'));
     expect(started).toEqual(['compose', '-p', 'archon-marphob-page-task-x', 'start']);
 
@@ -486,8 +557,10 @@ describe('ContainerProvider.destroy', () => {
     const runners = makeRunners();
     const provider = new ContainerProvider({ ...runners, loadConfig: async () => null });
 
-    await provider.destroy('/home/u/archon/worktrees/marphob-page/task-x');
+    const result = await provider.destroy('/home/u/archon/worktrees/marphob-page/task-x');
 
+    expect(result.worktreeRemoved).toBe(true);
+    expect(result.warnings).toEqual([]);
     expect(runners.calls.docker).toContainEqual([
       'compose',
       '-p',
@@ -502,7 +575,7 @@ describe('ContainerProvider.destroy', () => {
     expect(script).toContain('branch -D sandbox/task-x');
   });
 
-  test('an unreachable distro is swallowed — the run is already over', async () => {
+  test('an unreachable distro is logged and reported as not torn down, never thrown', async () => {
     const runners = makeRunners();
     const provider = new ContainerProvider({
       ...runners,
@@ -513,7 +586,23 @@ describe('ContainerProvider.destroy', () => {
     });
 
     const result = await provider.destroy('/home/u/archon/worktrees/marphob-page/task-x');
-    expect(result.worktreeRemoved).toBe(true);
+
+    expect(result).toEqual({
+      worktreeRemoved: false,
+      branchDeleted: null,
+      remoteBranchDeleted: null,
+      directoryClean: false,
+      warnings: [
+        'WSL distro unreachable: no distro; the sandbox stack and worktree were not torn down',
+      ],
+    });
+    expect(mockWarn).toHaveBeenCalledWith(
+      { workingPath: '/home/u/archon/worktrees/marphob-page/task-x', err: 'no distro' },
+      'container.destroy.host_unreachable'
+    );
+    // Nothing was attempted: no compose down, no worktree removal.
+    expect(runners.calls.docker).toHaveLength(0);
+    expect(runners.calls.wsl).toHaveLength(0);
   });
 });
 

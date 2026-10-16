@@ -368,7 +368,8 @@ export class ContainerProvider implements IContainerIsolationProvider {
 
   async create(request: IsolationRequest): Promise<ContainerEnvironment> {
     // Reject before provisioning: the sandbox cuts only from the base branch, so an
-    // explicit --from or a PR checkout would go green against the WRONG tree.
+    // explicit --from, a named or existing branch, or a PR checkout would go green
+    // against the WRONG tree.
     this.assertSupported(request);
     const repo = basename(request.canonicalRepoPath);
     // Then the repo's own declaration, which costs a config read and no subprocess.
@@ -416,7 +417,7 @@ export class ContainerProvider implements IContainerIsolationProvider {
   }
 
   /**
-   * Reattach to an existing sandbox on RESUME (D8 recovery). The container may be
+   * Reattach to an existing sandbox on RESUME. The container may be
    * STOPPED after a kill or a docker restart — resolveContainerId `start`s the
    * agent before resolving — so this rebuilds the container execContext from the
    * working path WITHOUT re-running the lifecycle (no re-provision). Throws if
@@ -434,7 +435,7 @@ export class ContainerProvider implements IContainerIsolationProvider {
    * The executor's resume guard requires a `container` context for any
    * run stamped `isolation: 'container'`; this is the repo-kind implementation.
    * The working path is bound here at construction; the `envId` each closure
-   * receives is the engine's `isolation_environments` row id (D5) and is unused
+   * receives is the engine's `isolation_environments` row id and is unused
    * — the compose stack is addressed by the bound path, not by that id. A
    * repo-kind sandbox writes straight to its git worktree branch — there is no
    * overlay diff to gate — so `finalize` never requests approval, which makes
@@ -447,7 +448,7 @@ export class ContainerProvider implements IContainerIsolationProvider {
   writeBackBackend(workingPath: string): ContainerWriteBackBackend {
     const project = composeProjectFromWorkingPath(workingPath);
     return {
-      // The engine hands us its `isolation_environments` row id here (D5). The
+      // The engine hands us its `isolation_environments` row id here. The
       // compose stack is addressed by the path bound above, so the id is unused.
       suspend: async (): Promise<void> => {
         await this.docker(['compose', '-p', project, 'stop', 'agent'], {
@@ -474,7 +475,7 @@ export class ContainerProvider implements IContainerIsolationProvider {
   }
 
   /**
-   * Stop every service of a run's stack (D8): the agent AND whatever the repo's
+   * Stop every service of a run's stack: the agent AND whatever the repo's
    * overlay declares. A terminal run frees its RAM this way and keeps its
    * worktree, branch, volumes and row; `reattach` starts the stack again.
    * Throws on a docker failure — the CLI surfaces a stack it could not stop.
@@ -485,7 +486,7 @@ export class ContainerProvider implements IContainerIsolationProvider {
   }
 
   /**
-   * The reap's evidence for one sandbox (D10, D11). Throws on any probe that
+   * The reap's evidence for one sandbox. Throws on any probe that
    * cannot answer — an unreadable compose listing, a worktree probe without its
    * markers — so the caller holds the row rather than reading silence as "gone".
    */
@@ -511,26 +512,34 @@ export class ContainerProvider implements IContainerIsolationProvider {
    * Best-effort teardown (mirrors WorktreeProvider.destroy's contract): composes
    * the stack down `-v` and removes the worktree + `sandbox/<slug>` branch in the
    * distro. Every step is best-effort inside the lifecycle — the run is already
-   * over — and a machine whose distro cannot be reached at all is logged, not thrown.
+   * over. A machine whose distro cannot be reached at all is logged, not thrown,
+   * and the result says nothing was torn down.
    */
   async destroy(workingPath: string): Promise<DestroyResult> {
     const { repo, slug } = repoSlugFromWorkingPath(workingPath);
-    const host = await this.host().catch((err: unknown) => {
-      log.warn(
-        { workingPath, err: err instanceof Error ? err.message : String(err) },
-        'container.destroy.host_unreachable'
-      );
-      return undefined;
-    });
-    if (host) {
-      await this.lifecycle.down({
-        distro: host.distro,
-        project: composeProjectFor(repo, slug),
-        slug,
-        baseClone: `${host.repoRoot}/${repo}`,
-        worktree: workingPath,
-      });
+    let host: ResolvedSandboxHost;
+    try {
+      host = await this.host();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      log.warn({ workingPath, err: message }, 'container.destroy.host_unreachable');
+      return {
+        worktreeRemoved: false,
+        branchDeleted: null,
+        remoteBranchDeleted: null,
+        directoryClean: false,
+        warnings: [
+          `WSL distro unreachable: ${message}; the sandbox stack and worktree were not torn down`,
+        ],
+      };
     }
+    await this.lifecycle.down({
+      distro: host.distro,
+      project: composeProjectFor(repo, slug),
+      slug,
+      baseClone: `${host.repoRoot}/${repo}`,
+      worktree: workingPath,
+    });
     return {
       worktreeRemoved: true,
       branchDeleted: null,
@@ -540,7 +549,10 @@ export class ContainerProvider implements IContainerIsolationProvider {
     };
   }
 
-  /** Reject requests the sandbox cannot honor (PR checkout, explicit --from). */
+  /**
+   * Reject requests the sandbox cannot honor (PR checkout, explicit --from, a named
+   * or existing task branch).
+   */
   private assertSupported(request: IsolationRequest): void {
     if (isPRIsolationRequest(request)) {
       throw new Error(
@@ -548,17 +560,24 @@ export class ContainerProvider implements IContainerIsolationProvider {
           'the base branch. Use worktree isolation for PR workflows.'
       );
     }
-    // `--from` now rides on the task's branch selection (upstream's TaskBranchSelection),
-    // so the same refusal reads it there. `kind: 'existing'` is a different request —
-    // continuing a branch, not cutting from a start point — and is not refused here.
-    const taskFromBranch =
-      request.workflowType === 'task' && request.taskBranch?.kind === 'new'
-        ? request.taskBranch.fromBranch
-        : undefined;
-    if (taskFromBranch) {
+    if (request.workflowType !== 'task' || !request.taskBranch) return;
+    // `--from` rides on the task's branch selection (upstream's TaskBranchSelection),
+    // so the same refusal reads it there.
+    const { taskBranch } = request;
+    if (taskBranch.kind === 'new' && taskBranch.fromBranch) {
       throw new Error(
-        `Container isolation cannot cut from an explicit start point (--from ${taskFromBranch}): ` +
+        `Container isolation cannot cut from an explicit start point (--from ${taskBranch.fromBranch}): ` +
           'the sandbox cuts only from the base branch.'
+      );
+    }
+    // Continuing an existing branch, or naming the new one, would otherwise be ignored:
+    // the run would go green on a fresh `sandbox/<slug>` branch instead.
+    if (taskBranch.branch) {
+      throw new Error(
+        `Container isolation cannot check out an existing or named branch ('${taskBranch.branch}'): ` +
+          'repo-kind container isolation cuts a fresh `sandbox/<slug>` branch from the base ' +
+          'branch. Run this without container isolation. ' +
+          PROVIDER_SETTING_HINT
       );
     }
   }
@@ -566,7 +585,7 @@ export class ContainerProvider implements IContainerIsolationProvider {
   /**
    * The repo's `isolation` section, checked where it becomes a decision — the
    * loader is fail-soft and cannot refuse. `provision` is required: Archon runs
-   * exactly one command in the fresh container (D1), and a repo that names none
+   * exactly one command in the fresh container, and a repo that names none
    * would hand every node an unprovisioned worktree that fails on its first
    * `uv run`, far from the setting that caused it.
    */
@@ -634,8 +653,8 @@ export class ContainerProvider implements IContainerIsolationProvider {
   }
 
   /**
-   * Resolve the compose `agent` service to a concrete container id (2a). `start`
-   * first — every service, since a terminal run's `stop` (D8) stops the repo's
+   * Resolve the compose `agent` service to a concrete container id. `start`
+   * first — every service, since a terminal run's `stop` stops the repo's
    * services as well as the agent — so a resume after a stop or a docker restart
    * re-runs what is stopped; harmless on a fresh `up`. Fails loud when nothing
    * resolves — a silent '' would build a broken execContext that only surfaces at
@@ -702,8 +721,8 @@ export class ContainerProvider implements IContainerIsolationProvider {
       .replace(/\//g, '-');
   }
 
-  // --- Branch-name helpers: WorktreeProvider's derived names. Unlike WorktreeProvider,
-  // an explicit `taskBranch` name is not honored; the slug comes from the identifier. ---
+  // --- Branch-name helpers: WorktreeProvider's derived names. Its explicit `taskBranch`
+  // names never reach here: `assertSupported` refuses a request that carries one. ---
 
   private generateBranchName(request: IsolationRequest): string {
     switch (request.workflowType) {

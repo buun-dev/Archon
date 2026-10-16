@@ -79,6 +79,13 @@ describe('selectIsolationProvider — unrecognised isolation.provider', () => {
     );
   });
 
+  test('refuses a key present with no value (YAML null) rather than reading it as unset', () => {
+    expect(() => assertIsolationProviderRecognized(null)).toThrow(
+      "Unknown isolation.provider 'null' in .archon/config.yaml"
+    );
+    expect(() => assertIsolationProviderRecognized(undefined)).not.toThrow();
+  });
+
   test('refuses a misspelled provider instead of silently running on the host', () => {
     const worktreeSingleton = getIsolationProvider();
     // The cast is the point: this value arrives from YAML, where the type is gone.
