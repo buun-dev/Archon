@@ -11,3 +11,6 @@ packages/docs-web/public/install text eol=lf
 docker-entrypoint.sh text eol=lf
 Caddyfile text eol=lf
 Caddyfile.example text eol=lf
+# Mounted read-only into the repo-kind sandbox container and read line by line by
+# init-firewall.sh; a CR on a hostname would silently drop it from the allowlist.
+packages/isolation/docker/allowlist.txt text eol=lf

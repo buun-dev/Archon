@@ -14,6 +14,18 @@ describe('dockerPreflight', () => {
     expect(calls[1]).toEqual(['image', 'inspect', 'archon-runner:test']);
   });
 
+  test('dockerPreflight names the given build hint instead of the in-repo Dockerfile', async () => {
+    const runner: DockerRunner = async args => {
+      if (args[0] === 'image') throw new Error('No such image');
+      return { stdout: '27.0.0', stderr: '' };
+    };
+    await expect(
+      dockerPreflight('archon-runner:latest', runner, 'run build-runner.sh')
+    ).rejects.toThrow(
+      "No such image: 'archon-runner:latest'. Build the runner image first: run build-runner.sh"
+    );
+  });
+
   test('throws a daemon-down error when version fails', async () => {
     const runner: DockerRunner = async () => {
       const err = new Error('Command failed') as Error & { stderr?: string };

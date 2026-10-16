@@ -61,6 +61,23 @@ export type { ContainerBackendDeps } from './backends/container';
 export { dockerCli, dockerPreflight, extractDockerError } from './container/docker-exec';
 export type { DockerRunner, DockerExecOptions, DockerExecResult } from './container/docker-exec';
 
+// --- Repo-kind sandbox lifecycle (WSL2 docker compose) ---
+export {
+  SANDBOX_HOST_DEFAULTS,
+  resolveSandboxHost,
+  SandboxLifecycle,
+  defaultWslRunner,
+  defaultSandboxDocker,
+  shq,
+} from './backends/sandbox';
+export type {
+  SandboxHostConfig,
+  RepoSandboxConfig,
+  ResolvedSandboxHost,
+  WslRunner,
+  SandboxDockerRunner,
+} from './backends/sandbox';
+
 // --- Store ---
 export type { IIsolationStore } from './store';
 export { recordWorktreeAdoption } from './store';

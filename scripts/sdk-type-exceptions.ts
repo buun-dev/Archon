@@ -103,6 +103,12 @@ export const SDK_TYPE_EXCEPTIONS: readonly SdkTypeException[] = [
     reason: 'Archon database session row derived from its Zod schema, not an OpenCode session.',
   },
   {
+    file: 'packages/isolation/src/backends/sandbox.ts',
+    name: 'ExecResult',
+    kind: 'independent',
+    reason: 'stdout/stderr of a docker or wsl subprocess, not a Pi coding-agent exec result.',
+  },
+  {
     file: 'packages/isolation/src/pr-state.test.ts',
     name: 'ExecResult',
     kind: 'independent',
