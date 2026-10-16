@@ -21,8 +21,8 @@ import { withBranchLaunchSource } from '@archon/core/workflows/branch-launch-sou
 import {
   createRegisteredContainerEnv,
   createRegisteredWorktree,
-  type RegisteredWorktree,
 } from '@archon/core/workflows/registered-worktree';
+import { assertNoDurableWaitForContainer } from '@archon/workflows/container-context';
 import {
   prepareRunAiConfiguration,
   assertRunCredentials,
@@ -97,6 +97,7 @@ import {
   assertIsolationProviderRecognized,
   assertContainerPrerequisites,
   assertContainerRequestSupported,
+  assertRepoSandboxConfigComplete,
 } from '@archon/isolation';
 import type {
   ExecutionContext,
@@ -565,7 +566,7 @@ function taskBranchSelection(
 
 /** What a fresh repo dispatch is about to do, as far as its isolation provider cares. */
 interface RepoDispatchIsolation {
-  workflowName: string;
+  workflow: Parameters<typeof assertNoDurableWaitForContainer>[0];
   /** The dispatch cuts a fresh isolated checkout. */
   isolates: boolean;
   /** The checkout's branch selection; read only when it isolates. */
@@ -581,10 +582,12 @@ interface RepoDispatchIsolation {
  * cannot honor it. Both launch paths call this before the run row is written, so a
  * refused dispatch leaves no row, worktree or stack behind (D6). It refuses:
  * - a value nothing implements;
- * - for a container that the dispatch isolates: a branch selection the sandbox cannot
- *   cut (the one check `ContainerProvider.create` also runs), then any prerequisite
- *   outside the repo that is absent (the WSL distro, the repo's base clone inside it,
- *   the docker daemon, the runner image), which `create` probes again;
+ * - for a container that the dispatch isolates, in this order: a branch selection the
+ *   sandbox cannot cut and a repo `isolation` section without `provision` (the checks
+ *   `ContainerProvider.create` also runs, from their one owner), a workflow with a
+ *   durable wait (the engine's own refusal), then any prerequisite outside the repo
+ *   that is absent (the WSL distro, the repo's base clone inside it, the docker daemon,
+ *   the runner image), which `create` probes again;
  * - for a container, a workflow pinned to the live checkout (`worktree.enabled: false`),
  *   which contradicts it.
  * An operator's `--no-worktree` still runs on the host, after one notice line.
@@ -593,17 +596,20 @@ async function resolveRepoIsolationProvider(
   repoRoot: string,
   dispatch: RepoDispatchIsolation
 ): Promise<Parameters<typeof selectIsolationProvider>[0]> {
-  const provider = (await loadRepoConfig(repoRoot)).isolation?.provider;
+  const repoConfig = await loadRepoConfig(repoRoot);
+  const provider = repoConfig.isolation?.provider;
   assertIsolationProviderRecognized(provider);
   if (provider !== 'container') return provider;
   if (dispatch.isolates) {
     assertContainerRequestSupported({ workflowType: 'task', taskBranch: dispatch.taskBranch });
+    assertRepoSandboxConfigComplete(repoConfig.isolation ?? null);
+    assertNoDurableWaitForContainer(dispatch.workflow);
     await assertContainerPrerequisites(basename(repoRoot), {
       host: (await loadGlobalConfig()).isolation?.container ?? null,
     });
   } else if (dispatch.pinnedEnabled === false) {
     throw new Error(
-      `Workflow '${dispatch.workflowName}' sets worktree.enabled: false (runs in the live ` +
+      `Workflow '${dispatch.workflow.name}' sets worktree.enabled: false (runs in the live ` +
         'checkout), but this repo sets isolation.provider: container in .archon/config.yaml ' +
         "(runs in a sandbox). Change the workflow's worktree.enabled, or set " +
         'isolation.provider to worktree.'
@@ -2589,7 +2595,7 @@ async function runWorkflowWithOwnedSource(
     const detachRepoIsolationProvider =
       !isContinuation && detachCodebase && !detachIsFolder
         ? await resolveRepoIsolationProvider(detachCodebase.default_cwd, {
-            workflowName: workflow.name,
+            workflow,
             isolates:
               !options.noWorktree &&
               wantsIsolation &&
@@ -3101,7 +3107,7 @@ async function runWorkflowWithOwnedSource(
   const repoIsolationProvider =
     !isContinuation && codebase && !isFolderCodebase
       ? await resolveRepoIsolationProvider(codebase.default_cwd, {
-          workflowName: workflow.name,
+          workflow,
           isolates: wantsIsolation,
           taskBranch: taskBranchSelection(options, adoptedTaskBranch),
           pinnedEnabled,
@@ -3342,7 +3348,6 @@ async function runWorkflowWithOwnedSource(
           'worktree_creating'
         );
 
-        let created: RegisteredWorktree | undefined;
         try {
           if (!preparedSource)
             throw new Error('Worktree setup requires a captured workflow source');
@@ -3409,8 +3414,17 @@ async function runWorkflowWithOwnedSource(
               createdByPlatform: 'cli',
             });
             repoContainer = { ...registered, provider: containerProvider };
+            // No `ownedWorktree`: the sandbox's worktree lives in the distro, and a run
+            // end stops its stack rather than removing it.
+            workingCwd = registered.env.workingPath;
+            isolationEnvId = registered.envId;
+            execContext = registered.env.execContext;
+            getLog().info(
+              { path: workingCwd, project: registered.env.project },
+              'container_sandbox_created'
+            );
           } else {
-            created = await createRegisteredWorktree(host.records.isolation, {
+            const created = await createRegisteredWorktree(host.records.isolation, {
               request,
               setupExecutor: createRunWorktreeSetupExecutor(
                 host.deps,
@@ -3419,28 +3433,15 @@ async function runWorkflowWithOwnedSource(
               ),
               createdByPlatform: 'cli',
             });
+            workingCwd = created.env.workingPath;
+            isolationEnvId = created.envId;
+            ownedWorktree = created.ownedWorktree;
+            cutFromCommit = created.cutFromCommit;
+            getLog().info({ path: workingCwd }, 'worktree_created');
           }
         } catch (createError) {
           getLog().error({ err: createError, branch: branchIdentifier }, 'worktree.create_failed');
           throw createError;
-        }
-
-        if (repoContainer) {
-          // No `ownedWorktree`: the sandbox's worktree lives in the distro, and a run end
-          // stops its stack rather than removing it.
-          workingCwd = repoContainer.env.workingPath;
-          isolationEnvId = repoContainer.envId;
-          execContext = repoContainer.env.execContext;
-          getLog().info(
-            { path: workingCwd, project: repoContainer.env.project },
-            'container_sandbox_created'
-          );
-        } else if (created) {
-          workingCwd = created.env.workingPath;
-          isolationEnvId = created.envId;
-          ownedWorktree = created.ownedWorktree;
-          cutFromCommit = created.cutFromCommit;
-          getLog().info({ path: workingCwd }, 'worktree_created');
         }
       }
     } else if (options.noWorktree) {

@@ -24,8 +24,12 @@ mock.module('@archon/paths', () => ({
 
 // Loaded after the mock: container.ts and backends/sandbox.ts create their loggers
 // when the module is evaluated.
-const { ContainerProvider, SANDBOX_COMPOSE_FILE, assertContainerRequestSupported } =
-  await import('./container');
+const {
+  ContainerProvider,
+  SANDBOX_COMPOSE_FILE,
+  assertContainerRequestSupported,
+  assertRepoSandboxConfigComplete,
+} = await import('./container');
 
 beforeEach(() => {
   mockWarn.mockClear();
@@ -295,6 +299,26 @@ describe('assertContainerRequestSupported', () => {
     ]) {
       expect(() => assertContainerRequestSupported({ workflowType: 'task', taskBranch })).toThrow(
         /cannot check out an existing or named branch \('named'\).*isolation\.provider/
+      );
+    }
+  });
+});
+
+/** The config completeness check alone: the section the CLI reads before any run row. */
+describe('assertRepoSandboxConfigComplete', () => {
+  test('returns the section trimmed, dropping a blank compose overlay', () => {
+    expect(
+      assertRepoSandboxConfigComplete({ provision: '  bun install ', compose: ' sandbox.yml ' })
+    ).toEqual({ provision: 'bun install', compose: 'sandbox.yml' });
+    expect(assertRepoSandboxConfigComplete({ provision: 'bun install', compose: '  ' })).toEqual({
+      provision: 'bun install',
+    });
+  });
+
+  test('refuses a missing section, a missing provision and a blank one, naming the setting', () => {
+    for (const config of [null, {}, { provision: '   ' }, { compose: 'sandbox.yml' }]) {
+      expect(() => assertRepoSandboxConfigComplete(config)).toThrow(
+        /set `isolation\.provision` in \.archon\/config\.yaml.*isolation\.provider/
       );
     }
   });

@@ -244,6 +244,32 @@ export function assertContainerRequestSupported(
   }
 }
 
+/**
+ * The repo's `isolation` section, checked where it becomes a decision — the loader is
+ * fail-soft and cannot refuse. `provision` is required: Archon runs exactly one command
+ * in the fresh container, and a repo that names none would hand every node an
+ * unprovisioned worktree that fails on its first `uv run`, far from the setting that
+ * caused it. Returns the section trimmed, with an empty `compose` dropped.
+ *
+ * The one owner of that check: `ContainerProvider.create` calls it on the section its
+ * loader returns, and the CLI calls it on the repo config it reads before the run row.
+ */
+export function assertRepoSandboxConfigComplete(
+  config: RepoSandboxConfig | null
+): RepoSandboxConfig & { provision: string } {
+  const provision = config?.provision?.trim();
+  if (!provision) {
+    throw new Error(
+      'Container isolation needs the repo to say how to provision its worktree: set ' +
+        '`isolation.provision` in .archon/config.yaml to the one command Archon runs inside ' +
+        'the fresh container (for example `python3 scripts/sandbox_env.py`). ' +
+        PROVIDER_SETTING_HINT
+    );
+  }
+  const compose = config?.compose?.trim();
+  return { ...(compose ? { compose } : {}), provision };
+}
+
 export interface ContainerPrerequisiteDeps {
   /** WSL probe runner (tests inject a fake; prod shells `wsl.exe -d <distro>`). */
   probeWsl?: WslProbe;
@@ -590,13 +616,7 @@ export class ContainerProvider implements IContainerIsolationProvider {
     };
   }
 
-  /**
-   * The repo's `isolation` section, checked where it becomes a decision — the
-   * loader is fail-soft and cannot refuse. `provision` is required: Archon runs
-   * exactly one command in the fresh container, and a repo that names none
-   * would hand every node an unprovisioned worktree that fails on its first
-   * `uv run`, far from the setting that caused it.
-   */
+  /** The repo's `isolation` section, loaded and checked by {@link assertRepoSandboxConfigComplete}. */
   private async requireRepoSandboxConfig(
     repoPath: string
   ): Promise<RepoSandboxConfig & { provision: string }> {
@@ -606,17 +626,7 @@ export class ContainerProvider implements IContainerIsolationProvider {
     } catch (err) {
       throw new Error(`Failed to load config: ${(err as Error).message}`);
     }
-    const provision = config?.provision?.trim();
-    if (!provision) {
-      throw new Error(
-        'Container isolation needs the repo to say how to provision its worktree: set ' +
-          '`isolation.provision` in .archon/config.yaml to the one command Archon runs inside ' +
-          'the fresh container (for example `python3 scripts/sandbox_env.py`). ' +
-          PROVIDER_SETTING_HINT
-      );
-    }
-    const compose = config?.compose?.trim();
-    return { ...(compose ? { compose } : {}), provision };
+    return assertRepoSandboxConfigComplete(config);
   }
 
   /**

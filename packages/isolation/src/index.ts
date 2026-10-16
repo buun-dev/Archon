@@ -116,6 +116,7 @@ export {
   ContainerProvider,
   assertContainerPrerequisites,
   assertContainerRequestSupported,
+  assertRepoSandboxConfigComplete,
   composeProjectFor,
   composeProjectFromWorkingPath,
   SANDBOX_COMPOSE_FILE,

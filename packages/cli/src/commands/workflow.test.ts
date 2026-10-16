@@ -323,6 +323,7 @@ const {
   worktreeRegistrationMetadata,
   assertIsolationProviderRecognized,
   assertContainerRequestSupported,
+  assertRepoSandboxConfigComplete,
   isContainerIsolationProvider,
 } = await import('@archon/isolation');
 
@@ -412,6 +413,7 @@ mock.module('@archon/isolation', () => ({
   worktreeRegistrationMetadata,
   assertIsolationProviderRecognized,
   assertContainerRequestSupported,
+  assertRepoSandboxConfigComplete,
   isContainerIsolationProvider,
   selectIsolationProvider: mockSelectIsolationProvider,
   assertContainerPrerequisites: mockAssertContainerPrerequisites,
@@ -8790,6 +8792,9 @@ describe('workflowRunCommand — repo container isolation', () => {
     workflowFields: Parameters<typeof makeTestWorkflowWithSource>[0] = {
       name: 'assist',
       description: 'Help',
+    },
+    repoConfig: Record<string, unknown> = {
+      isolation: { provider: 'container', provision: 'bun install' },
     }
   ): Promise<void> {
     const codebaseDb = await import('@archon/core/db/codebases');
@@ -8805,9 +8810,7 @@ describe('workflowRunCommand — repo container isolation', () => {
       default_branch: 'main',
       kind: 'repo',
     });
-    (core.loadRepoConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
-      isolation: { provider: 'container' },
-    });
+    (core.loadRepoConfig as ReturnType<typeof mock>).mockResolvedValueOnce(repoConfig);
   }
 
   /**
@@ -8930,6 +8933,36 @@ describe('workflowRunCommand — repo container isolation', () => {
     });
   }
 
+  it('refuses a durable-wait workflow on a container repo before any run row exists', async () => {
+    await arrangeContainerRepo({
+      name: 'assist',
+      description: 'Help',
+      nodes: [{ id: 'delay', wait: { duration_ms: 1000 } }],
+    });
+
+    await expect(
+      workflowRunCommand(createTestWorkflowHost(), '/test/path', 'assist', 'hello')
+    ).rejects.toThrow(
+      "Workflow 'assist' contains a durable wait, which is not supported in container isolation"
+    );
+    expect(mockAssertContainerPrerequisites).not.toHaveBeenCalled();
+    expect(mockStartRunLiveOwner).not.toHaveBeenCalled();
+    expect(mockCreateWorkflowRun).not.toHaveBeenCalled();
+    expect(mockSelectIsolationProvider).not.toHaveBeenCalled();
+  });
+
+  it('refuses a container repo without isolation.provision before any run row exists', async () => {
+    await arrangeContainerRepo(undefined, { isolation: { provider: 'container' } });
+
+    await expect(
+      workflowRunCommand(createTestWorkflowHost(), '/test/path', 'assist', 'hello')
+    ).rejects.toThrow(/set `isolation\.provision` in \.archon\/config\.yaml/);
+    expect(mockAssertContainerPrerequisites).not.toHaveBeenCalled();
+    expect(mockStartRunLiveOwner).not.toHaveBeenCalled();
+    expect(mockCreateWorkflowRun).not.toHaveBeenCalled();
+    expect(mockSelectIsolationProvider).not.toHaveBeenCalled();
+  });
+
   it('refuses worktree.enabled: false on a container repo before any run row exists', async () => {
     await arrangeContainerRepo({
       name: 'assist',
@@ -9022,7 +9055,7 @@ describe('workflowRunCommand — repo container isolation', () => {
 
     await expect(
       workflowRunCommand(createTestWorkflowHost(), '/test/path', 'assist', 'hello')
-    ).rejects.toThrow(/isolation\.provider/);
+    ).rejects.toThrow(/WSL distro 'Arch' is not reachable/);
     // The repo's basename names its base clone; the machine's section rides along.
     expect(mockAssertContainerPrerequisites).toHaveBeenCalledWith('path', {
       host: { distro: 'Arch' },
@@ -9117,6 +9150,34 @@ describe('workflowRunCommand — repo container isolation', () => {
           workflowRunCommand(createTestWorkflowHost(), '/test/path', 'assist', 'hello')
         ).rejects.toThrow(/daemon gone/);
         expect(provider.stop).toHaveBeenCalledTimes(1);
+        expect(errorSpy).toHaveBeenCalledWith(
+          expect.stringContaining(`failed to stop the sandbox stack ${REPO_SANDBOX.project}`)
+        );
+      } finally {
+        errorSpy.mockRestore();
+      }
+    });
+
+    it("a failed run whose stack will not stop reports the run's failure, not the stop error", async () => {
+      const provider = await arrangeContainerDispatch(
+        { success: false, workflowRunId: 'run-c', error: 'node broke' },
+        makeRepoContainerProvider(
+          mock(
+            (_workingPath: string): Promise<void> =>
+              Promise.reject(new Error('compose stop: daemon gone'))
+          )
+        )
+      );
+      const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
+
+      try {
+        const error = await captureError(
+          workflowRunCommand(createTestWorkflowHost(), '/test/path', 'assist', 'hello')
+        );
+        expect(error).toBeInstanceOf(WorkflowRunFailedError);
+        expect(error.message).not.toContain('daemon gone');
+        expect(provider.stop).toHaveBeenCalledTimes(1);
+        // The stop failure is still surfaced, loudly, beside the run's own failure.
         expect(errorSpy).toHaveBeenCalledWith(
           expect.stringContaining(`failed to stop the sandbox stack ${REPO_SANDBOX.project}`)
         );
@@ -9387,7 +9448,7 @@ describe('workflowRunCommand — detach', () => {
       errors: [],
     });
     (core.loadRepoConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
-      isolation: { provider: 'container' },
+      isolation: { provider: 'container', provision: 'bun install' },
     });
     mockAssertContainerPrerequisites.mockRejectedValueOnce(
       new Error(
@@ -9408,7 +9469,7 @@ describe('workflowRunCommand — detach', () => {
         workflowRunCommand(createTestWorkflowHost(), '/test/path', 'assist', 'hello', {
           detach: true,
         })
-      ).rejects.toThrow(/isolation\.provider/);
+      ).rejects.toThrow(/WSL distro 'Ubuntu' is not reachable/);
       // No child, and no row.
       expect(spawnSpy).not.toHaveBeenCalled();
       expect(mockCreateWorkflowRun).not.toHaveBeenCalled();
@@ -9453,35 +9514,55 @@ describe('workflowRunCommand — detach', () => {
     }
   });
 
-  for (const [flag, options, refusal] of [
+  const COMPLETE = { isolation: { provider: 'container', provision: 'bun install' } };
+  const detachedRefusals: [
+    label: string,
+    options: Parameters<typeof workflowRunCommand>[4],
+    workflowFields: Omit<Parameters<typeof makeTestWorkflowWithSource>[0], 'name'>,
+    repoConfig: Record<string, unknown>,
+    refusal: RegExp,
+  ][] = [
     [
       '--branch',
       { branchName: 'feat-x' },
+      {},
+      COMPLETE,
       /cannot check out an existing or named branch \('feat-x'\)/,
     ],
-    ['--from', { fromBranch: 'release' }, /explicit start point \(--from release\)/],
+    ['--from', { fromBranch: 'release' }, {}, COMPLETE, /explicit start point \(--from release\)/],
     [
       'worktree.enabled: false',
       {},
+      { worktree: { enabled: false } },
+      COMPLETE,
       /Workflow 'assist' sets worktree\.enabled: false.*isolation\.provider: container/,
     ],
-  ] as const) {
-    it(`refuses ${flag} on a container repo before writing the run row`, async () => {
+    [
+      'a durable-wait workflow',
+      {},
+      { nodes: [{ id: 'delay', wait: { duration_ms: 1000 } }] },
+      COMPLETE,
+      /Workflow 'assist' contains a durable wait, which is not supported in container isolation/,
+    ],
+    [
+      'a missing isolation.provision',
+      {},
+      {},
+      { isolation: { provider: 'container' } },
+      /set `isolation\.provision` in \.archon\/config\.yaml/,
+    ],
+  ];
+  for (const [label, options, workflowFields, repoConfig, refusal] of detachedRefusals) {
+    it(`refuses ${label} on a container repo before writing the run row`, async () => {
       jest.useRealTimers();
       const core = await import('@archon/core');
       mockDiscoverWorkflowsWithConfig.mockResolvedValueOnce({
         workflows: [
-          makeTestWorkflowWithSource({
-            name: 'assist',
-            description: 'Help',
-            ...(flag === 'worktree.enabled: false' ? { worktree: { enabled: false } } : {}),
-          }),
+          makeTestWorkflowWithSource({ name: 'assist', description: 'Help', ...workflowFields }),
         ],
         errors: [],
       });
-      (core.loadRepoConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
-        isolation: { provider: 'container' },
-      });
+      (core.loadRepoConfig as ReturnType<typeof mock>).mockResolvedValueOnce(repoConfig);
       mockAssertContainerPrerequisites.mockClear();
       mockCreateWorkflowRun.mockClear();
 
@@ -9516,7 +9597,7 @@ describe('workflowRunCommand — detach', () => {
       errors: [],
     });
     (core.loadRepoConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
-      isolation: { provider: 'container' },
+      isolation: { provider: 'container', provision: 'bun install' },
     });
     mockAssertContainerPrerequisites.mockClear();
     mockCreateWorkflowRun.mockClear();
@@ -15130,7 +15211,7 @@ describe('workflowRunCommand — adopt lane source recapture (#2660/#2747)', () 
     });
     const core = await import('@archon/core');
     (core.loadRepoConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
-      isolation: { provider: 'container' },
+      isolation: { provider: 'container', provision: 'bun install' },
     });
     mockAssertContainerPrerequisites.mockClear();
     mockCreateWorkflowRun.mockClear();
