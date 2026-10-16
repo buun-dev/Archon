@@ -115,6 +115,7 @@ export { WorktreeProvider, resolveRepoLocalOverride } from './providers/worktree
 export {
   ContainerProvider,
   assertContainerPrerequisites,
+  assertContainerRequestSupported,
   composeProjectFor,
   composeProjectFromWorkingPath,
   SANDBOX_COMPOSE_FILE,

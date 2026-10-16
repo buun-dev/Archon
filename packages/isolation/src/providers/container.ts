@@ -71,9 +71,9 @@ import type {
   IsolationRequest,
   RepoConfigLoader,
   SandboxInspection,
+  TaskIsolationRequest,
   WorktreeCreateConfig,
 } from '../types';
-import { isPRIsolationRequest } from '../types';
 
 const log = createLogger('isolation.container');
 
@@ -203,6 +203,47 @@ function probeFailureDetail(err: unknown): string {
   return e.code ? ` (${String(e.code)})` : '';
 }
 
+/**
+ * Refuse a request the sandbox cannot honor: a PR checkout, an explicit `--from`
+ * start point, or a named or existing task branch. The sandbox always cuts a fresh
+ * `sandbox/<slug>` branch from the base, so any of these would go green against the
+ * wrong tree.
+ *
+ * The one owner of the request check: `ContainerProvider.create` calls it before it
+ * provisions, and the CLI calls it before it writes a run row, with only the part of
+ * the request it knows by then.
+ */
+export function assertContainerRequestSupported(
+  request: Pick<IsolationRequest, 'workflowType'> & Pick<TaskIsolationRequest, 'taskBranch'>
+): void {
+  if (request.workflowType === 'pr') {
+    throw new Error(
+      'Container isolation cannot check out a PR: the sandbox cuts a fresh branch off ' +
+        'the base branch. Use worktree isolation for PR workflows.'
+    );
+  }
+  if (request.workflowType !== 'task' || !request.taskBranch) return;
+  // `--from` rides on the task's branch selection (upstream's TaskBranchSelection),
+  // so the same refusal reads it there.
+  const { taskBranch } = request;
+  if (taskBranch.kind === 'new' && taskBranch.fromBranch) {
+    throw new Error(
+      `Container isolation cannot cut from an explicit start point (--from ${taskBranch.fromBranch}): ` +
+        'the sandbox cuts only from the base branch.'
+    );
+  }
+  // Continuing an existing branch, or naming the new one, would otherwise be ignored:
+  // the run would go green on a fresh `sandbox/<slug>` branch instead.
+  if (taskBranch.branch) {
+    throw new Error(
+      `Container isolation cannot check out an existing or named branch ('${taskBranch.branch}'): ` +
+        'repo-kind container isolation cuts a fresh `sandbox/<slug>` branch from the base ' +
+        'branch. Run this without container isolation. ' +
+        PROVIDER_SETTING_HINT
+    );
+  }
+}
+
 export interface ContainerPrerequisiteDeps {
   /** WSL probe runner (tests inject a fake; prod shells `wsl.exe -d <distro>`). */
   probeWsl?: WslProbe;
@@ -230,8 +271,8 @@ export interface ContainerPrerequisites {
  * reimplemented — answers the daemon and the runner image. Present prerequisites
  * cost about a second; provisioning budgets twenty minutes.
  *
- * Deliberately separate from `assertSupported`, which judges the REQUEST (a
- * `--from` start point, a PR checkout) rather than the environment.
+ * Deliberately separate from {@link assertContainerRequestSupported}, which judges
+ * the REQUEST (a `--from` start point, a PR checkout) rather than the environment.
  */
 export async function assertContainerPrerequisites(
   repo: string,
@@ -370,7 +411,7 @@ export class ContainerProvider implements IContainerIsolationProvider {
     // Reject before provisioning: the sandbox cuts only from the base branch, so an
     // explicit --from, a named or existing branch, or a PR checkout would go green
     // against the WRONG tree.
-    this.assertSupported(request);
+    assertContainerRequestSupported(request);
     const repo = basename(request.canonicalRepoPath);
     // Then the repo's own declaration, which costs a config read and no subprocess.
     const repoSandbox = await this.requireRepoSandboxConfig(request.canonicalRepoPath);
@@ -550,39 +591,6 @@ export class ContainerProvider implements IContainerIsolationProvider {
   }
 
   /**
-   * Reject requests the sandbox cannot honor (PR checkout, explicit --from, a named
-   * or existing task branch).
-   */
-  private assertSupported(request: IsolationRequest): void {
-    if (isPRIsolationRequest(request)) {
-      throw new Error(
-        'Container isolation cannot check out a PR: the sandbox cuts a fresh branch off ' +
-          'the base branch. Use worktree isolation for PR workflows.'
-      );
-    }
-    if (request.workflowType !== 'task' || !request.taskBranch) return;
-    // `--from` rides on the task's branch selection (upstream's TaskBranchSelection),
-    // so the same refusal reads it there.
-    const { taskBranch } = request;
-    if (taskBranch.kind === 'new' && taskBranch.fromBranch) {
-      throw new Error(
-        `Container isolation cannot cut from an explicit start point (--from ${taskBranch.fromBranch}): ` +
-          'the sandbox cuts only from the base branch.'
-      );
-    }
-    // Continuing an existing branch, or naming the new one, would otherwise be ignored:
-    // the run would go green on a fresh `sandbox/<slug>` branch instead.
-    if (taskBranch.branch) {
-      throw new Error(
-        `Container isolation cannot check out an existing or named branch ('${taskBranch.branch}'): ` +
-          'repo-kind container isolation cuts a fresh `sandbox/<slug>` branch from the base ' +
-          'branch. Run this without container isolation. ' +
-          PROVIDER_SETTING_HINT
-      );
-    }
-  }
-
-  /**
    * The repo's `isolation` section, checked where it becomes a decision — the
    * loader is fail-soft and cannot refuse. `provision` is required: Archon runs
    * exactly one command in the fresh container, and a repo that names none
@@ -722,7 +730,8 @@ export class ContainerProvider implements IContainerIsolationProvider {
   }
 
   // --- Branch-name helpers: WorktreeProvider's derived names. Its explicit `taskBranch`
-  // names never reach here: `assertSupported` refuses a request that carries one. ---
+  // names never reach here: `assertContainerRequestSupported` refuses a request that
+  // carries one. ---
 
   private generateBranchName(request: IsolationRequest): string {
     switch (request.workflowType) {

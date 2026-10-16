@@ -24,7 +24,8 @@ mock.module('@archon/paths', () => ({
 
 // Loaded after the mock: container.ts and backends/sandbox.ts create their loggers
 // when the module is evaluated.
-const { ContainerProvider, SANDBOX_COMPOSE_FILE } = await import('./container');
+const { ContainerProvider, SANDBOX_COMPOSE_FILE, assertContainerRequestSupported } =
+  await import('./container');
 
 beforeEach(() => {
   mockWarn.mockClear();
@@ -244,6 +245,58 @@ describe('ContainerProvider.create', () => {
     ).rejects.toThrow(/existing or named branch \('feature\/named'\)/);
     expect(runners.calls.wsl).toHaveLength(0);
     expect(runners.calls.docker).toHaveLength(0);
+  });
+});
+
+/**
+ * The request check alone: the shape the CLI hands it before any run row exists, with
+ * no provider, runner or config behind it.
+ */
+describe('assertContainerRequestSupported', () => {
+  test('accepts a task with no branch selection, or a new branch with neither a name nor a start point', () => {
+    expect(() => assertContainerRequestSupported({ workflowType: 'task' })).not.toThrow();
+    expect(() =>
+      assertContainerRequestSupported({ workflowType: 'task', taskBranch: { kind: 'new' } })
+    ).not.toThrow();
+  });
+
+  test('accepts the non-task requests it has no rule for', () => {
+    for (const workflowType of ['issue', 'review', 'thread'] as const) {
+      expect(() => assertContainerRequestSupported({ workflowType })).not.toThrow();
+    }
+  });
+
+  test('refuses a PR checkout', () => {
+    expect(() => assertContainerRequestSupported({ workflowType: 'pr' })).toThrow(
+      /cannot check out a PR/
+    );
+  });
+
+  test('refuses an explicit --from start point, alone or beside a named branch', () => {
+    const fromBranch = toBranchName('feature-x');
+    expect(() =>
+      assertContainerRequestSupported({
+        workflowType: 'task',
+        taskBranch: { kind: 'new', fromBranch },
+      })
+    ).toThrow(/explicit start point \(--from feature-x\)/);
+    expect(() =>
+      assertContainerRequestSupported({
+        workflowType: 'task',
+        taskBranch: { kind: 'new', branch: toBranchName('named'), fromBranch },
+      })
+    ).toThrow(/explicit start point \(--from feature-x\)/);
+  });
+
+  test('refuses a named new branch and an existing branch, naming the setting', () => {
+    for (const taskBranch of [
+      { kind: 'new' as const, branch: toBranchName('named') },
+      { kind: 'existing' as const, branch: toBranchName('named') },
+    ]) {
+      expect(() => assertContainerRequestSupported({ workflowType: 'task', taskBranch })).toThrow(
+        /cannot check out an existing or named branch \('named'\).*isolation\.provider/
+      );
+    }
   });
 });
 

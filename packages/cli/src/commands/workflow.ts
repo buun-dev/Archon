@@ -96,6 +96,7 @@ import {
   isContainerIsolationProvider,
   assertIsolationProviderRecognized,
   assertContainerPrerequisites,
+  assertContainerRequestSupported,
 } from '@archon/isolation';
 import type {
   ExecutionContext,
@@ -542,22 +543,77 @@ export function containerProviderDeps(repoRoot: string): ContainerProviderDeps {
 }
 
 /**
- * The `isolation.provider` a fresh isolating repo dispatch runs under, refused when it
- * cannot run: a value nothing implements, or a container whose prerequisites outside the
- * repo (the WSL distro, the repo's base clone inside it, the docker daemon, the runner
- * image) are absent. Both launch paths call this before the run row is written, so a
- * refused dispatch leaves no row, worktree or stack behind (D6). `ContainerProvider.create`
- * probes again before it provisions.
+ * The branch a fresh task checkout is cut with: an adopted run's existing branch, else
+ * what `--branch` and `--from` ask for. The create request and the pre-row container
+ * check both read it from here, so they judge the same selection.
+ */
+function taskBranchSelection(
+  options: Pick<WorkflowRunOptions, 'branchName' | 'fromBranch'>,
+  adopted: Extract<TaskBranchSelection, { kind: 'existing' }> | undefined
+): TaskBranchSelection | undefined {
+  if (adopted) return adopted;
+  const fromBranch = options.fromBranch?.trim();
+  if (options.branchName) {
+    return {
+      kind: 'new',
+      branch: git.toBranchName(options.branchName),
+      ...(fromBranch ? { fromBranch: git.toBranchName(fromBranch) } : {}),
+    };
+  }
+  return fromBranch ? { kind: 'new', fromBranch: git.toBranchName(fromBranch) } : undefined;
+}
+
+/** What a fresh repo dispatch is about to do, as far as its isolation provider cares. */
+interface RepoDispatchIsolation {
+  workflowName: string;
+  /** The dispatch cuts a fresh isolated checkout. */
+  isolates: boolean;
+  /** The checkout's branch selection; read only when it isolates. */
+  taskBranch: TaskBranchSelection | undefined;
+  /** The workflow's `worktree.enabled`. */
+  pinnedEnabled: boolean | undefined;
+  /** The operator passed `--no-worktree`. */
+  noWorktree: boolean;
+}
+
+/**
+ * The `isolation.provider` a fresh repo dispatch runs under, refused when the dispatch
+ * cannot honor it. Both launch paths call this before the run row is written, so a
+ * refused dispatch leaves no row, worktree or stack behind (D6). It refuses:
+ * - a value nothing implements;
+ * - for a container that the dispatch isolates: a branch selection the sandbox cannot
+ *   cut (the one check `ContainerProvider.create` also runs), then any prerequisite
+ *   outside the repo that is absent (the WSL distro, the repo's base clone inside it,
+ *   the docker daemon, the runner image), which `create` probes again;
+ * - for a container, a workflow pinned to the live checkout (`worktree.enabled: false`),
+ *   which contradicts it.
+ * An operator's `--no-worktree` still runs on the host, after one notice line.
  */
 async function resolveRepoIsolationProvider(
-  repoRoot: string
+  repoRoot: string,
+  dispatch: RepoDispatchIsolation
 ): Promise<Parameters<typeof selectIsolationProvider>[0]> {
   const provider = (await loadRepoConfig(repoRoot)).isolation?.provider;
   assertIsolationProviderRecognized(provider);
-  if (provider === 'container') {
+  if (provider !== 'container') return provider;
+  if (dispatch.isolates) {
+    assertContainerRequestSupported({ workflowType: 'task', taskBranch: dispatch.taskBranch });
     await assertContainerPrerequisites(basename(repoRoot), {
       host: (await loadGlobalConfig()).isolation?.container ?? null,
     });
+  } else if (dispatch.pinnedEnabled === false) {
+    throw new Error(
+      `Workflow '${dispatch.workflowName}' sets worktree.enabled: false (runs in the live ` +
+        'checkout), but this repo sets isolation.provider: container in .archon/config.yaml ' +
+        "(runs in a sandbox). Change the workflow's worktree.enabled, or set " +
+        'isolation.provider to worktree.'
+    );
+  } else if (dispatch.noWorktree) {
+    // stderr, so a `--json` launch keeps stdout to its one document.
+    console.warn(
+      "Note: --no-worktree bypasses this repo's container isolation " +
+        '(isolation.provider: container); this run uses the live checkout on the host.'
+    );
   }
   return provider;
 }
@@ -2475,13 +2531,6 @@ async function runWorkflowWithOwnedSource(
     // Surface worktree-option conflicts synchronously in the parent rather than
     // letting the child fail after fork.
     assertNoWorktreeOptionsForFolder(detachIsFolder, options);
-    // The repo's isolation provider, and a container's prerequisites, are refused here
-    // too: the child would find them missing only after this process wrote the row and
-    // printed `Started`.
-    const detachRepoIsolationProvider =
-      !options.noWorktree && wantsIsolation && detachCodebase && !detachIsFolder
-        ? await resolveRepoIsolationProvider(detachCodebase.default_cwd)
-        : undefined;
 
     // Between-run continuation (#2747): refuse an unresolvable declaration HERE — this
     // is the exact failure that vanished into a child log. `resolveWorkflowAdoption` is
@@ -2533,6 +2582,28 @@ async function runWorkflowWithOwnedSource(
         await resolveSupersededRun(host, supersededRunId);
       }
     }
+
+    // The repo's isolation provider is refused here too, once the adoption lane is
+    // known: the child would find the refusal only after this process wrote the row
+    // and printed `Started`. A reused worktree isolates nothing new.
+    const detachRepoIsolationProvider =
+      !isContinuation && detachCodebase && !detachIsFolder
+        ? await resolveRepoIsolationProvider(detachCodebase.default_cwd, {
+            workflowName: workflow.name,
+            isolates:
+              !options.noWorktree &&
+              wantsIsolation &&
+              detachedAdoptionLane?.kind !== 'reuse-worktree',
+            taskBranch: taskBranchSelection(
+              options,
+              detachedAdoptionLane?.kind === 'checkout-branch'
+                ? detachedAdoptionLane.taskBranch
+                : undefined
+            ),
+            pinnedEnabled,
+            noWorktree: options.noWorktree === true,
+          })
+        : undefined;
 
     let detachedPrepared: PreparedRunAiConfiguration;
     if (detachedAdoptionLane?.kind === 'checkout-branch' && detachCodebase) {
@@ -3026,11 +3097,16 @@ async function runWorkflowWithOwnedSource(
   assertNoWorktreeOptionsForFolder(isFolderCodebase, options);
   assertWorkflowNotWorktreePinnedForFolder(isFolderCodebase, pinnedEnabled, workflow.name);
 
-  // The repo's isolation provider, recognized and (for a container) probed before the
-  // live owner and the run row below. The condition is the isolation branch's own.
+  // The repo's isolation provider, judged before the live owner and the run row below.
   const repoIsolationProvider =
-    wantsIsolation && codebase && !isFolderCodebase
-      ? await resolveRepoIsolationProvider(codebase.default_cwd)
+    !isContinuation && codebase && !isFolderCodebase
+      ? await resolveRepoIsolationProvider(codebase.default_cwd, {
+          workflowName: workflow.name,
+          isolates: wantsIsolation,
+          taskBranch: taskBranchSelection(options, adoptedTaskBranch),
+          pinnedEnabled,
+          noWorktree: options.noWorktree === true,
+        })
       : undefined;
 
   let setupPreparedRun: WorkflowRun | undefined;
@@ -3198,10 +3274,9 @@ async function runWorkflowWithOwnedSource(
         ? selectedProvider
         : undefined;
 
-      // Check for existing worktree (only when explicit --branch). A container run never
-      // reuses one: a host worktree has no container to execute in, and the sandbox
-      // refuses a named branch itself.
-      const existingEnv = containerProvider ? undefined : existingBranchEnv;
+      // Check for existing worktree (only when explicit --branch). A container dispatch
+      // never gets here with one: its --branch is refused before the run row.
+      const existingEnv = existingBranchEnv;
 
       if (existingEnv && (await getIsolationProvider().healthCheck(existingEnv.working_path))) {
         if (options.fromBranch) {
@@ -3316,19 +3391,7 @@ async function runWorkflowWithOwnedSource(
           const request: TaskIsolationRequest = {
             workflowType: 'task',
             identifier: branchIdentifier,
-            taskBranch: adoptedTaskBranch
-              ? adoptedTaskBranch
-              : options.branchName
-                ? {
-                    kind: 'new',
-                    branch: git.toBranchName(options.branchName),
-                    ...(options.fromBranch?.trim()
-                      ? { fromBranch: git.toBranchName(options.fromBranch.trim()) }
-                      : {}),
-                  }
-                : options.fromBranch?.trim()
-                  ? { kind: 'new', fromBranch: git.toBranchName(options.fromBranch.trim()) }
-                  : undefined,
+            taskBranch: taskBranchSelection(options, adoptedTaskBranch),
             baseBranch: codebaseDefaultBranch ? git.toBranchName(codebaseDefaultBranch) : undefined,
             baseOverride: flagBase ? git.toBranchName(flagBase) : undefined,
             codebaseId: codebase.id,
