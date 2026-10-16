@@ -253,6 +253,149 @@ describe('ContainerProvider.create', () => {
 });
 
 /**
+ * No row exists until `create` returns, so a stack it leaves behind after a failure
+ * is invisible: a running agent with open egress and secrets in its environment, the
+ * repo's services, and a worktree nobody will reclaim. Every failure after this call
+ * cut its worktree tears down what it made, and the caller sees the original error.
+ */
+describe('ContainerProvider.create — a failed provision leaves nothing behind', () => {
+  const REQ = { ...BASE_REQ, workflowType: 'task', identifier: 'fail' } as IsolationRequest;
+  const PROJECT = 'archon-marphob-page-task-fail';
+  const WORKTREE = '/home/u/archon/worktrees/marphob-page/task-fail';
+  type Step = 'fetch' | 'compose up' | 'provision' | 'firewall' | 'resolve';
+
+  /** The default runners, with `step` failing as docker or git would. */
+  function failingAt(step: Step, opts: { downFails?: boolean } = {}) {
+    const runners = makeRunners();
+    const fail = (stderr: string): never => {
+      const err = new Error('Command failed') as Error & { stderr?: string };
+      err.stderr = stderr;
+      throw err;
+    };
+    const wsl: WslRunner = async (distro, script, runOpts) => {
+      if (step === 'fetch' && script.includes('fetch')) fail('fatal: could not read from remote');
+      if (step === 'compose up' && script.includes('up -d')) fail('db failed to start');
+      return runners.wsl(distro, script, runOpts);
+    };
+    const docker = async (args: string[]): Promise<{ stdout: string; stderr: string }> => {
+      if (args.includes('exec') && !args.includes('--user') && step === 'provision') {
+        runners.calls.docker.push(args);
+        fail('[sandbox_env] FATAL: alembic failed');
+      }
+      if (args.includes('--user') && step === 'firewall') {
+        runners.calls.docker.push(args);
+        fail('FATAL: cannot resolve github.com');
+      }
+      if (args.includes('ps') && step === 'resolve') {
+        runners.calls.docker.push(args);
+        return { stdout: '', stderr: '' };
+      }
+      if (args.includes('down') && opts.downFails) {
+        runners.calls.docker.push(args);
+        fail('Cannot connect to the Docker daemon');
+      }
+      return runners.docker(args);
+    };
+    const provider = new ContainerProvider({
+      ...runners,
+      wsl,
+      docker,
+      loadConfig: async () => null,
+    });
+    const tornDown = (): boolean =>
+      runners.calls.docker.some(a => a.join(' ') === `compose -p ${PROJECT} down -v`) &&
+      runners.calls.wsl.some(c => c.script.includes(`worktree remove --force ${WORKTREE}`));
+    return { provider, runners, tornDown };
+  }
+
+  for (const [step, original] of [
+    ['compose up', /compose up.*db failed to start/s],
+    ['provision', /provision.*alembic failed/s],
+    ['firewall', /firewall.*cannot resolve github\.com/s],
+    ['resolve', /Could not resolve a container id/],
+  ] as const) {
+    test(`a ${step} failure tears down the stack and worktree, then rethrows the original error`, async () => {
+      const { provider, tornDown } = failingAt(step);
+
+      await expect(provider.create(REQ)).rejects.toThrow(original);
+      expect(tornDown()).toBe(true);
+    });
+  }
+
+  test('a failure before the worktree is cut tears nothing down: this call made nothing', async () => {
+    const { provider, runners } = failingAt('fetch');
+
+    await expect(provider.create(REQ)).rejects.toThrow(/could not read from remote/);
+    expect(runners.calls.docker.some(a => a.includes('down'))).toBe(false);
+    expect(runners.calls.wsl.some(c => c.script.includes('worktree remove'))).toBe(false);
+  });
+
+  test('a rollback that fails is logged and does not mask the original error', async () => {
+    const { provider, runners } = failingAt('provision', { downFails: true });
+
+    await expect(provider.create(REQ)).rejects.toThrow(/provision.*alembic failed/s);
+    expect(mockWarn).toHaveBeenCalledWith(
+      { project: PROJECT, err: 'Cannot connect to the Docker daemon' },
+      'sandbox.down.compose_failed'
+    );
+    // The rest of the teardown still ran.
+    expect(runners.calls.wsl.some(c => c.script.includes('worktree remove'))).toBe(true);
+  });
+});
+
+/**
+ * A slug is not guaranteed unique: a long workflow name truncates the run's timestamp
+ * out of it, and an issue or thread slug repeats by design. A second run must never
+ * provision into, or later tear down, another run's sandbox.
+ */
+describe("ContainerProvider.create — refuses another run's sandbox", () => {
+  const REQ = { ...BASE_REQ, workflowType: 'task', identifier: 'dup' } as IsolationRequest;
+  const PROJECT = 'archon-marphob-page-task-dup';
+  const WORKTREE = '/home/u/archon/worktrees/marphob-page/task-dup';
+
+  test('an existing worktree is refused before anything is fetched, cut or brought up', async () => {
+    const runners = makeRunners();
+    const wsl: WslRunner = async (distro, script, opts) => {
+      await runners.wsl(distro, script, opts);
+      return script.includes('ARCHON_WORKTREE_EXISTS')
+        ? { stdout: 'ARCHON_WORKTREE_EXISTS\n', stderr: '' }
+        : { stdout: '', stderr: '' };
+    };
+    const provider = new ContainerProvider({ ...runners, wsl, loadConfig: async () => null });
+
+    const p = provider.create(REQ);
+    await expect(p).rejects.toThrow(new RegExp(`worktree ${WORKTREE} already exists`));
+    await expect(p).rejects.toThrow(/archon isolation cleanup/);
+    const scripts = runners.calls.wsl.map(c => c.script).join('\n');
+    expect(scripts).not.toContain('fetch');
+    expect(scripts).not.toContain('worktree add');
+    expect(scripts).not.toContain('worktree remove');
+    expect(runners.composeUp()).toBeUndefined();
+    expect(runners.calls.docker.some(a => a.includes('down'))).toBe(false);
+  });
+
+  test('an existing compose project is refused before anything is fetched, cut or brought up', async () => {
+    const runners = makeRunners();
+    const docker = async (args: string[]): Promise<{ stdout: string; stderr: string }> => {
+      if (args[0] === 'compose' && args[1] === 'ls') {
+        runners.calls.docker.push(args);
+        return { stdout: JSON.stringify([{ Name: PROJECT }]), stderr: '' };
+      }
+      return runners.docker(args);
+    };
+    const provider = new ContainerProvider({ ...runners, docker, loadConfig: async () => null });
+
+    await expect(provider.create(REQ)).rejects.toThrow(
+      new RegExp(`compose project ${PROJECT} already exists`)
+    );
+    const scripts = runners.calls.wsl.map(c => c.script).join('\n');
+    expect(scripts).not.toContain('fetch');
+    expect(scripts).not.toContain('worktree add');
+    expect(runners.calls.docker.some(a => a.includes('down'))).toBe(false);
+  });
+});
+
+/**
  * The request check alone: the shape the CLI hands it before any run row exists, with
  * no provider, runner or config behind it.
  */

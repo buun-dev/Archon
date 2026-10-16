@@ -146,16 +146,54 @@ describe('SandboxLifecycle.up', () => {
     expect(lines).toContain('[sandbox_env] == uv sync ==');
   });
 
-  test('an existing worktree is re-used without a fetch, a worktree add, or a token', async () => {
+  // A sandbox is never shared: reusing one would provision into another run's
+  // worktree, and the failed run's rollback would then tear that worktree down.
+  test('an existing worktree is refused, and nothing is fetched, cut, brought up or torn down', async () => {
     const { calls, wsl, docker, onLine } = makeRunners({ worktreeExists: true });
     const lifecycle = new SandboxLifecycle({ wsl, docker, onLine });
 
-    await lifecycle.up({ ...SPEC, secrets: {} });
+    await expect(lifecycle.up(SPEC)).rejects.toThrow(`worktree ${SPEC.worktree} already exists`);
 
     const scripts = calls.wsl.map(c => c.script).join('\n');
     expect(scripts).not.toContain('fetch');
     expect(scripts).not.toContain('worktree add');
-    expect(scripts).toContain('compose');
+    expect(scripts).not.toContain('worktree remove');
+    expect(scripts).not.toContain('up -d');
+    expect(calls.docker.filter(a => a[1] !== 'ls')).toEqual([]);
+  });
+
+  test('an existing compose project is refused before anything is fetched or cut', async () => {
+    const { calls, wsl, onLine } = makeRunners();
+    const docker: SandboxDockerRunner = async args => {
+      calls.docker.push(args);
+      return args[1] === 'ls'
+        ? { stdout: JSON.stringify([{ Name: SPEC.project }]), stderr: '' }
+        : { stdout: '', stderr: '' };
+    };
+    const lifecycle = new SandboxLifecycle({ wsl, docker, onLine });
+
+    await expect(lifecycle.up(SPEC)).rejects.toThrow(
+      `compose project ${SPEC.project} already exists`
+    );
+    expect(calls.wsl.map(c => c.script).join('\n')).not.toContain('worktree add');
+  });
+
+  test('a step that fails after the worktree is cut tears down what `up` made, then rethrows', async () => {
+    const { calls, onLine, docker } = makeRunners();
+    const wsl: WslRunner = async (_distro, script, runOpts) => {
+      calls.wsl.push({ script, env: runOpts.env ?? {} });
+      if (script.includes('up -d')) {
+        const err = new Error('Command failed') as Error & { stderr?: string };
+        err.stderr = 'db failed to start';
+        throw err;
+      }
+      return { stdout: '', stderr: '' };
+    };
+    const lifecycle = new SandboxLifecycle({ wsl, docker, onLine });
+
+    await expect(lifecycle.up(SPEC)).rejects.toThrow(/compose up.*db failed to start/s);
+    expect(calls.docker).toContainEqual(['compose', '-p', SPEC.project, 'down', '-v']);
+    expect(calls.wsl.at(-1)?.script).toContain(`worktree remove --force ${SPEC.worktree}`);
   });
 
   test('a fresh worktree with no GH_TOKEN is refused before anything is created', async () => {

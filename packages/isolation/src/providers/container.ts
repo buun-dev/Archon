@@ -457,15 +457,18 @@ export class ContainerProvider implements IContainerIsolationProvider {
     // boundary as an argument; auto-detection runs against the host checkout.
     const baseBranch = await this.resolveBaseBranch(request);
 
+    const baseClone = `${host.repoRoot}/${repo}`;
     // Worktree-in-distro + compose up + provision. No port allocator — the
-    // container owns its own 3000/8123/5432 in a private network namespace.
+    // container owns its own 3000/8123/5432 in a private network namespace. `up`
+    // refuses a slug another run's sandbox holds, and tears down what it made if it
+    // fails after cutting the worktree.
     await this.lifecycle.up({
       distro: host.distro,
       project,
       repo,
       slug,
       baseBranch,
-      baseClone: `${host.repoRoot}/${repo}`,
+      baseClone,
       worktree: workingPath,
       image: host.image,
       composeBase: toNodeVisiblePath(SANDBOX_COMPOSE_FILE),
@@ -479,7 +482,29 @@ export class ContainerProvider implements IContainerIsolationProvider {
       secrets: pick(this.secretsFrom, ['GH_TOKEN', 'ANTHROPIC_API_KEY']),
     });
 
-    const containerId = await this.resolveContainerId(project);
+    let containerId: string;
+    try {
+      containerId = await this.resolveContainerId(project);
+    } catch (err) {
+      // `up` succeeded, so this call made the stack and the worktree, and no row names
+      // them yet: tear them down before the caller sees the error.
+      log.warn(
+        { project, err: err instanceof Error ? err.message : String(err) },
+        'container.create.rolling_back'
+      );
+      await this.lifecycle
+        .down({ distro: host.distro, project, slug, baseClone, worktree: workingPath })
+        .catch((rollbackErr: unknown) => {
+          log.error(
+            {
+              project,
+              err: rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr),
+            },
+            'container.create.rollback_failed'
+          );
+        });
+      throw err;
+    }
     return this.buildEnv(slug, workingPath, project, containerId, request, baseBranch);
   }
 
@@ -576,17 +601,7 @@ export class ContainerProvider implements IContainerIsolationProvider {
    */
   async inspect(workingPath: string): Promise<SandboxInspection> {
     const { repo, slug } = repoSlugFromWorkingPath(workingPath);
-    const project = composeProjectFor(repo, slug);
-    const { stdout } = await this.docker(['compose', 'ls', '--all', '--format', 'json'], {
-      timeout: DOCKER_QUERY_TIMEOUT_MS,
-    });
-    let entries: { Name?: string }[];
-    try {
-      entries = JSON.parse(stdout || '[]') as { Name?: string }[];
-    } catch {
-      throw new Error(`docker compose ls did not answer with JSON: ${stdout.trim().slice(0, 200)}`);
-    }
-    const stackExists = entries.some(e => e.Name === project);
+    const stackExists = await this.lifecycle.composeProjectExists(composeProjectFor(repo, slug));
     const host = await this.host();
     const wt = await this.lifecycle.inspectWorktree(host.distro, workingPath);
     return { stackExists, worktreeExists: wt.exists, dirty: wt.dirty, unpushed: wt.unpushed };

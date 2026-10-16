@@ -192,6 +192,7 @@ const COMPOSE_UP_TIMEOUT_MS = 10 * 60 * 1000;
 const PROVISION_TIMEOUT_MS = 20 * 60 * 1000;
 const FIREWALL_TIMEOUT_MS = 2 * 60 * 1000;
 const COMPOSE_DOWN_TIMEOUT_MS = 5 * 60 * 1000;
+const COMPOSE_QUERY_TIMEOUT_MS = 30 * 1000;
 
 /** Single-quote a value for bash unless it is plainly safe bare. */
 export function shq(value: string): string {
@@ -214,9 +215,20 @@ export class SandboxLifecycle {
   constructor(private readonly deps: SandboxLifecycleDeps) {}
 
   /**
-   * Bring the stack up and provision it. Idempotent on the worktree: a re-`up` of
-   * an existing worktree (reuse-by-branch) skips the fetch and the `worktree add`,
-   * so it needs no token, and re-asserts everything else.
+   * Cut a fresh worktree, bring the stack up, provision it, then firewall it.
+   *
+   * A sandbox is never reused. A slug can repeat (a long workflow name truncates the
+   * run's timestamp out of it), and a worktree or compose project already at this slug
+   * belongs to another run: provisioning into it would mix the two runs' work, and this
+   * call's rollback would then tear the other run down. So both are refused before
+   * anything is fetched or cut.
+   *
+   * Once this call has cut the worktree, a failure at any later step tears down what
+   * it made (`down` is best-effort and logs each step it could not do) and rethrows the
+   * original error: no isolation row exists yet, so a half-built stack — an agent with
+   * open egress and secrets in its environment — would be invisible. A failure before
+   * the cut made nothing and tears nothing down; in particular a `worktree add` that
+   * loses a race for the slug must not remove the winner's worktree.
    */
   async up(spec: SandboxUpSpec): Promise<void> {
     const { onLine } = this.deps;
@@ -224,34 +236,64 @@ export class SandboxLifecycle {
       onLine(line);
     };
 
-    if (!(await this.worktreeExists(spec))) {
-      const token = spec.secrets.GH_TOKEN;
-      if (!token) {
-        throw new Error(
-          `Sandbox up refused: GH_TOKEN is unset, so origin/${spec.baseBranch} cannot be fetched ` +
-            `into ${spec.baseClone}. Set GH_TOKEN in the environment Archon runs in.`
-        );
-      }
-      say(`fetching origin/${spec.baseBranch} into ${spec.baseClone}`);
-      await this.fetchBase(spec, token);
-      say(`cutting worktree ${spec.worktree} on sandbox/${spec.slug}`);
-      await this.worktreeAdd(spec);
-    } else {
-      say(`reusing worktree ${spec.worktree}`);
+    const token = spec.secrets.GH_TOKEN;
+    if (!token) {
+      throw new Error(
+        `Sandbox up refused: GH_TOKEN is unset, so origin/${spec.baseBranch} cannot be fetched ` +
+          `into ${spec.baseClone}. Set GH_TOKEN in the environment Archon runs in.`
+      );
     }
+    await this.assertSlugFree(spec);
+    say(`fetching origin/${spec.baseBranch} into ${spec.baseClone}`);
+    await this.fetchBase(spec, token);
+    say(`cutting worktree ${spec.worktree} on sandbox/${spec.slug}`);
+    await this.worktreeAdd(spec);
 
-    if (spec.gitIdentity) await this.stampIdentity(spec, spec.gitIdentity);
-    await this.writeHandshake(spec);
+    try {
+      if (spec.gitIdentity) await this.stampIdentity(spec, spec.gitIdentity);
+      await this.writeHandshake(spec);
 
-    say(`compose up ${spec.project}`);
-    await this.composeUp(spec);
+      say(`compose up ${spec.project}`);
+      await this.composeUp(spec);
 
-    say(`provisioning: ${spec.provision}`);
-    await this.provision(spec);
+      say(`provisioning: ${spec.provision}`);
+      await this.provision(spec);
 
-    say('firewall: default-deny egress');
-    await this.applyFirewall(spec.project);
+      say('firewall: default-deny egress');
+      await this.applyFirewall(spec.project);
+    } catch (err) {
+      say(`tearing down ${spec.project}: the sandbox did not come up`);
+      log.warn(
+        { project: spec.project, err: err instanceof Error ? err.message : String(err) },
+        'sandbox.up.rolling_back'
+      );
+      await this.down(spec).catch((rollbackErr: unknown) => {
+        log.error(
+          { project: spec.project, err: lastLine(rollbackErr) },
+          'sandbox.up.rollback_failed'
+        );
+      });
+      throw err;
+    }
     log.info({ project: spec.project, worktree: spec.worktree }, 'sandbox.up');
+  }
+
+  /**
+   * Whether the daemon knows a compose project by this name, running or stopped.
+   * Throws when the listing is not JSON, so a caller never reads an unreadable answer
+   * as "no such project".
+   */
+  async composeProjectExists(project: string): Promise<boolean> {
+    const { stdout } = await this.deps.docker(['compose', 'ls', '--all', '--format', 'json'], {
+      timeoutMs: COMPOSE_QUERY_TIMEOUT_MS,
+    });
+    let entries: { Name?: string }[];
+    try {
+      entries = JSON.parse(stdout || '[]') as { Name?: string }[];
+    } catch {
+      throw new Error(`docker compose ls did not answer with JSON: ${stdout.trim().slice(0, 200)}`);
+    }
+    return entries.some(e => e.Name === project);
   }
 
   /**
@@ -315,14 +357,25 @@ export class SandboxLifecycle {
     return { exists: true, dirty: dirty > 0, unpushed: unpushed > 0 };
   }
 
-  private async worktreeExists(spec: SandboxUpSpec): Promise<boolean> {
+  /** Refuse a slug whose worktree or compose project already exists (see {@link up}). */
+  private async assertSlugFree(spec: SandboxUpSpec): Promise<void> {
+    const taken = (what: string): Error =>
+      new Error(
+        `Sandbox up refused: ${what} already exists. Another run's sandbox has the slug ` +
+          `'${spec.slug}' (a long workflow name truncates the run's timestamp out of the slug), ` +
+          'and a sandbox is never reused. Reclaim that sandbox (`archon isolation cleanup`, or ' +
+          'abandon its run), then run this again.'
+      );
     const { stdout } = await this.run(
       spec,
       'worktree probe',
       `if [ -e ${shq(`${spec.worktree}/.git`)} ]; then echo ${WORKTREE_EXISTS_MARKER}; fi`,
       { timeoutMs: GIT_TIMEOUT_MS }
     );
-    return stdout.includes(WORKTREE_EXISTS_MARKER);
+    if (stdout.includes(WORKTREE_EXISTS_MARKER)) throw taken(`worktree ${spec.worktree}`);
+    if (await this.composeProjectExists(spec.project)) {
+      throw taken(`compose project ${spec.project}`);
+    }
   }
 
   /**
