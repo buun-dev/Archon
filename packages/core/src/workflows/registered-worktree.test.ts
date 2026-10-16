@@ -3,17 +3,19 @@
  * repo-kind sandbox's isolation row. The provider and the store are fakes passed as
  * arguments, so this file needs no module mocks.
  */
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, mock, test } from 'bun:test';
 import { toBranchName, toRepoPath } from '@archon/git';
 import {
   classifyIsolationError,
   type ContainerEnvironment,
   type CreateEnvironmentParams,
+  type DestroyResult,
   type IContainerIsolationProvider,
   type IIsolationStore,
   type IsolationEnvironmentRow,
   type TaskIsolationRequest,
 } from '@archon/isolation';
+import { getLogLevel, setLogLevel, setLogSink } from '@archon/paths';
 import { createRegisteredContainerEnv } from './registered-worktree';
 
 const request: TaskIsolationRequest = {
@@ -42,9 +44,13 @@ function notUsed(method: string): never {
   throw new Error(`${method} is not part of registration`);
 }
 
-/** A provider whose `create` is the one method registration may call. */
+/**
+ * A provider whose `create` registration calls, and whose `destroy` it calls only to
+ * tear down a sandbox it could not record.
+ */
 function fakeProvider(
-  create: (request: TaskIsolationRequest) => Promise<ContainerEnvironment>
+  create: (request: TaskIsolationRequest) => Promise<ContainerEnvironment>,
+  destroy: (workingPath: string) => Promise<DestroyResult> = () => notUsed('destroy')
 ): IContainerIsolationProvider {
   return {
     providerType: 'container',
@@ -56,9 +62,17 @@ function fakeProvider(
     writeBackBackend: () => notUsed('writeBackBackend'),
     stop: () => notUsed('stop'),
     inspect: () => notUsed('inspect'),
-    destroy: () => notUsed('destroy'),
+    destroy,
   };
 }
+
+const TORN_DOWN: DestroyResult = {
+  worktreeRemoved: true,
+  branchDeleted: null,
+  remoteBranchDeleted: null,
+  directoryClean: true,
+  warnings: [],
+};
 
 /** A store that records every row it is asked to create. */
 function fakeStore(): Pick<IIsolationStore, 'create'> & { rows: CreateEnvironmentParams[] } {
@@ -144,5 +158,58 @@ describe('createRegisteredContainerEnv', () => {
     expect((error as Error).message).toBe(classifyIsolationError(failure));
     expect((error as Error).cause).toBe(failure);
     expect(store.rows).toEqual([]);
+  });
+
+  test('destroys the sandbox and rethrows the row error when the row write fails', async () => {
+    const rowError = new Error('database is locked');
+    const destroy = mock((_workingPath: string) => Promise.resolve(TORN_DOWN));
+
+    const error = await createRegisteredContainerEnv(
+      { create: () => Promise.reject(rowError) },
+      {
+        request,
+        provider: fakeProvider(() => Promise.resolve(env), destroy),
+        createdByPlatform: 'cli',
+      }
+    ).then(
+      () => undefined,
+      (cause: unknown) => cause
+    );
+
+    expect(error).toBe(rowError);
+    expect(destroy.mock.calls).toEqual([[env.workingPath]]);
+  });
+
+  test('a teardown that fails is logged and never masks the row error', async () => {
+    const rowError = new Error('database is locked');
+    const events: { msg?: string; workingPath?: string; project?: string }[] = [];
+    const level = getLogLevel();
+    setLogLevel('info');
+    setLogSink(line => events.push(JSON.parse(line) as (typeof events)[number]));
+
+    try {
+      const error = await createRegisteredContainerEnv(
+        { create: () => Promise.reject(rowError) },
+        {
+          request,
+          provider: fakeProvider(
+            () => Promise.resolve(env),
+            () => Promise.reject(new Error('compose down: daemon gone'))
+          ),
+          createdByPlatform: 'cli',
+        }
+      ).then(
+        () => undefined,
+        (cause: unknown) => cause
+      );
+
+      expect(error).toBe(rowError);
+      expect(
+        events.filter(event => event.msg === 'container_env.unrecorded_sandbox_destroy_failed')
+      ).toEqual([expect.objectContaining({ workingPath: env.workingPath, project: env.project })]);
+    } finally {
+      setLogSink(undefined);
+      setLogLevel(level);
+    }
   });
 });
