@@ -193,7 +193,7 @@ const mockLogger = {
 
 const mockDetachedTargetStop = mock((): Promise<void> => Promise.resolve());
 const mockDetachedTargetRelease = mock((): undefined => undefined);
-const mockReclaimContainerEnv = mock((): Promise<void> => Promise.resolve());
+const mockReclaimContainerEnv = mock(() => Promise.resolve({ kind: 'reclaimed' as const }));
 const mockRequestDetachedRunStop = mock<typeof RunOwnerStop.requestDetachedRunStop>(() =>
   Promise.resolve({ pid: 4242, stop: mockDetachedTargetStop, release: mockDetachedTargetRelease })
 );
@@ -12722,7 +12722,7 @@ describe('workflowCancelCommand', () => {
     mockDetachedTargetStop.mockResolvedValue();
     mockDetachedTargetRelease.mockClear();
     mockReclaimContainerEnv.mockReset();
-    mockReclaimContainerEnv.mockResolvedValue();
+    mockReclaimContainerEnv.mockResolvedValue({ kind: 'reclaimed' });
 
     const workflowDb = require('@archon/core/db/workflows');
     const isolationDb = require('@archon/core/db/isolation-environments');
@@ -12833,8 +12833,9 @@ describe('workflowCancelCommand', () => {
     mockDetachedTargetStop.mockImplementation(async (): Promise<void> => {
       order.push('terminate-owner');
     });
-    mockReclaimContainerEnv.mockImplementation(async (): Promise<void> => {
+    mockReclaimContainerEnv.mockImplementation(async () => {
       order.push('reclaim-container');
+      return { kind: 'reclaimed' as const };
     });
     (workflowDb.cancelWorkflowRun as ReturnType<typeof mock>).mockImplementation(
       async (): Promise<{ cancelled: boolean }> => {

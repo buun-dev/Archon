@@ -259,16 +259,32 @@ async function reclaimRepoSandbox(
 }
 
 /**
- * Immediately reclaim (destroy) one container isolation environment by id, so an
- * abandoned or cancelled container run's resources don't wait for the reaper. A
- * missing row is a no-op. Throws when the teardown fails or cannot be confirmed;
- * the caller surfaces it.
+ * What {@link reclaimContainerEnv} did with an environment.
+ * - `reclaimed`: nothing of it is left to keep — torn down now, already gone, or no
+ *   row at all.
+ * - `held`: a repo sandbox keeps unsaved work. Its stack is stopped; its worktree,
+ *   `sandbox/<slug>` branch and active row stay. `reason` is {@link heldWorkReason}'s
+ *   wording: what is held, where, and how the operator releases it. A hold is not a
+ *   failure; callers report it as a warning.
+ */
+export type ContainerReclaimOutcome = { kind: 'reclaimed' } | { kind: 'held'; reason: string };
+
+/**
+ * Immediately reclaim one container isolation environment by id, so an abandoned,
+ * cancelled or reset container run's resources don't wait for the reaper. A missing
+ * row is a no-op. Throws when the teardown fails or cannot be confirmed; the caller
+ * surfaces it.
  *
  * Routes on the codebase kind (see containerEnvKind). A folder env goes through
  * ContainerBackend, which throws on a genuine docker failure (the placeholder
- * config is unused by `destroy`). A repo sandbox is torn down by its provider and
- * marked destroyed only after a fresh inspection (see reclaimRepoSandbox). The
- * codebase reader is injectable so a file-backed host reads its own records.
+ * config is unused by `destroy`). A repo sandbox is inspected first: work that exists
+ * only in it is never discarded by an operator action, as the reaper and a closed
+ * conversation never discard it, so a sandbox with uncommitted changes or unpushed
+ * commits only has its stack stopped and is reported `held`. An inspect that cannot
+ * answer keeps the row too (fail closed), stops the stack best-effort, and throws.
+ * Only a sandbox holding nothing is torn down, and marked destroyed after a fresh
+ * inspection (see reclaimRepoSandbox). The codebase reader is injectable so a
+ * file-backed host reads its own records.
  */
 export async function reclaimContainerEnv(
   envId: string,
@@ -276,27 +292,69 @@ export async function reclaimContainerEnv(
   readers: { getCodebase: typeof codebaseDb.getCodebase } = {
     getCodebase: codebaseDb.getCodebase,
   }
-): Promise<void> {
+): Promise<ContainerReclaimOutcome> {
   const env = await store.getById(envId);
   if (!env) {
     // Without the row nothing addresses the resources; ContainerBackend.destroy
     // no-ops the same way.
     getLog().warn({ envId }, 'container_reclaim_row_missing');
-    return;
+    return { kind: 'reclaimed' };
   }
   const reason = unknownPlatformReason(env.created_by_platform);
   if (reason) throw new Error(reason);
   if ((await containerEnvKind(env, readers.getCodebase)) === 'repo') {
     // Already confirmed gone: no teardown to repeat, no distro round trip.
-    if (env.status === 'destroyed') return;
-    await reclaimRepoSandbox(env, repoSandboxProvider(), store);
-    return;
+    if (env.status === 'destroyed') return { kind: 'reclaimed' };
+    return reclaimRepoSandboxUnlessHeld(env, repoSandboxProvider(), store);
   }
   const backend = new ContainerBackend({
     store,
     config: CLEANUP_PLACEHOLDER_CONTAINER_CONFIG,
   });
   await backend.destroy(envId);
+  return { kind: 'reclaimed' };
+}
+
+/** The repo half of {@link reclaimContainerEnv}: keep held work, else reclaim. */
+async function reclaimRepoSandboxUnlessHeld(
+  env: Pick<IsolationEnvironmentRow, 'id' | 'working_path'>,
+  sandbox: ContainerProvider,
+  store: Pick<IIsolationStore, 'updateStatus'>
+): Promise<ContainerReclaimOutcome> {
+  const subject = `repo sandbox ${env.id} at ${env.working_path}`;
+  let inspection: SandboxInspection;
+  try {
+    inspection = await sandbox.inspect(env.working_path);
+  } catch (err) {
+    getLog().warn({ err, envId: env.id }, 'container_sandbox_reclaim_inspect_failed');
+    // Whatever the sandbox holds, its run is over: free the stack's memory if we can.
+    await sandbox.stop(env.working_path).catch((stopErr: unknown) => {
+      getLog().warn({ err: stopErr, envId: env.id }, 'container_sandbox_reclaim_stop_failed');
+    });
+    throw new Error(
+      `The ${subject} could not be inspected for unsaved work, so it is kept: ${(err as Error).message}`,
+      { cause: err }
+    );
+  }
+  const held = heldWorkReason(inspection, env.working_path);
+  if (!held) {
+    await reclaimRepoSandbox(env, sandbox, store);
+    return { kind: 'reclaimed' };
+  }
+  if (inspection.stackExists) {
+    try {
+      await sandbox.stop(env.working_path);
+    } catch (err) {
+      getLog().warn({ err, envId: env.id }, 'container_sandbox_reclaim_stop_failed');
+      throw new Error(
+        `The ${subject} is kept for its unsaved work, but could not stop its stack: ` +
+          `${(err as Error).message}. ${held}`,
+        { cause: err }
+      );
+    }
+  }
+  getLog().info({ envId: env.id }, 'container_sandbox_reclaim_held_work');
+  return { kind: 'held', reason: held };
 }
 
 /**
@@ -332,8 +390,9 @@ export async function listContainerEnvironments(): Promise<readonly ContainerEnv
 /**
  * What a sandbox holds that exists nowhere else, and how the operator releases it,
  * or null when it holds nothing. The teardown deletes the worktree and its
- * `sandbox/<slug>` branch, so the automatic paths (the reaper, a closed
- * conversation) keep such a sandbox; only abandon and cancel discard it.
+ * `sandbox/<slug>` branch, so every path that could tear one down keeps such a
+ * sandbox: the reaper, a closed conversation, and abandon, cancel and `/reset`
+ * through reclaimContainerEnv.
  */
 function heldWorkReason(inspection: SandboxInspection, workingPath: string): string | null {
   if (!inspection.worktreeExists || (!inspection.dirty && !inspection.unpushed)) return null;

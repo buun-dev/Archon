@@ -55,7 +55,7 @@ async function setup(): Promise<void> {
     },
     isRunOwnedByThisProcess: () => false,
     isRunOwnerAnswering: async () => false,
-    reclaimContainerEnv: async () => {},
+    reclaimContainerEnv: async () => ({ kind: 'reclaimed' as const }),
     reclaimRunWorktree: async () => ({ warnings: [] }),
   });
 }

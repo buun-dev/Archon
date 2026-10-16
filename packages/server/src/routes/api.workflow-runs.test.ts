@@ -511,7 +511,7 @@ const mockResolveRunWorkflow = mock<typeof resolveRunWorkflow>(async () => ({
 }));
 // Capture the real class before mock.module replaces the module.
 import { DetachedRunOwnerUnavailableError as RealDetachedRunOwnerUnavailableError } from '@archon/core/services/run-owner-stop';
-const mockReclaimContainerEnv = mock(async () => {});
+const mockReclaimContainerEnv = mock(async () => ({ kind: 'reclaimed' as const }));
 mock.module('@archon/core/services/cleanup-service', () => ({
   reclaimRunWorktree: async () => ({ warnings: [] }),
   reclaimContainerEnv: mockReclaimContainerEnv,

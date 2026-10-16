@@ -1171,10 +1171,13 @@ without repeating cancellation.
 
 Managed container reclamation is best-effort here too. A failure leaves the run
 `cancelled` and reports a warning on every abandon surface because container resources
-may remain allocated. Inspect the managed containers before retrying cleanup.
+may remain allocated. Inspect the managed containers before retrying cleanup. A repo
+sandbox that holds uncommitted changes or unpushed commits is not deleted: its stack is
+stopped and the warning says how to release it (see
+[`isolation cleanup`](#isolation-cleanup-days)).
 Successful `--json` responses include an optional `cleanupWarnings` array of warning
-strings when reclamation fails; the field is omitted when there are no cleanup
-warnings. A cleanup warning does not change `ok: true`.
+strings when reclamation fails or a sandbox is kept; the field is omitted when there are
+no cleanup warnings. A cleanup warning does not change `ok: true`.
 
 **Sub-run trees (#2121 Phase 2):** abandoning a parent that spawned `workflow:` sub-runs cascade-cancels every non-terminal descendant (children and grandchildren; already-terminal runs are left alone). These are database transitions, not process termination; an in-flight host command can continue until it returns. If part of the tree could not be reached, the command reports the count so you know descendants may still be alive. Conversely, abandoning a **child** that its parent is paused-and-blocked on strands that parent (nothing re-fires the auto-resume hook); the command surfaces the blocked parent's run id so you can `resume` it (which fails the sub-run node cleanly) or abandon it too.
 
@@ -1407,8 +1410,7 @@ the sandbox's state from Docker and from git inside the distro, never from a hos
   run and a sandbox with no run at all. Removal would delete the worktree and its branch,
   the only copy of that work. The output reports it as
   `Held: <id> — <work> in sandbox worktree <path>: push or discard that work there, then
-  re-run archon isolation cleanup`. To discard a failed run's sandbox outright, use
-  `workflow abandon`.
+  re-run archon isolation cleanup`. No Archon command discards that work for you.
 - Any other sandbox is removed past the threshold once its worktree is gone, or clean
   with every commit on a remote, a failed run's sandbox included.
 
@@ -1417,20 +1419,27 @@ worktree. When the distro cannot be reached, a check cannot answer, or the teard
 leaves something behind, the sandbox stays active and the output reports it as `Failed`
 with the reason; the next cleanup retries it.
 
-Three other events tear a repo sandbox down the same way: `workflow abandon`,
-`workflow cancel`, and closing the issue or pull request whose conversation owns it.
-Each deletes the sandbox's worktree **and** its `sandbox/<slug>` branch, as cleanup's own
-teardown does. Abandon and cancel do so even when the branch has unpushed commits, which
-are then lost. This differs from `workflow abandon` on a worktree run, which keeps the
-branch.
+Four other events reclaim a repo sandbox: `workflow abandon`, `workflow cancel`, `/reset`
+in a chat (which abandons the conversation's resumable runs), and closing the issue or
+pull request whose conversation owns it. All of them keep unsaved work, as cleanup does;
+only a sandbox with nothing unsaved is deleted.
 
-- Abandon and cancel are explicit discards: they do not check for unsaved work.
-- Closing the issue or pull request holds unsaved work, as `isolation cleanup` does. A
-  sandbox whose worktree has uncommitted changes or unpushed commits is kept, along with
-  the conversation's reference to it, and the close reports
+- The sandbox is checked first, inside the distro. A worktree with uncommitted changes or
+  unpushed commits is kept, with its `sandbox/<slug>` branch and its record.
+- On abandon, cancel and `/reset` the run is still cancelled. The sandbox's stack is
+  stopped to free its memory, and the command prints a warning:
+  `Kept the sandbox of run <run-id> (environment <id>): <work> in sandbox worktree <path>:
+  push or discard that work there, then re-run archon isolation cleanup. Its stack is
+  stopped; the run is cancelled.` Once the work is pushed or discarded,
+  `archon isolation cleanup` removes the sandbox.
+- Closing the issue or pull request also keeps the conversation's reference to the
+  sandbox, and reports
   `Conversation cleanup retained environment <id>: <work> in sandbox worktree <path>: …`.
-  If the check cannot answer, the sandbox is kept too. Only a sandbox with nothing
-  unsaved is torn down.
+- If the check cannot answer, the sandbox is kept too. Abandon and `/reset` warn that it
+  could not be reclaimed; cancel refuses and leaves the run unchanged.
+- A sandbox with nothing unsaved is deleted, worktree **and** `sandbox/<slug>` branch, as
+  cleanup's own teardown does. Its commits are all on a remote by then. This differs from
+  `workflow abandon` on a worktree run, which keeps the branch.
 
 Project deletion (`DELETE /api/codebases/{id}`) returns `409` while active container
 environments remain. The error lists their environment IDs and the cleanup command.

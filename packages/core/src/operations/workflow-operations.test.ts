@@ -72,8 +72,12 @@ const mockDeleteWorkflowNodeSessions = mock<IWorkflowStore['deleteWorkflowNodeSe
 );
 
 const mockReclaimContainerEnv = mock<WorkflowOperationsDeps['reclaimContainerEnv']>(() =>
-  Promise.resolve()
+  Promise.resolve({ kind: 'reclaimed' })
 );
+/** What a sandbox holding unsaved work reports, as `heldWorkReason` words it. */
+const HELD_REASON =
+  'unpushed commits in sandbox worktree /home/u/archon/worktrees/repo/task-x: push or ' +
+  'discard that work there, then re-run `archon isolation cleanup`';
 
 import { DetachedRunOwnerUnavailableError } from '../services/run-owner-stop';
 /** What the stop path reports when nothing listens at the run's endpoint. */
@@ -2093,7 +2097,7 @@ describe('abandonWorkflow', () => {
     mockCancelWorkflowRun.mockClear();
     mockCancelWorkflowRun.mockImplementation(() => Promise.resolve({ cancelled: true }));
     mockReclaimContainerEnv.mockClear();
-    mockReclaimContainerEnv.mockImplementation(() => Promise.resolve());
+    mockReclaimContainerEnv.mockImplementation(() => Promise.resolve({ kind: 'reclaimed' }));
     mockFindChildRuns.mockClear();
     mockFindChildRuns.mockImplementation(() => Promise.resolve([]));
     mockRequestDetachedRunStop.mockClear();
@@ -2287,6 +2291,26 @@ describe('abandonWorkflow', () => {
     mockCancelWorkflowRun.mockImplementationOnce(() => Promise.resolve({ cancelled: false }));
     await expect(abandonWorkflow('run-1', operator)).rejects.toThrow('changed before abandonment');
     expect(mockReclaimContainerEnv).not.toHaveBeenCalled();
+  });
+
+  // A hold is not a failure: the run is cancelled, the sandbox keeps its unsaved work
+  // with its stack stopped, and the operator is told how to release it.
+  test('reports a sandbox that keeps unsaved work as a warning, the run still cancelled', async () => {
+    mockGetWorkflowRun.mockResolvedValueOnce(
+      makePausedRun({
+        status: 'paused',
+        metadata: { isolation: 'container', isolation_env_id: 'env-9' },
+      })
+    );
+    mockReclaimContainerEnv.mockImplementationOnce(async () => ({
+      kind: 'held',
+      reason: HELD_REASON,
+    }));
+    const { cancelled, cleanupWarnings } = await abandonWorkflow('run-1', operator);
+    expect(cancelled).toBe(true);
+    expect(cleanupWarnings).toEqual([
+      `Kept the sandbox of run run-1 (environment env-9): ${HELD_REASON}. Its stack is stopped; the run is cancelled.`,
+    ]);
   });
 
   test('reports a reclaim failure after committing abandonment', async () => {
@@ -2495,7 +2519,9 @@ describe('supplied stores', () => {
       metadata: {},
     }));
     const isolation = { ...isolationStore, getById };
-    const cleanup = mock<WorkflowOperationsDeps['reclaimContainerEnv']>(async () => {});
+    const cleanup = mock<WorkflowOperationsDeps['reclaimContainerEnv']>(async () => ({
+      kind: 'reclaimed',
+    }));
     const cancelled = mock<IWorkflowStore['cancelWorkflowRun']>(async () => ({ cancelled: true }));
     const stop = mock(async () => {});
     const operations = createWorkflowOperations({
@@ -2524,6 +2550,15 @@ describe('supplied stores', () => {
     cancelled.mockClear();
     await expect(operations.cancelWorkflow(run.id, operator)).rejects.toThrow('Docker unavailable');
     expect(cancelled).not.toHaveBeenCalled();
+
+    // A sandbox that keeps unsaved work is stopped, not a failure: the run is cancelled
+    // and the hold is reported.
+    cleanup.mockImplementation(async () => ({ kind: 'held', reason: HELD_REASON }));
+    const held = await operations.cancelWorkflow(run.id, operator);
+    expect(cancelled).toHaveBeenCalledTimes(1);
+    expect(held.kind === 'stopped' ? held.cleanupWarnings : undefined).toEqual([
+      `Kept the sandbox of run ${run.id} (environment supplied-env): ${HELD_REASON}. Its stack is stopped; the run is cancelled.`,
+    ]);
   });
 });
 
@@ -2845,7 +2880,7 @@ describe('abandonResumableRunsForConversation', () => {
     mockFindChildRuns.mockClear();
     mockFindChildRuns.mockImplementation(() => Promise.resolve([]));
     mockReclaimContainerEnv.mockClear();
-    mockReclaimContainerEnv.mockImplementation(() => Promise.resolve());
+    mockReclaimContainerEnv.mockImplementation(() => Promise.resolve({ kind: 'reclaimed' }));
   });
 
   test('reports zero when the conversation has nothing resumable', async () => {
@@ -2908,9 +2943,31 @@ describe('abandonResumableRunsForConversation', () => {
     expect(mockReclaimContainerEnv.mock.calls.map(call => call[0])).toEqual(['env-a', 'env-b']);
   });
 
+  test('reset reports a sandbox that keeps unsaved work, and abandons the run', async () => {
+    mockCancelResumableRunsForConversation.mockResolvedValueOnce([
+      makePausedRun({
+        id: 'container-a',
+        metadata: { isolation: 'container', isolation_env_id: 'env-a' },
+      }),
+    ]);
+    mockReclaimContainerEnv.mockImplementationOnce(async () => ({
+      kind: 'held',
+      reason: HELD_REASON,
+    }));
+
+    const result = await abandonResumableRunsForConversation('conv-1', operator);
+
+    expect(result.abandoned).toBe(1);
+    expect(result.cleanupWarnings).toEqual([
+      `Kept the sandbox of run container-a (environment env-a): ${HELD_REASON}. Its stack is stopped; the run is cancelled.`,
+    ]);
+  });
+
   test('reset uses its supplied isolation store and reports each failed reclaim while continuing', async () => {
     const sentinel: IIsolationStore = { ...isolationStore };
-    const reclaim = mock<WorkflowOperationsDeps['reclaimContainerEnv']>(async () => {});
+    const reclaim = mock<WorkflowOperationsDeps['reclaimContainerEnv']>(async () => ({
+      kind: 'reclaimed',
+    }));
     reclaim.mockRejectedValueOnce(new Error('docker down'));
     const operations = createWorkflowOperations({
       getUserRole: async () => undefined,

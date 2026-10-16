@@ -251,6 +251,7 @@ const mockSandboxDestroy = mock<Isolation.ContainerProvider['destroy']>(() =>
 const mockSandboxInspect = mock<Isolation.ContainerProvider['inspect']>(() =>
   Promise.resolve(LIVE_CLEAN)
 );
+const mockSandboxStop = mock<Isolation.ContainerProvider['stop']>(() => Promise.resolve());
 const mockSandboxDeps = mock((deps: Isolation.ContainerProviderDeps) => deps);
 class MockContainerProvider {
   constructor(deps: Isolation.ContainerProviderDeps) {
@@ -258,6 +259,7 @@ class MockContainerProvider {
   }
   destroy = mockSandboxDestroy;
   inspect = mockSandboxInspect;
+  stop = mockSandboxStop;
 }
 mock.module('@archon/isolation', () => ({
   getIsolationProvider: () => ({
@@ -399,6 +401,8 @@ function makeStore(
 /** Reset the sandbox provider to "torn down cleanly": live and clean before, gone after. */
 function resetSandbox(): void {
   mockSandboxDeps.mockClear();
+  mockSandboxStop.mockReset();
+  mockSandboxStop.mockImplementation(() => Promise.resolve());
   mockSandboxDestroy.mockReset();
   mockSandboxDestroy.mockImplementation(() => Promise.resolve(TORN_DOWN));
   mockSandboxInspect.mockReset();
@@ -458,13 +462,95 @@ describe('reclaimContainerEnv', () => {
     await reclaimContainerEnv('env-repo', store);
 
     expect(mockSandboxDestroy).toHaveBeenCalledWith(SANDBOX_PATH);
-    // Confirmed AFTER the teardown, by a fresh probe.
-    expect(mockSandboxInspect).toHaveBeenCalledWith(SANDBOX_PATH);
+    // Inspected for held work BEFORE the teardown, and confirmed AFTER it by a fresh probe.
+    expect(mockSandboxInspect).toHaveBeenCalledTimes(2);
+    expect(mockSandboxInspect.mock.invocationCallOrder[0]).toBeLessThan(
+      mockSandboxDestroy.mock.invocationCallOrder[0] ?? 0
+    );
     expect(mockSandboxDestroy.mock.invocationCallOrder[0]).toBeLessThan(
-      mockSandboxInspect.mock.invocationCallOrder[0] ?? 0
+      mockSandboxInspect.mock.invocationCallOrder[1] ?? 0
     );
     expect(store.updateStatus).toHaveBeenCalledWith('env-repo', 'destroyed');
     expect(mockContainerDestroy).not.toHaveBeenCalled();
+    expect(mockSandboxStop).not.toHaveBeenCalled();
+  });
+
+  // Abandon, cancel and /reset reach here. The teardown deletes the worktree and its
+  // `sandbox/<slug>` branch, so work that exists only there is kept, exactly as the
+  // reaper and a closed conversation keep it; the stack is stopped to free its memory.
+  describe('held work', () => {
+    beforeEach(() => {
+      mockGetCodebase.mockImplementation(() => Promise.resolve(makeCodebase({ kind: 'repo' })));
+    });
+
+    test.each([
+      ['unpushed commits', { ...LIVE_CLEAN, unpushed: true }],
+      ['uncommitted changes', { ...LIVE_CLEAN, dirty: true }],
+      ['uncommitted changes and unpushed commits', { ...LIVE_CLEAN, dirty: true, unpushed: true }],
+    ])(
+      'a sandbox with %s keeps its worktree, branch and row, and its stack is stopped',
+      async (work, inspection: Isolation.SandboxInspection) => {
+        mockSandboxInspect.mockImplementation(() => Promise.resolve(inspection));
+        const store = makeStore(repoRow);
+
+        const outcome = await reclaimContainerEnv('env-repo', store);
+
+        expect(outcome).toEqual({ kind: 'held', reason: heldReason(work) });
+        expect(mockSandboxStop).toHaveBeenCalledWith(SANDBOX_PATH);
+        expect(mockSandboxDestroy).not.toHaveBeenCalled();
+        expect(store.updateStatus).not.toHaveBeenCalled();
+      }
+    );
+
+    test('a held sandbox whose stack is already gone is kept without a stop', async () => {
+      mockSandboxInspect.mockImplementation(() =>
+        Promise.resolve({ ...LIVE_CLEAN, stackExists: false, unpushed: true })
+      );
+      const store = makeStore(repoRow);
+
+      const outcome = await reclaimContainerEnv('env-repo', store);
+
+      expect(outcome).toEqual({ kind: 'held', reason: heldReason('unpushed commits') });
+      expect(mockSandboxStop).not.toHaveBeenCalled();
+      expect(mockSandboxDestroy).not.toHaveBeenCalled();
+    });
+
+    test('a held sandbox whose stack will not stop is refused, still kept', async () => {
+      mockSandboxInspect.mockImplementation(() =>
+        Promise.resolve({ ...LIVE_CLEAN, unpushed: true })
+      );
+      mockSandboxStop.mockImplementation(() => Promise.reject(new Error('daemon down')));
+      const store = makeStore(repoRow);
+
+      await expect(reclaimContainerEnv('env-repo', store)).rejects.toThrow(
+        /kept.*could not stop its stack: daemon down/s
+      );
+      expect(mockSandboxDestroy).not.toHaveBeenCalled();
+      expect(store.updateStatus).not.toHaveBeenCalled();
+    });
+
+    test('a clean sandbox is reclaimed as before', async () => {
+      const store = makeStore(repoRow);
+
+      expect(await reclaimContainerEnv('env-repo', store)).toEqual({ kind: 'reclaimed' });
+      expect(mockSandboxDestroy).toHaveBeenCalledWith(SANDBOX_PATH);
+      expect(store.updateStatus).toHaveBeenCalledWith('env-repo', 'destroyed');
+    });
+
+    test('an inspect that cannot answer keeps the row, stops the stack best-effort, and throws', async () => {
+      mockSandboxInspect.mockImplementation(() =>
+        Promise.reject(new Error('docker compose ls did not answer with JSON'))
+      );
+      mockSandboxStop.mockImplementation(() => Promise.reject(new Error('daemon down')));
+      const store = makeStore(repoRow);
+
+      await expect(reclaimContainerEnv('env-repo', store)).rejects.toThrow(
+        /could not be inspected for unsaved work, so it is kept.*did not answer with JSON/s
+      );
+      expect(mockSandboxStop).toHaveBeenCalledWith(SANDBOX_PATH);
+      expect(mockSandboxDestroy).not.toHaveBeenCalled();
+      expect(store.updateStatus).not.toHaveBeenCalled();
+    });
   });
 
   test('reads the codebase through the supplied reader, so a file-backed host routes too', async () => {
@@ -544,8 +630,11 @@ describe('reclaimContainerEnv', () => {
     });
 
     test('keeps the row active when the confirming inspect throws', async () => {
+      // The held-work inspect answers; only the confirmation after the teardown fails.
       mockSandboxInspect.mockImplementation(() =>
-        Promise.reject(new Error('docker compose ls did not answer with JSON'))
+        mockSandboxDestroy.mock.calls.length > 0
+          ? Promise.reject(new Error('docker compose ls did not answer with JSON'))
+          : Promise.resolve(LIVE_CLEAN)
       );
       const store = makeStore(repoRow);
 

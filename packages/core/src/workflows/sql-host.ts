@@ -51,7 +51,7 @@ export function createSqlWorkflowOperations(
     },
     reclaimContainerEnv: async (envId, isolation) => {
       const { reclaimContainerEnv } = await import('../services/cleanup-service');
-      await reclaimContainerEnv(envId, isolation);
+      return reclaimContainerEnv(envId, isolation);
     },
   });
 }

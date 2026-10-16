@@ -450,7 +450,7 @@ mock.module('../services/run-owner-stop', () => ({
   DetachedRunOwnerUnavailableError: RealDetachedRunOwnerUnavailableError,
 }));
 
-const mockReclaimContainerEnv = mock(async () => {});
+const mockReclaimContainerEnv = mock(async () => ({ kind: 'reclaimed' as const }));
 const mockGetLiveRunBlocker = mock<typeof CleanupService.getLiveRunBlocker>(() =>
   Promise.resolve(null)
 );

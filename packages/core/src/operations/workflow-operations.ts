@@ -73,6 +73,7 @@ import {
 import type { isRunOwnedByThisProcess, isRunOwnerAnswering } from '../services/run-live-owner';
 import { hostname } from 'node:os';
 import type {
+  ContainerReclaimOutcome,
   reclaimRunWorktree as ReclaimRunWorktree,
   ReleasedWorktree,
   RunWorktreeRelease,
@@ -1067,7 +1068,7 @@ export interface WorkflowOperationsDeps {
   requestDetachedRunStop: typeof requestDetachedRunStop;
   isRunOwnedByThisProcess: typeof isRunOwnedByThisProcess;
   isRunOwnerAnswering: typeof isRunOwnerAnswering;
-  reclaimContainerEnv: (envId: string, store: IIsolationStore) => Promise<void>;
+  reclaimContainerEnv: (envId: string, store: IIsolationStore) => Promise<ContainerReclaimOutcome>;
   reclaimRunWorktree: typeof ReclaimRunWorktree;
 }
 
@@ -1272,7 +1273,12 @@ export function createWorkflowOperations({
     }
   }
 
-  /** Reclaim a container owned by a run this process successfully cancelled. */
+  /**
+   * Reclaim a container owned by a run this process successfully cancelled. Abandon,
+   * cancel and `/reset` all land here once the run is cancelled, and every surface
+   * prints the returned warnings: a failed reclaim, or a repo sandbox kept for its
+   * unsaved work (a hold, not a failure — the run stays cancelled either way).
+   */
   async function reclaimCancelledRunContainer(run: WorkflowRun): Promise<string[]> {
     if (
       run.metadata?.isolation !== 'container' ||
@@ -1280,12 +1286,20 @@ export function createWorkflowOperations({
     ) {
       return [];
     }
+    const envId = run.metadata.isolation_env_id;
+    let outcome: ContainerReclaimOutcome;
     try {
-      await reclaimContainerEnv(run.metadata.isolation_env_id, hostStore.isolation);
+      outcome = await reclaimContainerEnv(envId, hostStore.isolation);
     } catch (err) {
       getLog().warn({ err, runId: run.id }, 'operations.workflow_abandon_container_reclaim_failed');
       return [
-        `Could not reclaim container environment ${run.metadata.isolation_env_id} for run ${run.id}; resources may remain allocated. Inspect the managed containers before retrying cleanup.`,
+        `Could not reclaim container environment ${envId} for run ${run.id}; resources may remain allocated. Inspect the managed containers before retrying cleanup.`,
+      ];
+    }
+    if (outcome.kind === 'held') {
+      getLog().info({ runId: run.id, envId }, 'operations.workflow_abandon_sandbox_held');
+      return [
+        `Kept the sandbox of run ${run.id} (environment ${envId}): ${outcome.reason}. Its stack is stopped; the run is cancelled.`,
       ];
     }
     return [];
@@ -1725,6 +1739,9 @@ export function createWorkflowOperations({
     }
 
     if (containerEnvId) {
+      // Confirms the container is stopped before `cancelled` is recorded. A repo sandbox
+      // kept for its unsaved work is stopped too; the reclaim after the record below
+      // finds it held again and reports that.
       try {
         await reclaimContainerEnv(containerEnvId, hostStore.isolation);
       } catch (error) {
