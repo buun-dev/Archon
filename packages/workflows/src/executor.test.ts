@@ -183,6 +183,7 @@ import {
 import { resolveWorkflow } from './graph-plan';
 import { keepAwake } from './utils/keep-awake';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
+import { PI_AUTH_JSON_RELATIVE_PATH } from './deps';
 import type { IWorkflowStore } from './store';
 import type {
   ResolvedWorkflow,
@@ -4587,6 +4588,101 @@ describe('executeWorkflow', () => {
       );
       const configArg = mockExecuteDagWorkflow.mock.calls[0]?.[0].config;
       expect(configArg?.protectedCredentialValues).toEqual(['persisted-user-token']);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Provider credential file lifecycle
+  //
+  // A file-delivered credential (Pi `auth.json`) is a readable secret under the
+  // run's artifacts dir. It must not outlive a run nothing will resume, and must
+  // survive a pause, which re-enters the run-start clear on resume.
+  // -------------------------------------------------------------------------
+
+  describe('provider credential file lifecycle', () => {
+    const CREDENTIAL = 'pi-oauth-secret';
+    const artifactsDir = wsPath('_cwd', 'tmp', 'artifacts', 'runs', 'run-123');
+    const piAuthPath = join(artifactsDir, PI_AUTH_JSON_RELATIVE_PATH);
+
+    /** Deps whose delivery writes a Pi auth.json under the dir it is handed. */
+    function makeDeliveringDeps(store: IWorkflowStore): WorkflowDeps {
+      return {
+        ...makeDeps(store),
+        isPerUserProviderKeysEnabled: () => true,
+        getUserProviderEnv: mock(async (_userId: string, dir: string) => ({
+          env: { ARCHON_PI_AUTH_PATH: join(dir, PI_AUTH_JSON_RELATIVE_PATH) },
+          files: [{ path: join(dir, PI_AUTH_JSON_RELATIVE_PATH), contents: CREDENTIAL }],
+          protectedValues: [CREDENTIAL],
+        })),
+      };
+    }
+
+    function storeWithStatus(status: 'paused' | 'failed' | 'cancelled'): IWorkflowStore {
+      return makeStore({
+        getWorkflowRun: mock(async () => ({ ...makeRun(), status })),
+        getWorkflowRunStatus: mock(async () => status),
+      });
+    }
+
+    function run(deps: WorkflowDeps, options: ExecuteWorkflowOptions = {}) {
+      return executeWorkflow(
+        deps,
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow(),
+        'msg',
+        { conversationId: 'db-c1', userId: 'u-1' },
+        options
+      );
+    }
+
+    afterEach(async () => {
+      await removeTempTree(dirname(piAuthPath));
+    });
+
+    it('removes the managed credential file when the run completes', async () => {
+      // makeStore's default run finishes 'completed'.
+      await run(makeDeliveringDeps(makeStore()));
+      await expect(readFile(piAuthPath, 'utf8')).rejects.toThrow();
+    });
+
+    it('removes the managed credential file when the run fails', async () => {
+      await run(makeDeliveringDeps(storeWithStatus('failed')));
+      await expect(readFile(piAuthPath, 'utf8')).rejects.toThrow();
+    });
+
+    it('removes the managed credential file when the run is cancelled', async () => {
+      await run(makeDeliveringDeps(storeWithStatus('cancelled')));
+      await expect(readFile(piAuthPath, 'utf8')).rejects.toThrow();
+    });
+
+    it('removes the managed credential file when the engine throws', async () => {
+      mockExecuteDagWorkflow.mockImplementationOnce(async () => {
+        throw new Error('engine blew up');
+      });
+      const result = await run(makeDeliveringDeps(makeStore()));
+      expect(result.success).toBe(false);
+      await expect(readFile(piAuthPath, 'utf8')).rejects.toThrow();
+    });
+
+    it('keeps the managed credential file while the run is paused', async () => {
+      await run(makeDeliveringDeps(storeWithStatus('paused')));
+      expect(await readFile(piAuthPath, 'utf8')).toBe(CREDENTIAL);
+    });
+
+    it('delivers the file again to a resumed run, and clears it when that run completes', async () => {
+      let onDiskDuringDag = '';
+      mockExecuteDagWorkflow.mockImplementationOnce(async () => {
+        onDiskDuringDag = await readFile(piAuthPath, 'utf8');
+        return undefined;
+      });
+      await run(makeDeliveringDeps(makeStore()), {
+        preCreatedRun: makeRun({ user_id: 'u-1' }),
+        priorCompletedNodes: new Map([['node1', { output: 'out' }]]),
+      });
+      expect(onDiskDuringDag).toBe(CREDENTIAL);
+      await expect(readFile(piAuthPath, 'utf8')).rejects.toThrow();
     });
   });
 

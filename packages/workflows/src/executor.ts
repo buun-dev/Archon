@@ -367,13 +367,34 @@ async function resolveUserGithubEnvForWorkflow(
 }
 
 /**
- * Remove file-delivered credentials left by an earlier invocation of this run.
- * A resume must not keep a readable credential after it has been disconnected
- * or after fresh credential resolution fails.
+ * Remove this run's file-delivered credentials.
+ *
+ * Called at both ends of an invocation. At run start it removes what an earlier
+ * invocation left, so a resume cannot keep a readable credential after it has
+ * been disconnected or after fresh resolution fails. At run end it removes what
+ * THIS invocation delivered, once the run reached a status nothing resumes from.
  */
 async function clearManagedProviderCredentialFiles(artifactsDir: string): Promise<void> {
   for (const relativePath of MANAGED_PROVIDER_CREDENTIAL_RELATIVE_PATHS) {
     await rm(join(artifactsDir, relativePath), { force: true });
+  }
+}
+
+/**
+ * Run-end clear. A failure must not replace the result the run already produced,
+ * so it is logged (error and path only, never a credential value) and swallowed.
+ */
+async function clearManagedProviderCredentialFilesAtExit(
+  artifactsDir: string,
+  workflowRunId: string
+): Promise<void> {
+  try {
+    await clearManagedProviderCredentialFiles(artifactsDir);
+  } catch (error) {
+    getLog().error(
+      { err: error as Error, workflowRunId },
+      'workflow.user_provider_files_terminal_cleanup_failed'
+    );
   }
 }
 
@@ -3484,6 +3505,17 @@ export async function executeWorkflow(
 
     // executeDagWorkflow throws on fatal errors; check DB status for result
     const finalStatus = await deps.store.getWorkflowRun(workflowRun.id);
+    // A run nothing will resume must not leave its provider credential readable on
+    // disk. `paused` is a live run at a gate and re-enters the run-start clear on
+    // resume; an unreadable status leaves the file rather than act on a record that
+    // no longer describes the run.
+    if (
+      finalStatus?.status === 'completed' ||
+      finalStatus?.status === 'failed' ||
+      finalStatus?.status === 'cancelled'
+    ) {
+      await clearManagedProviderCredentialFilesAtExit(artifactsDir, workflowRun.id);
+    }
     // Sub-run re-entry (#2121 Phase 2): if this run is a `workflow:` child that just
     // reached a terminal state, re-enter its paused parent in-process. Guarded to be
     // a no-op on the synchronous first-run path (parent still 'running').
@@ -3583,6 +3615,9 @@ export async function executeWorkflow(
     // event, or the user's failure notification. Terminal telemetry is reported by
     // the run store after the write commits.
     //
+    // The run is failing: its credential file must not outlive it.
+    await clearManagedProviderCredentialFilesAtExit(artifactsDir, workflowRun.id);
+
     // Log to file (separate from database - non-blocking)
     try {
       await logWorkflowError(logDir, workflowRun.id, err.message);
