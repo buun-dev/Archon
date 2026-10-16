@@ -113,13 +113,35 @@ It needs a Windows host with WSL2 and Docker Desktop, plus:
 
 - the WSL distro named by `isolation.container.distro` (default `Ubuntu`);
 - a clone of the repo inside that distro, under `isolation.container.repoRoot`, which the sandbox cuts its worktrees from;
-- the runner image named by `isolation.container.image` on the Docker daemon.
+- the runner image named by `isolation.container.image` on the Docker daemon;
+- three shared cache volumes: `archon-playwright` (Playwright browsers), `archon-uv` and `archon-bun` (package caches). Archon's compose file declares them `external: true` so a teardown's `compose down -v` can never delete them, which also means compose never creates them. Create them once per machine, owned by uid 1000 (the agent's user), with any small image:
 
-A dispatch whose provider is misspelled, or whose machine lacks any of these, is refused before any run, worktree or stack exists, and the error names the setting to correct.
+  ```bash
+  docker volume create archon-playwright
+  docker volume create archon-uv
+  docker volume create archon-bun
+  docker run --rm -v archon-playwright:/p -v archon-uv:/u -v archon-bun:/b alpine chown 1000:1000 /p /u /b
+  ```
 
-Each run cuts a fresh `sandbox/<slug>` branch from the base branch. `--branch`, `--from` and PR checkouts are refused, and a workflow with a durable wait is refused because a continuation cannot rewire the container. Only providers with the `containerExec` capability run inside it, which today means Claude (see [Provider support](#provider-support)).
+A dispatch whose provider is misspelled, or whose machine lacks the distro, the clone or the image, is refused before any run, worktree or stack exists, and the error names the setting to correct. The preflight does not check or create the volumes: a missing one fails the run's `compose up`, after its worktree is cut, and the run tears down what it made.
 
-A run that completes or fails, or is interrupted with Ctrl-C, **stops** its stack, so the agent and the repo's services give their memory back. The worktree and its branch stay: they are the run's output. A paused run keeps its stack, and the engine stops only the agent while the run waits. `archon isolation cleanup` reclaims the sandboxes of finished runs.
+The repo must gitignore `.worktree-ports.json`. The sandbox writes that handshake file into every worktree, and an untracked file counts as uncommitted work: without the ignore entry every sandbox looks dirty, so cleanup, abandon and cancel keep it forever.
+
+Each run cuts a fresh `sandbox/<slug>` branch from the base branch. `--branch`, `--from` and PR checkouts are refused. So is a workflow with a durable wait, because a continuation cannot rewire the container, and a workflow with a `workflow:` sub-run (fan-out included), because a child run would execute on the host, outside the container. Only providers with the `containerExec` capability run inside it, which today means Claude (see [Provider support](#provider-support)).
+
+After provisioning, a default-deny egress firewall clamps the agent before any node runs. A stopped stack loses its firewall rules, so every resume applies the firewall again after starting the stack, and a resume whose firewall fails is refused with the run left as it was.
+
+A run that completes or fails, or is interrupted with Ctrl-C, **stops** its stack, so the agent and the repo's services give their memory back. The worktree and its branch stay: they are the run's output. A paused run keeps its stack, and the engine stops only the agent while the run waits. `archon isolation cleanup` reclaims the sandboxes of finished runs, and `archon isolation reap` does the same for container environments only, with a JSON report for schedulers. Neither deletes a sandbox that holds uncommitted changes or unpushed commits, and neither do `workflow abandon`, `workflow cancel` or `/reset`: they stop its stack and report how to release the work (see [`isolation cleanup`](/reference/cli/#isolation-cleanup-days)).
+
+### Launch from the CLI only
+
+Only `archon workflow run` provisions a sandbox, and only the CLI continues a sandbox run: `archon workflow resume`, and `approve`, `reject`, `respond` and `answer`, which resume inline. Every other surface refuses a repo whose config sets `isolation.provider: container`, rather than running it on the host:
+
+- a workflow dispatched from chat or the Web UI, foreground or background, fresh or continued;
+- a resource start or trigger, refused when it is prepared (no run is created) and again when it starts, in case the repo switched to the sandbox while the request waited;
+- `/worktree create`.
+
+`archon serve` and `archon workflow wake` do not continue a sandbox run either: they report it unavailable. A gate answered with `--json`, or from chat or the Web UI, stays paused until `archon workflow resume <run-id>` runs from the CLI.
 
 ## macOS / Linux notes
 

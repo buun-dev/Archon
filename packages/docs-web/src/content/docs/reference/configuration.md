@@ -494,6 +494,8 @@ isolation:
 
 The loader does not validate these values; the provider checks them where they become a decision, and refuses a misconfigured container dispatch before any run or worktree exists.
 
+With `provider: container`, only `archon workflow run` launches the repo. Chat and Web UI dispatch, resource starts and triggers, and `/worktree` refuse it instead of running it on the host; see [Launch from the CLI only](/guides/container-isolation/#launch-from-the-cli-only).
+
 The machine side lives in the global `~/.archon/config.yaml` under `isolation.container`. Every key is optional:
 
 ```yaml
