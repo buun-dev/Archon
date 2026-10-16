@@ -218,13 +218,10 @@ export async function isolationCleanupCommand(daysStale = 7): Promise<void> {
       console.log(`  Reconciled: ${id.slice(0, 8)} (no stack, no worktree)`);
     }
     for (const s of containerReport.skipped) {
-      // Held work is the one skip an operator must act on; the others resolve
-      // themselves or are platform policy.
-      console.log(
-        s.kind === 'held-work'
-          ? `  Held: ${s.id.slice(0, 8)} — ${s.reason} (commit and push it, or abandon the run to discard it)`
-          : `  Skipped: ${s.id.slice(0, 8)} — ${s.reason}`
-      );
+      // Held work is the one skip an operator must act on; its reason says how to
+      // release it. The others resolve themselves or are platform policy.
+      const label = s.kind === 'held-work' ? 'Held' : 'Skipped';
+      console.log(`  ${label}: ${s.id.slice(0, 8)} — ${s.reason}`);
     }
     for (const e of containerReport.errors) {
       console.error(`  Failed: ${e.id.slice(0, 8)} — ${e.error}`);

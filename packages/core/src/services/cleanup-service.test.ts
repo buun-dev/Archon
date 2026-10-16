@@ -733,10 +733,15 @@ describe('cleanupContainerEnvironments — repo sandboxes', () => {
     });
   });
 
+  /** The held-work reason: what is held, where, and how the operator releases it. */
+  const heldReason = (work: string): string =>
+    `${work} in sandbox worktree ${SANDBOX_PATH}: push or discard that work there, ` +
+    'then re-run `archon isolation cleanup`';
+
   test.each([
     ['uncommitted changes', { dirty: true, unpushed: false }],
     ['unpushed commits', { dirty: false, unpushed: true }],
-    ['uncommitted changes, unpushed commits', { dirty: true, unpushed: true }],
+    ['uncommitted changes and unpushed commits', { dirty: true, unpushed: true }],
   ])(
     'cleanup holds a repo sandbox with uncommitted or unpushed work (kind held-work): %s',
     async (work, held) => {
@@ -749,10 +754,48 @@ describe('cleanupContainerEnvironments — repo sandboxes', () => {
       expect(mockSandboxDestroy).not.toHaveBeenCalled();
       expect(mockUpdateStatus).not.toHaveBeenCalled();
       expect(report.skipped).toEqual([
-        { id: 'env-repo', kind: 'held-work', reason: `run a355c282 is failed: ${work}` },
+        {
+          id: 'env-repo',
+          kind: 'held-work',
+          reason: `run a355c282 is failed; ${heldReason(work)}`,
+        },
       ]);
     }
   );
+
+  // T9-e: the teardown deletes the worktree and its branch, so work that exists
+  // only in the sandbox is held whatever the run's status. A completed or
+  // cancelled run no longer claims its env, so the lock lookup answers null for
+  // it, exactly as for a row that never had a run.
+  test.each([
+    ['a completed run with unpushed commits', 'unpushed commits', { unpushed: true }],
+    ['a run-less row with a dirty worktree', 'uncommitted changes', { dirty: true }],
+  ])('holds %s past the threshold instead of destroying it', async (_shape, work, held) => {
+    mockListActiveContainerEnvironments.mockResolvedValueOnce([row(30)]);
+    mockSandboxInspect.mockImplementation(() => Promise.resolve({ ...LIVE_CLEAN, ...held }));
+
+    const report = await cleanupContainerEnvironments(7);
+
+    expect(mockSandboxDestroy).not.toHaveBeenCalled();
+    expect(mockUpdateStatus).not.toHaveBeenCalled();
+    expect(report).toEqual({
+      removed: [],
+      reconciled: [],
+      skipped: [{ id: 'env-repo', kind: 'held-work', reason: heldReason(work) }],
+      errors: [],
+    });
+  });
+
+  test('holds unsaved work before the age check, so a young sandbox reports held-work', async () => {
+    mockListActiveContainerEnvironments.mockResolvedValueOnce([row(2)]);
+    mockSandboxInspect.mockImplementation(() => Promise.resolve({ ...LIVE_CLEAN, unpushed: true }));
+
+    const report = await cleanupContainerEnvironments(7);
+
+    expect(report.skipped).toEqual([
+      { id: 'env-repo', kind: 'held-work', reason: heldReason('unpushed commits') },
+    ]);
+  });
 
   test('releases a failed run’s sandbox past the threshold once its work is clean and pushed', async () => {
     mockListActiveContainerEnvironments.mockResolvedValueOnce([row(30)]);

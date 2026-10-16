@@ -159,9 +159,9 @@ export interface ContainerEnvSummary {
 
 /**
  * Why the reaper left a container env alone this pass. `held-work` is the one an
- * operator acts on (push the work, or abandon the run); `live-run` and `age`
- * resolve themselves; `platform` is policy: the env's creating platform is
- * unregistered or retains its workspaces.
+ * operator acts on (push or discard the work in the sandbox worktree); `live-run`
+ * and `age` resolve themselves; `platform` is policy: the env's creating platform
+ * is unregistered or retains its workspaces.
  */
 export type ContainerSkipKind = 'live-run' | 'age' | 'held-work' | 'platform';
 
@@ -342,9 +342,12 @@ function ageSkipReason(daysSinceCreated: number, daysStale: number): string {
  * distro), never from a host stat:
  * - a row whose stack AND worktree are both gone is reconciled to `destroyed` at
  *   any age, failed run or not: nothing is left to claim;
- * - a failed run's sandbox is released past the threshold once its worktree is
- *   gone, or clean with every commit on a remote: its branch then holds all the
- *   run could resume from. Uncommitted or unpushed work holds it (`held-work`).
+ * - a worktree with uncommitted changes or unpushed commits holds the row
+ *   (`held-work`) whatever the run's status, or with no run: the teardown would
+ *   delete the only copy, so the operator pushes or discards it first;
+ * - otherwise the sandbox is reaped past the threshold, a failed run's included:
+ *   with its worktree gone, or clean with every commit on a remote, its branch
+ *   holds all the run could resume from.
  * A probe that cannot answer holds the row and reports why.
  */
 export async function cleanupContainerEnvironments(
@@ -478,12 +481,22 @@ async function sweepRepoSandbox(
     getLog().info({ envId: row.id, runId: failedRun?.runId }, 'container_env_ghost_reconciled');
     return;
   }
-  if (failedRun && inspection.worktreeExists && (inspection.dirty || inspection.unpushed)) {
+  // Work that exists only in the sandbox is held whatever the run's status, or with
+  // no run at all: the teardown deletes the worktree and its branch, so reaping
+  // would destroy the only copy. Only the operator can release it.
+  if (inspection.worktreeExists && (inspection.dirty || inspection.unpushed)) {
     const work = [
       ...(inspection.dirty ? ['uncommitted changes'] : []),
       ...(inspection.unpushed ? ['unpushed commits'] : []),
-    ].join(', ');
-    report.skipped.push({ id: row.id, kind: 'held-work', reason: `${failedRun.display}: ${work}` });
+    ].join(' and ');
+    const held =
+      `${work} in sandbox worktree ${row.working_path}: push or discard that work there, ` +
+      'then re-run `archon isolation cleanup`';
+    report.skipped.push({
+      id: row.id,
+      kind: 'held-work',
+      reason: failedRun ? `${failedRun.display}; ${held}` : held,
+    });
     return;
   }
   if (row.days_since_created < daysStale) {

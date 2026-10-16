@@ -1402,12 +1402,15 @@ the sandbox's state from Docker and from git inside the distro, never from a hos
 - A sandbox whose stack and worktree are both gone is **reconciled**: its record is
   marked destroyed at any age, since nothing is left to claim.
 - A running, pending or paused run's sandbox is never inspected or removed.
-- A failed run's sandbox is removed past the threshold once its worktree is gone, or
-  clean with every commit on a remote. A sandbox holding uncommitted changes or unpushed
-  commits is **held** and reported as `Held: <id> — run <id> is failed: <work>`. Push the
-  work, or `workflow abandon` the run to discard it.
-- A sandbox no run can claim is removed past the threshold, whatever its worktree holds,
-  as a folder project's container is.
+- A sandbox whose worktree holds uncommitted changes or unpushed commits is **held**,
+  whatever its run's status and at any age, including a completed, cancelled or failed
+  run and a sandbox with no run at all. Removal would delete the worktree and its branch,
+  the only copy of that work. The output reports it as
+  `Held: <id> — <work> in sandbox worktree <path>: push or discard that work there, then
+  re-run archon isolation cleanup`. To discard a failed run's sandbox outright, use
+  `workflow abandon`.
+- Any other sandbox is removed past the threshold once its worktree is gone, or clean
+  with every commit on a remote, a failed run's sandbox included.
 
 A sandbox is marked destroyed only after a fresh check finds neither its stack nor its
 worktree. When the distro cannot be reached, a check cannot answer, or the teardown

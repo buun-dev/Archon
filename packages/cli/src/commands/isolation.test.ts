@@ -1041,7 +1041,13 @@ describe('isolationCleanupCommand', () => {
       removed: ['aa271d53-0000'],
       reconciled: ['35c7d928-0000'],
       skipped: [
-        { id: 'e1e1e1e1-0000', kind: 'held-work', reason: 'run r1 is failed: unpushed commits' },
+        {
+          id: 'e1e1e1e1-0000',
+          kind: 'held-work',
+          reason:
+            'unpushed commits in sandbox worktree /home/u/archon/worktrees/repo/task-x: push or ' +
+            'discard that work there, then re-run `archon isolation cleanup`',
+        },
         { id: 'f0f0f0f0-0000', kind: 'age', reason: '2d old (< 7d threshold)' },
       ],
       errors: [{ id: 'e2e2e2e2-0000', error: 'inspect failed (NOT reaped): distro unreachable' }],
@@ -1051,8 +1057,11 @@ describe('isolationCleanupCommand', () => {
 
     expect(consoleLogSpy).toHaveBeenCalledWith('  Removed: aa271d53');
     expect(consoleLogSpy).toHaveBeenCalledWith('  Reconciled: 35c7d928 (no stack, no worktree)');
+    // The reason already says how to release the work; the CLI adds nothing that
+    // would be wrong for a run-less or completed sandbox (there is no run to abandon).
     expect(consoleLogSpy).toHaveBeenCalledWith(
-      '  Held: e1e1e1e1 — run r1 is failed: unpushed commits (commit and push it, or abandon the run to discard it)'
+      '  Held: e1e1e1e1 — unpushed commits in sandbox worktree /home/u/archon/worktrees/repo/task-x: ' +
+        'push or discard that work there, then re-run `archon isolation cleanup`'
     );
     expect(consoleLogSpy).toHaveBeenCalledWith('  Skipped: f0f0f0f0 — 2d old (< 7d threshold)');
     expect(consoleErrorSpy).toHaveBeenCalledWith(
