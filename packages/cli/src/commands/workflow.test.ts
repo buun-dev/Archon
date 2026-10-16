@@ -9486,6 +9486,28 @@ describe('workflowResumeCommand — repo container run', () => {
     expect(provider.create).not.toHaveBeenCalled();
   });
 
+  // A container repo refuses `--branch`, so the relaunch hint must not suggest the
+  // sandbox's own `sandbox/<slug>` branch.
+  it('a resume with nothing to skip suggests a fresh run, never --branch sandbox/<slug>', async () => {
+    const { executeWorkflow, hydrateResumableRun } = await import('@archon/workflows/executor');
+    const provider = makeRepoContainerProvider();
+    provider.reattach.mockImplementation(async () => reattachedSandbox());
+    await arrangeSandboxResume(provider);
+    (hydrateResumableRun as ReturnType<typeof mock>).mockResolvedValueOnce(null);
+
+    const error = await captureError(
+      workflowResumeCommand(createTestWorkflowHost(), SANDBOX.runId)
+    );
+
+    expect(error.message).toContain(
+      "Cannot resume: the prior run for 'assist' has no completed nodes and no interactive-loop state.\n" +
+        'Nothing can be skipped, so start a fresh run instead:\n' +
+        `  archon workflow run assist --supersedes ${SANDBOX.runId}`
+    );
+    expect(error.message).not.toContain('--branch');
+    expect(executeWorkflow).not.toHaveBeenCalled();
+  });
+
   // The engine suspended the agent at the gate. The answer's inline continuation is a
   // resume like any other, so it must reattach (which starts the stack and re-applies
   // the firewall) rather than run without a container context.

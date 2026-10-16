@@ -3803,10 +3803,12 @@ async function runWorkflowWithOwnedSource(
         }
         if (!admission.accepted) {
           // `--branch` is only runnable when the prior run used worktree isolation:
-          // folder projects reject worktree options outright, and an in-place repo run
-          // cannot be relaunched onto the branch its own checkout holds. A stale-running
-          // orphan cannot be superseded until it is released, so name that step first.
-          const worktreeBranch = isFolderCodebase ? undefined : resumeBranch;
+          // folder projects reject worktree options outright, an in-place repo run
+          // cannot be relaunched onto the branch its own checkout holds, and a repo
+          // sandbox refuses a named branch (it always cuts a fresh `sandbox/<slug>`). A
+          // stale-running orphan cannot be superseded until it is released, so name
+          // that step first.
+          const worktreeBranch = isFolderCodebase || repoContainer ? undefined : resumeBranch;
           const unblock = isTerminalRunStatus(resumable.status)
             ? ''
             : `The run is still marked ${resumable.status}; release it before relaunching:\n` +
