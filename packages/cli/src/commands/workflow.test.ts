@@ -9228,27 +9228,32 @@ describe('workflowRunCommand — repo container isolation', () => {
   });
 });
 
-// The fork's four cases, adapted to the isolation row a resume reads. A row carries no
-// codebase kind, and a folder container's row records provider 'container' as a repo
-// sandbox's does, so the fork's "a folder container env is host-visible" case has no
-// row-shaped form; its place goes to the providers the exception does not cover.
+// The fork's cases, over the isolation row a resume reads plus its codebase's kind: both
+// kinds of container record provider 'container', so the row alone cannot answer.
 describe('isWorkingPathHostVisible', () => {
-  it('a container env is NOT host-visible — a repo sandbox worktree lives in the WSL distro', () => {
-    expect(isWorkingPathHostVisible({ provider: 'container' })).toBe(false);
+  it('a repo container env is NOT host-visible — its worktree lives in the WSL distro', () => {
+    expect(isWorkingPathHostVisible({ provider: 'container' }, 'repo')).toBe(false);
+    // A codebase that cannot be read is not taken for a folder.
+    expect(isWorkingPathHostVisible({ provider: 'container' }, undefined)).toBe(false);
+  });
+
+  it('a FOLDER container env IS host-visible — its working path is the folder root on the host', () => {
+    expect(isWorkingPathHostVisible({ provider: 'container' }, 'folder')).toBe(true);
   });
 
   it('only a container env is excepted — every other provider is stat-able', () => {
-    expect(isWorkingPathHostVisible({ provider: 'vm' })).toBe(true);
-    expect(isWorkingPathHostVisible({ provider: 'remote' })).toBe(true);
+    expect(isWorkingPathHostVisible({ provider: 'vm' }, 'repo')).toBe(true);
+    expect(isWorkingPathHostVisible({ provider: 'remote' }, 'repo')).toBe(true);
   });
 
-  it('a worktree env is host-visible', () => {
-    expect(isWorkingPathHostVisible({ provider: 'worktree' })).toBe(true);
+  it('a worktree env is host-visible regardless of kind', () => {
+    expect(isWorkingPathHostVisible({ provider: 'worktree' }, 'repo')).toBe(true);
+    expect(isWorkingPathHostVisible({ provider: 'worktree' }, 'folder')).toBe(true);
   });
 
   it('no env row means nothing to except — stat it', () => {
-    expect(isWorkingPathHostVisible(undefined)).toBe(true);
-    expect(isWorkingPathHostVisible(null)).toBe(true);
+    expect(isWorkingPathHostVisible(undefined, 'repo')).toBe(true);
+    expect(isWorkingPathHostVisible(null, undefined)).toBe(true);
   });
 });
 
@@ -9552,6 +9557,72 @@ describe('workflowResumeCommand — repo container run', () => {
     expect(distroStats).toEqual([]);
     expect(inline).toBe(0);
     expect(detached?.message).toMatch(/Failed to start detached workflow child/);
+  });
+
+  // A folder container's row records provider 'container' too, but its working path is
+  // the folder root on the host. Both stat sites still check it, so a missing root is
+  // refused before anything reads it.
+  it('resume of a folder container run still stats its folder root and refuses a missing one early', async () => {
+    const { hydrateResumableRun } = await import('@archon/workflows/executor');
+    const workflowDb = await import('@archon/core/db/workflows');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    const isolationDb = await import('@archon/core/db/isolation-environments');
+    const folderRoot = join(tmpdir(), `archon-removed-folder-root-${randomUUID()}`);
+    const folderRun = {
+      ...sandboxRun,
+      id: 'run-folder',
+      working_path: folderRoot,
+      codebase_id: 'cb-folder',
+      metadata: { isolation: 'container', isolation_env_id: 'env-folder' },
+    };
+    (codebaseDb.getCodebase as ReturnType<typeof mock>).mockImplementation(async (id: string) =>
+      id === 'cb-folder'
+        ? { id, name: 'platform', default_cwd: folderRoot, default_branch: null, kind: 'folder' }
+        : null
+    );
+    (isolationDb.findLatestByCodebaseAndWorkingPath as ReturnType<typeof mock>).mockImplementation(
+      async (codebaseId: string, workingPath: string) =>
+        codebaseId === 'cb-folder' && workingPath === folderRoot
+          ? { ...sandboxRow, id: 'env-folder', codebase_id: 'cb-folder', working_path: folderRoot }
+          : null
+    );
+    mockFolderBackendPrepare.mockClear();
+    const statSpy = spyOn(fs, 'statSync');
+    const spawnSpy = spyOn(childProcess, 'spawn').mockImplementation(() => {
+      throw new Error('a refused --detach precheck must not spawn');
+    });
+    let inline: Error | undefined;
+    let detached: Error | undefined;
+    let rootStats = 0;
+    let spawns = 0;
+    try {
+      (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+        ...folderRun,
+      });
+      inline = await captureError(workflowResumeCommand(createTestWorkflowHost(), 'run-folder'));
+      (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+        ...folderRun,
+      });
+      detached = await captureError(
+        workflowResumeCommand(createTestWorkflowHost(), 'run-folder', undefined, undefined, true)
+      );
+    } finally {
+      rootStats = statSpy.mock.calls.filter(([path]) => path === folderRoot).length;
+      spawns = spawnSpy.mock.calls.length;
+      spawnSpy.mockRestore();
+      statSpy.mockRestore();
+    }
+
+    expect(rootStats).toBe(2);
+    expect(spawns).toBe(0);
+    expect(inline?.message).toContain(
+      `the working path from the run no longer exists: ${folderRoot}`
+    );
+    expect(detached?.message).toContain(
+      `the working path from the run no longer exists: ${folderRoot}`
+    );
+    expect(mockFolderBackendPrepare).not.toHaveBeenCalled();
+    expect(hydrateResumableRun).not.toHaveBeenCalled();
   });
 });
 

@@ -548,16 +548,18 @@ export function containerProviderDeps(repoRoot: string): ContainerProviderDeps {
 
 /**
  * Whether this process can stat a run's working path, judged by the isolation row that
- * owns it. A container row's path is the sandbox's distro path
+ * owns it and its codebase's kind. A repo container's path is the sandbox's distro path
  * (`/home/<user>/archon/worktrees/<repo>/<slug>`), which the Windows host resolves
  * drive-relative and never finds; the sandbox's `reattach` answers whether it still
- * exists. A folder container's row records `container` too and is excepted with it: the
- * row carries no codebase kind. No row means nothing to except.
+ * exists. A folder container's row records `container` too, but its path is the folder
+ * root on the host, so the kind decides. An unknown kind is not taken for a folder. No
+ * row means nothing to except.
  */
 export function isWorkingPathHostVisible(
-  env: { provider: IsolationProviderType } | null | undefined
+  env: { provider: IsolationProviderType } | null | undefined,
+  codebaseKind: Codebase['kind'] | undefined
 ): boolean {
-  return env?.provider !== 'container';
+  return !(env?.provider === 'container' && codebaseKind !== 'folder');
 }
 
 /**
@@ -1846,27 +1848,48 @@ async function resolveRunCodebase(
   return { codebase, lookupError, registrationError, registeredFolder };
 }
 
-/** The newest isolation row recorded for a run's working path, when the run has a codebase. */
-async function findWorkingPathEnv(
-  isolation: Pick<WorkflowHost['records']['isolation'], 'findLatestByCodebaseAndWorkingPath'>,
-  codebaseId: string | null,
-  workingPath: string
-): Promise<IsolationEnvironmentRow | null> {
-  if (!codebaseId) return null;
-  return isolation.findLatestByCodebaseAndWorkingPath(codebaseId, workingPath, new Date());
+/**
+ * Stat a resumed run's working path unless this host cannot see it
+ * (`isWorkingPathHostVisible`): a repo sandbox's distro path is answered for by the
+ * sandbox when the resume reattaches. Returns the run's codebase for such a path, read
+ * by the run's codebase id, never through the path; `undefined` once the path is stat'd.
+ */
+async function assertResumeWorkingPathReachable(
+  host: WorkflowHost,
+  run: Pick<WorkflowRun, 'id' | 'codebase_id'> & { working_path: string }
+): Promise<Codebase | undefined> {
+  if (!run.codebase_id) {
+    assertResumeWorkingPathExists(run.working_path);
+    return undefined;
+  }
+  const env = await host.records.isolation.findLatestByCodebaseAndWorkingPath(
+    run.codebase_id,
+    run.working_path,
+    new Date()
+  );
+  // Only a container row's visibility turns on the codebase kind.
+  const codebase =
+    env?.provider === 'container'
+      ? await host.records.codebases.getCodebase(run.codebase_id)
+      : null;
+  if (isWorkingPathHostVisible(env, codebase?.kind)) {
+    assertResumeWorkingPathExists(run.working_path);
+    return undefined;
+  }
+  if (!codebase) {
+    throw new Error(
+      `Workflow run '${run.id}' references codebase '${run.codebase_id}', ` +
+        'but that codebase no longer exists.'
+    );
+  }
+  return codebase;
 }
 
 /**
  * A resume continues in the run's own checkout. Cleanup removes a failed run's
  * worktree once its outcome is settled or stale (#4090), and nothing can recreate it.
- * A path the host cannot see (`isWorkingPathHostVisible`) is not stat'd: its sandbox
- * answers for it when the resume reattaches.
  */
-function assertResumeWorkingPathExists(
-  workingPath: string,
-  env: IsolationEnvironmentRow | null
-): void {
-  if (!isWorkingPathHostVisible(env)) return;
+function assertResumeWorkingPathExists(workingPath: string): void {
   try {
     statSync(workingPath);
   } catch (error) {
@@ -1940,22 +1963,12 @@ async function runWorkflowWithOwnedSource(
   // registered at.
   let codebaseLookupCwd = cwd;
   if (options.resume === true && continuationRun?.working_path) {
-    const env = await findWorkingPathEnv(
-      host.records.isolation,
-      continuationRun.codebase_id,
-      continuationRun.working_path
-    );
-    assertResumeWorkingPathExists(continuationRun.working_path, env);
-    if (env && !isWorkingPathHostVisible(env)) {
-      const registered = await host.records.codebases.getCodebase(env.codebase_id);
-      if (!registered) {
-        throw new Error(
-          `Workflow run '${continuationRun.id}' references codebase '${env.codebase_id}', ` +
-            'but that codebase no longer exists.'
-        );
-      }
-      codebaseLookupCwd = registered.default_cwd;
-    }
+    const sandboxCodebase = await assertResumeWorkingPathReachable(host, {
+      id: continuationRun.id,
+      codebase_id: continuationRun.codebase_id,
+      working_path: continuationRun.working_path,
+    });
+    if (sandboxCodebase) codebaseLookupCwd = sandboxCodebase.default_cwd;
   }
 
   let continuation: ResolvedContinuation | undefined;
@@ -6509,10 +6522,11 @@ export async function workflowResumeCommand(
             'Cannot determine where to resume. The run may be too old.'
         );
       }
-      assertResumeWorkingPathExists(
-        run.working_path,
-        await findWorkingPathEnv(host.records.isolation, run.codebase_id, run.working_path)
-      );
+      await assertResumeWorkingPathReachable(host, {
+        id: run.id,
+        codebase_id: run.codebase_id,
+        working_path: run.working_path,
+      });
       return run;
     });
   }
