@@ -103,8 +103,11 @@ import type {
   ExecutionContext,
   ContainerBackend,
   ContainerBackendConfig,
+  ContainerEnvironment,
   ContainerProviderDeps,
   IContainerIsolationProvider,
+  IsolationEnvironmentRow,
+  IsolationProviderType,
   TaskIsolationRequest,
 } from '@archon/isolation';
 import type { TaskBranchSelection } from '@archon/isolation';
@@ -541,6 +544,20 @@ export function containerProviderDeps(repoRoot: string): ContainerProviderDeps {
     loadRepoSandboxConfig: async () => (await loadRepoConfig(repoRoot)).isolation ?? null,
     loadHostConfig: async () => (await loadGlobalConfig()).isolation?.container ?? null,
   };
+}
+
+/**
+ * Whether this process can stat a run's working path, judged by the isolation row that
+ * owns it. A container row's path is the sandbox's distro path
+ * (`/home/<user>/archon/worktrees/<repo>/<slug>`), which the Windows host resolves
+ * drive-relative and never finds; the sandbox's `reattach` answers whether it still
+ * exists. A folder container's row records `container` too and is excepted with it: the
+ * row carries no codebase kind. No row means nothing to except.
+ */
+export function isWorkingPathHostVisible(
+  env: { provider: IsolationProviderType } | null | undefined
+): boolean {
+  return env?.provider !== 'container';
 }
 
 /**
@@ -1829,11 +1846,27 @@ async function resolveRunCodebase(
   return { codebase, lookupError, registrationError, registeredFolder };
 }
 
+/** The newest isolation row recorded for a run's working path, when the run has a codebase. */
+async function findWorkingPathEnv(
+  isolation: Pick<WorkflowHost['records']['isolation'], 'findLatestByCodebaseAndWorkingPath'>,
+  codebaseId: string | null,
+  workingPath: string
+): Promise<IsolationEnvironmentRow | null> {
+  if (!codebaseId) return null;
+  return isolation.findLatestByCodebaseAndWorkingPath(codebaseId, workingPath, new Date());
+}
+
 /**
  * A resume continues in the run's own checkout. Cleanup removes a failed run's
  * worktree once its outcome is settled or stale (#4090), and nothing can recreate it.
+ * A path the host cannot see (`isWorkingPathHostVisible`) is not stat'd: its sandbox
+ * answers for it when the resume reattaches.
  */
-function assertResumeWorkingPathExists(workingPath: string): void {
+function assertResumeWorkingPathExists(
+  workingPath: string,
+  env: IsolationEnvironmentRow | null
+): void {
+  if (!isWorkingPathHostVisible(env)) return;
   try {
     statSync(workingPath);
   } catch (error) {
@@ -1901,9 +1934,28 @@ async function runWorkflowWithOwnedSource(
   }
 
   // Before anything reads the run's checkout: codebase resolution on a removed
-  // worktree fails with a raw git error that reads as a database fault.
+  // worktree fails with a raw git error that reads as a database fault. A sandbox's
+  // distro path fails it the same way while the sandbox is alive, since git on this host
+  // cannot enter it either, so its project resolves from the checkout its codebase is
+  // registered at.
+  let codebaseLookupCwd = cwd;
   if (options.resume === true && continuationRun?.working_path) {
-    assertResumeWorkingPathExists(continuationRun.working_path);
+    const env = await findWorkingPathEnv(
+      host.records.isolation,
+      continuationRun.codebase_id,
+      continuationRun.working_path
+    );
+    assertResumeWorkingPathExists(continuationRun.working_path, env);
+    if (env && !isWorkingPathHostVisible(env)) {
+      const registered = await host.records.codebases.getCodebase(env.codebase_id);
+      if (!registered) {
+        throw new Error(
+          `Workflow run '${continuationRun.id}' references codebase '${env.codebase_id}', ` +
+            'but that codebase no longer exists.'
+        );
+      }
+      codebaseLookupCwd = registered.default_cwd;
+    }
   }
 
   let continuation: ResolvedContinuation | undefined;
@@ -2511,7 +2563,7 @@ async function runWorkflowWithOwnedSource(
     // the run path performs, because the run row needs `codebase_id` and adoption
     // cannot be judged without it. Registration is idempotent, so the child's own call
     // finds what this one registered.
-    const detachResolved = await resolveRunCodebase(host, cwd, options);
+    const detachResolved = await resolveRunCodebase(host, codebaseLookupCwd, options);
     const detachCodebase = detachResolved.codebase;
     // Never on `--json`: stdout carries one machine-readable document and nothing else.
     if (detachResolved.registeredFolder && !options.json) {
@@ -2847,7 +2899,7 @@ async function runWorkflowWithOwnedSource(
     lookupError: codebaseLookupError,
     registrationError: codebaseRegistrationError,
     registeredFolder,
-  } = await resolveRunCodebase(host, cwd, options);
+  } = await resolveRunCodebase(host, codebaseLookupCwd, options);
   if (registeredFolder) {
     console.log(
       `Registered folder project "${registeredFolder.name}" (${registeredFolder.defaultCwd})`
@@ -2882,9 +2934,10 @@ async function runWorkflowWithOwnedSource(
   // Overlay mode the backend actually mounted (fuse = unprivileged; native =
   // CAP_SYS_ADMIN, gate-bypassable). Threaded to the engine for the H4 run-start warning.
   let containerOverlayMode: 'fuse' | 'native' | undefined;
-  // A repo-kind container run's sandbox, set by its create only. The engine drives its
-  // write-back port and this process stops its stack when the run ends. `containerBackend`
-  // stays undefined for it, so no folder destroy path can tear down the run's worktree.
+  // A repo-kind container run's sandbox, set by its create or by a resume's reattach. The
+  // engine drives its write-back port and this process stops its stack when the run ends.
+  // `containerBackend` stays undefined for it, so no folder destroy path can tear down the
+  // run's worktree.
   let repoContainer:
     | (Awaited<ReturnType<typeof createRegisteredContainerEnv>> & {
         provider: IContainerIsolationProvider;
@@ -2982,6 +3035,9 @@ async function runWorkflowWithOwnedSource(
   // matches. Only a worktree-isolated run has one; the no-completed-nodes refusal
   // names it in the relaunch command it suggests (#3154).
   let resumeBranch: string | undefined;
+  // The active isolation row that owns the resumed run's working path. The isolation
+  // block below reattaches a repo sandbox through it.
+  let matchingEnv: IsolationEnvironmentRow | undefined;
   if (options.resume) {
     if (!codebase) {
       if (codebaseLookupError) {
@@ -3020,19 +3076,20 @@ async function runWorkflowWithOwnedSource(
       'workflow.resume_found_resumable'
     );
 
-    // A container run IS resumable (Phase C): the overlay lives on a persisted
-    // volume the resume rediscovers and restarts (see the folder branch below,
-    // which calls backend.resumeEnv when `resumable.metadata.isolation` is
-    // 'container'). Nothing to reject here anymore.
+    // A container run IS resumable. A folder run's overlay lives on a persisted volume
+    // the folder branch below rediscovers and restarts (backend.resumeEnv, when
+    // `resumable.metadata.isolation` is 'container'); a repo sandbox is reattached by
+    // the container branch below. Nothing to reject here anymore.
 
-    // Reuse the working path from the resumable run (checked to exist above).
+    // Reuse the working path from the resumable run (checked to exist above, or, for a
+    // sandbox's distro path, by its reattach below).
     if (resumable.working_path) {
       workingCwd = resumable.working_path;
     }
 
     // Look up the isolation environment that owns this working path (if any)
     const allEnvs = await host.records.isolation.listByCodebase(codebase.id);
-    const matchingEnv = allEnvs.find(e => e.working_path === workingCwd);
+    matchingEnv = allEnvs.find(e => e.working_path === workingCwd);
     if (matchingEnv) {
       await recordWorktreeAdoption(host.records.isolation, matchingEnv, codebase.default_cwd);
       isolationEnvId = matchingEnv.id;
@@ -3444,6 +3501,53 @@ async function runWorkflowWithOwnedSource(
           throw createError;
         }
       }
+    } else if (options.resume && codebase && matchingEnv?.provider === 'container') {
+      // A repo sandbox resumes in its own stack: `reattach` rebuilds the exec context from
+      // the working path, starting a stopped agent, and provisions nothing. The engine
+      // fails a container run resumed without its container context (D5), and the run end
+      // below stops this stack as it stops a fresh run's. Ahead of `--no-worktree`, which
+      // a resume ignores: it continues in the run's own checkout either way.
+      const selectedProvider = selectIsolationProvider(
+        'container',
+        containerProviderDeps(codebase.default_cwd)
+      );
+      if (!isContainerIsolationProvider(selectedProvider)) {
+        throw new Error("selectIsolationProvider('container') returned a non-container provider.");
+      }
+      const workingPath = matchingEnv.working_path;
+      let env: ContainerEnvironment;
+      try {
+        env = await selectedProvider.reattach(workingPath);
+      } catch (reattachError) {
+        const err = reattachError as Error;
+        getLog().error(
+          { err, envId: matchingEnv.id, workingPath },
+          'workflow.sandbox_reattach_failed'
+        );
+        // Nothing has claimed the run yet, so it is exactly as resumable as it was.
+        throw new Error(
+          `Cannot reattach to the sandbox at ${workingPath}: ${err.message}\n` +
+            'The run was not resumed. Resume it again once its stack is reachable, or start ' +
+            'a fresh run if the stack is gone.',
+          { cause: err }
+        );
+      }
+      // `workingCwd` and `isolationEnvId` already name this sandbox: the resume block
+      // matched its row by the run's working path.
+      repoContainer = { env, envId: matchingEnv.id, provider: selectedProvider };
+      execContext = env.execContext;
+      getLog().info(
+        { envId: matchingEnv.id, project: env.project },
+        'container_sandbox_reattached'
+      );
+    } else if (options.resume && resumable?.metadata?.isolation === 'container') {
+      // A repo run that executed in a sandbox with no active row left: the sandbox was
+      // reclaimed. The engine would claim the run and then fail it for arriving without
+      // its container context, so refuse here, before anything claims it.
+      throw new Error(
+        `Cannot resume: the sandbox this run executed in is no longer registered (${workingCwd}).\n` +
+          'It was reclaimed with its stack. Start a fresh run instead.'
+      );
     } else if (options.noWorktree) {
       getLog().info({ cwd }, 'workflow.running_without_isolation');
     } else if (wantsIsolation) {
@@ -6405,7 +6509,10 @@ export async function workflowResumeCommand(
             'Cannot determine where to resume. The run may be too old.'
         );
       }
-      assertResumeWorkingPathExists(run.working_path);
+      assertResumeWorkingPathExists(
+        run.working_path,
+        await findWorkingPathEnv(host.records.isolation, run.codebase_id, run.working_path)
+      );
       return run;
     });
   }

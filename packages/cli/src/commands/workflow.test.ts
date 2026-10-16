@@ -131,6 +131,7 @@ import {
   maybePrintTierNotice,
   resolveContainerBackendConfig,
   containerProviderDeps,
+  isWorkingPathHostVisible,
   pendingDurableWait,
   hasUnresolvedWriteback,
   buildNodeSummaries,
@@ -339,7 +340,8 @@ const REPO_SANDBOX = {
 /**
  * A repo container provider double. `create`, `writeBackBackend` and `stop` are what a
  * fresh run drives; `reattach` and `destroy` reject, because a fresh run that reached
- * either one would be resuming or tearing down the run's output.
+ * either one would be resuming or tearing down the run's output. A resume test answers
+ * `reattach` itself.
  */
 function makeRepoContainerProvider(
   stop = mock((_workingPath: string): Promise<void> => Promise.resolve())
@@ -352,7 +354,7 @@ function makeRepoContainerProvider(
   >;
   writeBackBackend: Mock<(workingPath: string) => unknown>;
   stop: Mock<(workingPath: string) => Promise<void>>;
-  reattach: Mock<() => Promise<never>>;
+  reattach: Mock<(workingPath: string) => Promise<unknown>>;
   destroy: Mock<() => Promise<never>>;
 } {
   const writeBack = {
@@ -387,7 +389,10 @@ function makeRepoContainerProvider(
     writeBack,
     writeBackBackend: mock((_workingPath: string): unknown => writeBack),
     stop,
-    reattach: mock(() => Promise.reject(new Error('a fresh run never reattaches'))),
+    reattach: mock(
+      (_workingPath: string): Promise<unknown> =>
+        Promise.reject(new Error('a fresh run never reattaches'))
+    ),
     destroy: mock(() => Promise.reject(new Error('a run end never destroys the sandbox'))),
   };
 }
@@ -753,6 +758,9 @@ mock.module('@archon/core/db/isolation-environments', () => ({
   // module, so omitting this would leave the REAL implementation in place and
   // open a live SQLite handle rather than failing loudly (#2240).
   listByCodebase: mock(() => Promise.resolve([])),
+  // Every resume asks it which row owns the run's working path before the host stats
+  // that path. No row: the path is stat'd as before.
+  findLatestByCodebaseAndWorkingPath: mock(() => Promise.resolve(null)),
 }));
 
 mock.module('@archon/core/db/messages', () => ({
@@ -9217,6 +9225,333 @@ describe('workflowRunCommand — repo container isolation', () => {
         exitSpy.mockRestore();
       }
     });
+  });
+});
+
+// The fork's four cases, adapted to the isolation row a resume reads. A row carries no
+// codebase kind, and a folder container's row records provider 'container' as a repo
+// sandbox's does, so the fork's "a folder container env is host-visible" case has no
+// row-shaped form; its place goes to the providers the exception does not cover.
+describe('isWorkingPathHostVisible', () => {
+  it('a container env is NOT host-visible — a repo sandbox worktree lives in the WSL distro', () => {
+    expect(isWorkingPathHostVisible({ provider: 'container' })).toBe(false);
+  });
+
+  it('only a container env is excepted — every other provider is stat-able', () => {
+    expect(isWorkingPathHostVisible({ provider: 'vm' })).toBe(true);
+    expect(isWorkingPathHostVisible({ provider: 'remote' })).toBe(true);
+  });
+
+  it('a worktree env is host-visible', () => {
+    expect(isWorkingPathHostVisible({ provider: 'worktree' })).toBe(true);
+  });
+
+  it('no env row means nothing to except — stat it', () => {
+    expect(isWorkingPathHostVisible(undefined)).toBe(true);
+    expect(isWorkingPathHostVisible(null)).toBe(true);
+  });
+});
+
+// A repo sandbox's working path is a distro path the Windows host can neither stat nor
+// enter with git (D3). A CLI resume finds the sandbox by its isolation row and reattaches
+// to it, so the engine gets the container context its resume guard requires (D5).
+describe('workflowResumeCommand — repo container run', () => {
+  const SANDBOX = {
+    runId: 'run-sandbox',
+    envId: 'env-sandbox',
+    codebaseId: 'cb-widget',
+    repoRoot: '/repos/widget',
+    workingPath: '/home/u/archon/worktrees/widget/s1',
+    project: 'archon-widget-s1',
+    containerId: 'cid-resumed',
+  } as const;
+  const sandboxRun = {
+    id: SANDBOX.runId,
+    workflow_name: 'assist',
+    status: 'failed',
+    user_message: 'hello',
+    working_path: SANDBOX.workingPath,
+    codebase_id: SANDBOX.codebaseId,
+    conversation_id: null,
+    parent_conversation_id: null,
+    metadata: { isolation: 'container', isolation_env_id: SANDBOX.envId },
+  };
+  const sandboxRow = {
+    id: SANDBOX.envId,
+    codebase_id: SANDBOX.codebaseId,
+    workflow_type: 'task',
+    workflow_id: 'assist-1',
+    provider: 'container',
+    working_path: SANDBOX.workingPath,
+    branch_name: 'sandbox/s1',
+    status: 'active',
+    created_at: new Date(),
+    created_by_platform: 'cli',
+    created_by_user_id: null,
+    metadata: { container_project: SANDBOX.project, base_branch: 'main' },
+  };
+  const widget = {
+    id: SANDBOX.codebaseId,
+    name: 'owner/widget',
+    default_cwd: SANDBOX.repoRoot,
+    default_branch: 'main',
+    kind: 'repo',
+  };
+  /** What `reattach` rebuilds from the working path: the same sandbox, its agent running. */
+  const reattachedSandbox = (): unknown => ({
+    id: SANDBOX.workingPath,
+    provider: 'container',
+    workingPath: SANDBOX.workingPath,
+    branchName: 'sandbox/s1',
+    project: SANDBOX.project,
+    execContext: { kind: 'container', containerId: SANDBOX.containerId, execUser: '1000' },
+    status: 'active',
+    createdAt: new Date(),
+    metadata: {},
+  });
+
+  let consoleSpy: ReturnType<typeof spyOn>;
+
+  beforeEach(async () => {
+    consoleSpy = spyOn(console, 'log').mockImplementation(() => {});
+    mockSelectIsolationProvider.mockClear();
+    mockStartRunLiveOwner.mockClear();
+    const { executeWorkflow, hydrateResumableRun } = await import('@archon/workflows/executor');
+    (executeWorkflow as ReturnType<typeof mock>).mockClear();
+    (hydrateResumableRun as ReturnType<typeof mock>).mockClear();
+    const workflowDb = await import('@archon/core/db/workflows');
+    (workflowDb.failWorkflowRun as ReturnType<typeof mock>).mockClear();
+    const codebaseDb = await import('@archon/core/db/codebases');
+    (codebaseDb.getCodebase as ReturnType<typeof mock>).mockImplementation(async (id: string) =>
+      id === SANDBOX.codebaseId ? widget : null
+    );
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockImplementation(
+      async (path: string) => (path === SANDBOX.repoRoot ? widget : null)
+    );
+    const isolationDb = await import('@archon/core/db/isolation-environments');
+    (isolationDb.listByCodebase as ReturnType<typeof mock>).mockImplementation(
+      async (codebaseId: string) => (codebaseId === SANDBOX.codebaseId ? [sandboxRow] : [])
+    );
+    (isolationDb.findLatestByCodebaseAndWorkingPath as ReturnType<typeof mock>).mockImplementation(
+      async (codebaseId: string, workingPath: string) =>
+        codebaseId === SANDBOX.codebaseId && workingPath === SANDBOX.workingPath ? sandboxRow : null
+    );
+    // As git on the Windows host answers for a distro path: it cannot change into it.
+    const git = await import('@archon/git');
+    (git.findRepoRoot as ReturnType<typeof mock>).mockImplementation(async (path: string) => {
+      if (path === SANDBOX.workingPath) {
+        throw new Error(
+          `Failed to find repo root for ${path}: fatal: cannot change to '${path}': ` +
+            'No such file or directory'
+        );
+      }
+      return null;
+    });
+  });
+
+  afterEach(async () => {
+    consoleSpy.mockRestore();
+    const codebaseDb = await import('@archon/core/db/codebases');
+    (codebaseDb.getCodebase as ReturnType<typeof mock>).mockImplementation(async () => null);
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockImplementation(
+      async () => null
+    );
+    const isolationDb = await import('@archon/core/db/isolation-environments');
+    (isolationDb.listByCodebase as ReturnType<typeof mock>).mockImplementation(async () => []);
+    (isolationDb.findLatestByCodebaseAndWorkingPath as ReturnType<typeof mock>).mockImplementation(
+      async () => null
+    );
+    const git = await import('@archon/git');
+    (git.findRepoRoot as ReturnType<typeof mock>).mockImplementation(async () => null);
+  });
+
+  /** One resume of the sandbox run, as far as its isolation; without a provider, short of it. */
+  async function arrangeSandboxResume(
+    provider?: ReturnType<typeof makeRepoContainerProvider>
+  ): Promise<void> {
+    const workflowDb = await import('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      ...sandboxRun,
+    });
+    mockDiscoverWorkflowsWithConfig.mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'assist', description: 'Help' })],
+      errors: [],
+    });
+    if (provider) mockSelectIsolationProvider.mockReturnValueOnce(provider);
+  }
+
+  /** The engine's half: the run has prior state to resume, and the resumed attempt ends. */
+  async function arrangeEngineResume(): Promise<void> {
+    const { executeWorkflow, hydrateResumableRun } = await import('@archon/workflows/executor');
+    (hydrateResumableRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      preCreatedRun: { ...sandboxRun },
+      priorCompletedNodes: new Map([['node-a', 'done']]),
+    });
+    (executeWorkflow as ReturnType<typeof mock>).mockResolvedValueOnce({
+      success: true,
+      workflowRunId: SANDBOX.runId,
+    });
+  }
+
+  it('resume reattaches a repo container run by its working path and threads its exec context', async () => {
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+    const core = await import('@archon/core');
+    const provider = makeRepoContainerProvider();
+    provider.reattach.mockImplementation(async () => reattachedSandbox());
+    await arrangeSandboxResume(provider);
+    await arrangeEngineResume();
+
+    await workflowResumeCommand(createTestWorkflowHost(), SANDBOX.runId);
+
+    expect(provider.reattach).toHaveBeenCalledWith(SANDBOX.workingPath);
+    // The provider reads the repo's config from the checkout the codebase is registered at.
+    expect(mockSelectIsolationProvider).toHaveBeenCalledWith('container', expect.any(Object));
+    const deps = mockSelectIsolationProvider.mock.calls.at(-1)?.[1] as ReturnType<
+      typeof containerProviderDeps
+    >;
+    const loadRepoConfig = core.loadRepoConfig as ReturnType<typeof mock>;
+    loadRepoConfig.mockClear();
+    await deps.loadConfig?.(SANDBOX.repoRoot);
+    expect(loadRepoConfig).toHaveBeenCalledWith(SANDBOX.repoRoot);
+
+    const call = (executeWorkflow as ReturnType<typeof mock>).mock.calls.at(-1);
+    const opts = call?.[7] as {
+      nodeVisibility?: string;
+      execContext?: unknown;
+      container?: unknown;
+    };
+    expect(call?.[3]).toBe(SANDBOX.workingPath);
+    expect(opts.execContext).toEqual({
+      kind: 'container',
+      containerId: SANDBOX.containerId,
+      execUser: '1000',
+    });
+    expect(opts.nodeVisibility).toBe('wsl');
+    expect(opts.container).toEqual({
+      envId: SANDBOX.envId,
+      writeBack: 'auto',
+      backend: provider.writeBack,
+    });
+    expect(provider.writeBackBackend).toHaveBeenCalledWith(SANDBOX.workingPath);
+    // A resumed run ends as a fresh one does: its stack is stopped, never destroyed.
+    expect(provider.stop).toHaveBeenCalledWith(SANDBOX.workingPath);
+    expect(provider.destroy).not.toHaveBeenCalled();
+  });
+
+  it('resume starts a stopped sandbox rather than re-provisioning', async () => {
+    const lifecycle: string[] = [];
+    const provider = makeRepoContainerProvider(
+      mock(async (workingPath: string): Promise<void> => {
+        lifecycle.push(`stop ${workingPath}`);
+      })
+    );
+    // The run's stack was stopped when its last attempt ended; reattach starts it again.
+    provider.reattach.mockImplementation(async (workingPath: string) => {
+      lifecycle.push(`start ${workingPath}`);
+      return reattachedSandbox();
+    });
+    await arrangeSandboxResume(provider);
+    await arrangeEngineResume();
+
+    await workflowResumeCommand(createTestWorkflowHost(), SANDBOX.runId);
+
+    expect(lifecycle).toEqual([`start ${SANDBOX.workingPath}`, `stop ${SANDBOX.workingPath}`]);
+    expect(provider.create).not.toHaveBeenCalled();
+  });
+
+  it('resume of a container run whose stack is gone fails with the reattach error and leaves the run resumable', async () => {
+    const { executeWorkflow, hydrateResumableRun } = await import('@archon/workflows/executor');
+    const workflowDb = await import('@archon/core/db/workflows');
+    const provider = makeRepoContainerProvider();
+    provider.reattach.mockImplementation(async () => {
+      throw new Error(
+        `Could not resolve a container id for compose project '${SANDBOX.project}' ` +
+          "(service 'agent'). Is the sandbox stack up?"
+      );
+    });
+    await arrangeSandboxResume(provider);
+
+    const error = await captureError(
+      workflowResumeCommand(createTestWorkflowHost(), SANDBOX.runId)
+    );
+
+    expect(error.message).toContain(
+      `Could not resolve a container id for compose project '${SANDBOX.project}'`
+    );
+    expect(error.message).toContain(SANDBOX.workingPath);
+    // Nothing claimed, ran or failed the run, so it is exactly as resumable as before.
+    expect(mockStartRunLiveOwner).not.toHaveBeenCalled();
+    expect(hydrateResumableRun).not.toHaveBeenCalled();
+    expect(executeWorkflow).not.toHaveBeenCalled();
+    expect(workflowDb.failWorkflowRun).not.toHaveBeenCalled();
+    // ...and nothing was provisioned or stopped in its place.
+    expect(provider.create).not.toHaveBeenCalled();
+    expect(provider.stop).not.toHaveBeenCalled();
+  });
+
+  // A reaped sandbox leaves only a destroyed row. The engine would claim such a run and
+  // then fail it for arriving without a container context; the CLI refuses it unclaimed.
+  it('resume of a container run whose sandbox was reclaimed is refused before anything claims it', async () => {
+    const { executeWorkflow, hydrateResumableRun } = await import('@archon/workflows/executor');
+    const workflowDb = await import('@archon/core/db/workflows');
+    const isolationDb = await import('@archon/core/db/isolation-environments');
+    (isolationDb.listByCodebase as ReturnType<typeof mock>).mockImplementation(async () => []);
+    (isolationDb.findLatestByCodebaseAndWorkingPath as ReturnType<typeof mock>).mockImplementation(
+      async () => ({ ...sandboxRow, status: 'destroyed' })
+    );
+    await arrangeSandboxResume();
+
+    const error = await captureError(
+      workflowResumeCommand(createTestWorkflowHost(), SANDBOX.runId)
+    );
+
+    expect(error.message).toContain(
+      `the sandbox this run executed in is no longer registered (${SANDBOX.workingPath})`
+    );
+    expect(mockSelectIsolationProvider).not.toHaveBeenCalled();
+    expect(mockStartRunLiveOwner).not.toHaveBeenCalled();
+    expect(hydrateResumableRun).not.toHaveBeenCalled();
+    expect(executeWorkflow).not.toHaveBeenCalled();
+    expect(workflowDb.failWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  it("resume does not host-stat a container run's distro working path", async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    const provider = makeRepoContainerProvider();
+    provider.reattach.mockImplementation(async () => reattachedSandbox());
+    await arrangeSandboxResume(provider);
+    await arrangeEngineResume();
+    const statSpy = spyOn(fs, 'statSync');
+    // The --detach parent checks the run before it forks; a child that cannot spawn ends
+    // the command there, after the check.
+    const child = new childProcess.ChildProcess();
+    Object.defineProperty(child, 'stdio', { value: [null, null, null, null] });
+    const spawnSpy = spyOn(childProcess, 'spawn').mockReturnValue(child);
+    const savedArgv = process.argv;
+    process.argv = ['bun', '/abs/cli.ts', 'workflow', 'resume', SANDBOX.runId, '--detach'];
+    let inline: unknown;
+    let detached: Error | undefined;
+    let distroStats: unknown[][] = [];
+    try {
+      inline = await workflowResumeCommand(createTestWorkflowHost(), SANDBOX.runId).catch(
+        (error: unknown) => error
+      );
+      (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+        ...sandboxRun,
+      });
+      detached = await captureError(
+        workflowResumeCommand(createTestWorkflowHost(), SANDBOX.runId, undefined, undefined, true)
+      );
+    } finally {
+      distroStats = statSpy.mock.calls.filter(([path]) => path === SANDBOX.workingPath);
+      process.argv = savedArgv;
+      spawnSpy.mockRestore();
+      statSpy.mockRestore();
+    }
+
+    expect(distroStats).toEqual([]);
+    expect(inline).toBe(0);
+    expect(detached?.message).toMatch(/Failed to start detached workflow child/);
   });
 });
 
