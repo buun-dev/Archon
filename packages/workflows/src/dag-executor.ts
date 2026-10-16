@@ -9333,12 +9333,14 @@ interface PersistScope {
 /**
  * Build the by-reference recovery suffix for a cold-resume warning (#1846): list
  * the typed artifacts that PRIOR invocations of this workflow+scope left in the
- * stable scope dir, as absolute file paths in the run's node form (`toNodePath`) —
- * never pasted content. Entries produced by the current run are excluded (they
- * can't recover anything the fresh session doesn't already have). Returns `''`
- * when there is nothing to point at, or when the scope dir can't be read —
- * recovery is best-effort and must never turn a successful (if cold) node into a
- * failure.
+ * stable scope dir, as absolute file paths — never pasted content. Entries
+ * produced by the current run are excluded (they can't recover anything the
+ * fresh session doesn't already have). Returns `''` when there is nothing to
+ * point at, or when the scope dir can't be read — recovery is best-effort and
+ * must never turn a successful (if cold) node into a failure.
+ *
+ * The warning reaches the operator through the platform, never a node, so the
+ * paths stay in host form even on a repo-kind container run (no `toNodePath`).
  */
 async function buildColdResumeRecoveryPointer(
   scopeArtifactsDir: string,
@@ -9362,7 +9364,7 @@ async function buildColdResumeRecoveryPointer(
     if (priorArtifacts.length === 0) return '';
     const lines = priorArtifacts.map(
       entry =>
-        `- ${entry.outputType} (\`${entry.nodeId}\`): ${toNodePath(joinPath(scopeArtifactsDir, entry.path))}`
+        `- ${entry.outputType} (\`${entry.nodeId}\`): ${joinPath(scopeArtifactsDir, entry.path)}`
     );
     return `\nArtifacts from the previous invocation are available for recovery (read on demand):\n${lines.join('\n')}`;
   } catch (err) {

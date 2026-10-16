@@ -24503,7 +24503,9 @@ describe('executeDagWorkflow -- persist_session', () => {
     expect(mockSendQueryDag.mock.calls.length).toBe(1);
   });
 
-  it('cold-resume recovery pointer names the node form', async () => {
+  // The pointer reaches the operator through the platform, never a node, so a 'wsl'
+  // run's binding must not convert it.
+  it('cold-resume recovery pointer is operator-facing and stays host form in a wsl run', async () => {
     const scopeDir = join(testDir, 'scope-artifacts');
     await writeNodeArtifact(
       scopeDir,
@@ -24546,8 +24548,8 @@ describe('executeDagWorkflow -- persist_session', () => {
     const warning = deliveredMessages(platform).find(message =>
       message.startsWith('⚠️ Node `planner`: could not resume the prior session')
     );
-    expect(warning).toContain(`- plan (\`planner\`): ${WSL_MARKER_BINDING.toNode(hostPointer)}`);
-    expect(warning).not.toContain(hostPointer);
+    expect(warning).toContain(`- plan (\`planner\`): ${hostPointer}`);
+    expect(warning).not.toContain(WSL_MARKER_BINDING.toNode(scopeDir));
   });
 
   it('cold resume with scope artifacts only from the CURRENT run → plain warning, no pointer', async () => {
