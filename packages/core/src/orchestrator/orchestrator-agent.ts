@@ -132,6 +132,10 @@ import { createWorkflowDeps } from '../workflows/store-adapter';
 import { resolveRunWorkflow } from '../workflows/resolve-run-workflow';
 import { createCodebaseChildResolver } from '../workflows/child-isolation-resolver';
 import {
+  assertRepoLaunchableOffCli,
+  SandboxRepoLaunchRefusedError,
+} from '../workflows/sandbox-launch';
+import {
   resolveRegisteredWorktree,
   resolveWorkflowAdoption,
   WorkflowAdoptionError,
@@ -805,6 +809,25 @@ async function dispatchOrchestratorWorkflowOwned(
   const userMessage = request.kind === 'resume' ? request.run.user_message : request.args;
   const parseWarnings = request.kind === 'start' ? request.parseWarnings : undefined;
   const runCwd = conversation.cwd ?? codebase.default_cwd;
+
+  // Every chat and web dispatch, foreground or background, fresh or continued, runs on
+  // the host: a fresh or reused worktree, the live checkout, or an adopted estate. A repo
+  // that runs in the WSL sandbox launches only from `archon workflow run`, so it is
+  // refused here, before isolation, a run row or a background worker exists.
+  if (codebase.kind !== 'folder') {
+    try {
+      assertRepoLaunchableOffCli(await loadRepoConfig(codebase.default_cwd));
+    } catch (error) {
+      if (!(error instanceof SandboxRepoLaunchRefusedError)) throw error;
+      getLog().info(
+        { codebaseId: codebase.id, conversationId },
+        'orchestrator.sandbox_repo_dispatch_refused'
+      );
+      await platform.sendMessage(conversationId, `⚠️ ${error.message}`);
+      return;
+    }
+  }
+
   let workflow: ResolvedWorkflow;
   if (request.kind === 'resume') {
     if (!request.run.working_path) {

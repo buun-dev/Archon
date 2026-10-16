@@ -65,6 +65,8 @@ import { resolveCodebaseForPath } from '../services/codebase-checkout-resolver';
 import { startRunLiveOwner, type RunLiveOwner } from '../services/run-live-owner';
 import { createCodebaseChildResolver } from './child-isolation-resolver';
 import { createRegisteredWorktree } from './registered-worktree';
+import { assertRepoLaunchableOffCli, SandboxRepoLaunchRefusedError } from './sandbox-launch';
+import { loadRepoConfig } from '../config/config-loader';
 
 const log = createLogger('resource-start-host');
 
@@ -169,6 +171,11 @@ async function prepareBinding(
     }
 
     const codebase = await findOrRegisterCodebase(host, cwd);
+    // Every lane below runs on the host. A repo that runs in the WSL sandbox launches
+    // only from `archon workflow run`, so it is refused before the launch is durable.
+    if (codebase.kind !== 'folder') {
+      assertRepoLaunchableOffCli(await loadRepoConfig(codebase.default_cwd));
+    }
     const requested = intent.launch.isolation;
     const pinned = workflow.worktree?.enabled;
     if (requested.kind === 'in-place' && pinned === true) {
@@ -496,6 +503,20 @@ export async function startAdmittedResourceStart(
   try {
     releaseGuard = input.guardOwnedRun?.({ runId: run.id, liveOwner });
     const deps = host.deps;
+    // Judged again at start: the repo may have moved into the WSL sandbox while the
+    // request waited for its slot. Refused before any worktree, like preparation.
+    if (codebase.kind !== 'folder') {
+      try {
+        assertRepoLaunchableOffCli(await loadRepoConfig(codebase.default_cwd));
+      } catch (error) {
+        if (!(error instanceof SandboxRepoLaunchRefusedError)) throw error;
+        await requireTerminalStatusWrite(deps.store.failWorkflowRun(run.id, error.message), {
+          workflowRunId: run.id,
+          site: 'resource_start.sandbox_repo_refused',
+        });
+        return { success: false, workflowRunId: run.id, error: error.message };
+      }
+    }
     const preparedAiConfiguration = await prepareRunAiConfiguration(
       deps,
       frozen.workflow,

@@ -29,7 +29,7 @@ import {
   getWorktreeStatusBreakdown,
 } from '../services/cleanup-service';
 import { getArchonWorkspacesPath } from '@archon/paths';
-import { loadConfig } from '../config/config-loader';
+import { loadConfig, loadRepoConfig } from '../config/config-loader';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import { resolveWorkflowName } from '@archon/workflows/router';
 import type {
@@ -53,6 +53,7 @@ import {
 } from '../operations/workflow-operations';
 import { createSqlWorkflowOperations } from '../workflows/sql-host';
 import { createRegisteredWorktree } from '../workflows/registered-worktree';
+import { assertRepoLaunchableOffCli } from '../workflows/sandbox-launch';
 import { safeDeactivateSession } from '../state/session-transitions';
 import { createLogger } from '@archon/paths';
 
@@ -346,6 +347,8 @@ async function handleWorktreeCommand(
       }
 
       try {
+        // A repo that runs in the WSL sandbox gets no host worktree; the refusal says so.
+        assertRepoLaunchableOffCli(await loadRepoConfig(mainPath));
         ensureIsolationConfigured();
         const { env, envId } = await createRegisteredWorktree(isolationEnvDb, {
           request: {

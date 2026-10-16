@@ -2511,6 +2511,46 @@ describe('workflow dispatch routing', () => {
     expect(mockCloseRunLiveOwner).toHaveBeenCalledTimes(1);
   });
 
+  // Only `archon workflow run` provisions the WSL sandbox. Every chat or web dispatch of
+  // a sandbox repo would run on the host (a worktree, the live checkout, or an adopted
+  // estate), so it is refused before isolation, a run row, or a background worker.
+  describe('a repo that runs in the WSL sandbox', () => {
+    beforeEach(() => {
+      mockLoadRepoConfig.mockReset();
+      mockLoadRepoConfig.mockImplementation(async () => ({
+        isolation: { provider: 'container', provision: 'bun install' },
+      }));
+    });
+    afterEach(() => {
+      mockLoadRepoConfig.mockReset();
+      mockLoadRepoConfig.mockImplementation(async () => ({}));
+    });
+
+    for (const [dispatch, makeAdapter] of [
+      ['foreground', makeForegroundPlatform],
+      ['background', makePlatform],
+    ] as const) {
+      test(`is refused on a ${dispatch} dispatch before anything runs`, async () => {
+        mockGetOrCreateConversation.mockResolvedValueOnce(makeDispatchConversation());
+        mockGetCodebase.mockResolvedValueOnce(makeCodebase({ default_cwd: '/repos/sandboxed' }));
+        mockHandleCommand.mockResolvedValueOnce(makeWorkflowResult());
+        const platform = makeAdapter();
+
+        await handleMessage(platform, 'conv-1', '/workflow run test-workflow', {
+          actor: operator,
+        });
+
+        expect(mockLoadRepoConfig).toHaveBeenCalledWith('/repos/sandboxed');
+        const sent = platform.sendMessage.mock.calls.map(call => String(call[1]));
+        expect(sent.some(text => text.includes('only `archon workflow run` launches'))).toBe(true);
+        expect(mockValidateAndResolveIsolation).not.toHaveBeenCalled();
+        expect(mockStartRunLiveOwner).not.toHaveBeenCalled();
+        expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+        expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
+      });
+    }
+  });
+
   test('calls executeWorkflow (not dispatchBackground) on a foreground-default adapter', async () => {
     mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
     mockGetCodebase.mockReturnValueOnce(

@@ -27,6 +27,7 @@ import { getStartReceipt, hasStartReceiptForDelivery } from '@archon/core/db/res
 import { claimPendingWorkflowRun } from '@archon/core/db/workflows';
 import {
   drainResourceStartHost,
+  ResourceStartDrainError,
   startAdmittedResourceStart,
 } from '@archon/core/workflows/resource-start-host';
 import { captureLogLines, removeTempTree } from '@archon/paths/test-utils';
@@ -677,6 +678,77 @@ describe('server resource-start host', () => {
       },
     });
     expect(admitted).toHaveLength(2);
+  });
+
+  // Only `archon workflow run` provisions the WSL sandbox; a trigger would run a sandbox
+  // repo on the host, in a worktree or in place.
+  describe('a repo that runs in the WSL sandbox', () => {
+    const SANDBOX_CONFIG = 'isolation:\n  provider: container\n  provision: bun install\n';
+
+    test.each([{ kind: 'worktree' } as const, { kind: 'in-place' } as const])(
+      'is refused at preparation (%o): no run, no worktree',
+      async isolation => {
+        const { deliver, engine } = await fixture(false, isolation);
+        const project = join(root, 'project');
+        await writeFile(join(project, '.archon', 'config.yaml'), SANDBOX_CONFIG);
+        expect((await deliver('sandboxed', 'queue')).status).toBe(200);
+
+        const admitted: string[] = [];
+        const drained = await drainResourceStartHost({
+          ...createSqlWorkflowHost(),
+          hostId: HOST_ID,
+          startAdmitted: async id => {
+            admitted.push(id);
+          },
+        }).then(
+          () => undefined,
+          (error: unknown) => error
+        );
+
+        expect(drained).toBeInstanceOf(ResourceStartDrainError);
+        const failure = (drained as ResourceStartDrainError).failures[0]?.error as Error;
+        expect(failure.message).toContain('only `archon workflow run` launches');
+        expect((await bindingOf('sandboxed')).status).toBe('rejected');
+        expect(admitted).toEqual([]);
+        expect(engine.submitted).toHaveLength(0);
+        expect(
+          (await getDatabase().query('SELECT id FROM remote_agent_workflow_runs')).rows
+        ).toEqual([]);
+        expect(
+          (await getDatabase().query('SELECT id FROM remote_agent_isolation_environments')).rows
+        ).toEqual([]);
+      }
+    );
+
+    test('switched to the sandbox after admission, the start fails its run before any worktree', async () => {
+      const { deliver, engine } = await fixture(false, { kind: 'worktree' });
+      const project = join(root, 'project');
+      expect((await deliver('drifted', 'queue')).status).toBe(200);
+      const requestId = await admitWithoutStarting();
+      await writeFile(join(project, '.archon', 'config.yaml'), SANDBOX_CONFIG);
+      const before = (
+        await execFileAsync('git', ['worktree', 'list', '--porcelain'], { cwd: project })
+      ).stdout;
+
+      const result = await startAdmittedResourceStart({
+        requestId,
+        hostId: HOST_ID,
+        host: { ...createSqlWorkflowHost(), engine },
+        createPlatform: () => new HeadlessPlatform(),
+      });
+
+      expect(result.success).toBe(false);
+      if (result.success) throw new Error('Expected the sandbox refusal');
+      expect(result.error).toContain('only `archon workflow run` launches');
+      expect((await getWorkflowRun(requestId))?.status).toBe('failed');
+      expect(engine.submitted).toHaveLength(0);
+      expect(
+        (await execFileAsync('git', ['worktree', 'list', '--porcelain'], { cwd: project })).stdout
+      ).toBe(before);
+      expect(
+        (await getDatabase().query('SELECT id FROM remote_agent_isolation_environments')).rows
+      ).toEqual([]);
+    });
   });
 
   test('two starters of one admitted request execute it once', async () => {

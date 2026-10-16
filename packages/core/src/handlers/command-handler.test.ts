@@ -22,6 +22,7 @@ import type { CleanupOperationResult } from '../services/cleanup-service';
 import {
   MissingProjectDirectoryError,
   WorktreeUncommittedChangesError,
+  assertIsolationProviderRecognized,
   worktreeRegistrationMetadata,
   readWorktreeCreationId,
   type DestroyResult,
@@ -32,6 +33,7 @@ import {
 import { join } from 'path';
 import * as fsPromises from 'fs/promises';
 import * as gitUtils from '@archon/git';
+import * as configLoader from '../config/config-loader';
 import * as workflowDiscovery from '@archon/workflows/workflow-discovery';
 import type * as CodebaseDb from '../db/codebases';
 import type * as ConversationDb from '../db/conversations';
@@ -411,6 +413,8 @@ mock.module('../isolation', () => ({
 }));
 mock.module('@archon/isolation', () => ({
   WorktreeUncommittedChangesError,
+  // The launch guard (workflows/sandbox-launch) judges the repo config with it.
+  assertIsolationProviderRecognized,
   worktreeRegistrationMetadata,
   readWorktreeCreationId,
   getIsolationProvider: () => ({
@@ -1558,6 +1562,30 @@ describe('CommandHandler', () => {
               },
             })
           );
+        });
+
+        // Only `archon workflow run` provisions the WSL sandbox; a host worktree of a
+        // sandbox repo would run its work outside the box without a word.
+        test('refuses a repo that runs in the WSL sandbox before creating anything', async () => {
+          const loadRepoConfigSpy = spyOn(configLoader, 'loadRepoConfig').mockResolvedValue({
+            isolation: { provider: 'container', provision: 'bun install' },
+          });
+          try {
+            const result = await handleCommand(
+              conversationWithCodebase,
+              '/worktree create feat-auth',
+              operator
+            );
+
+            expect(loadRepoConfigSpy).toHaveBeenCalledWith('/workspace/my-repo');
+            expect(result.success).toBe(false);
+            expect(result.message).toContain('only `archon workflow run` launches');
+            expect(mockIsolationCreate).not.toHaveBeenCalled();
+            expect(mockIsolationEnvDbCreate).not.toHaveBeenCalled();
+            expect(mockUpdateConversation).not.toHaveBeenCalled();
+          } finally {
+            loadRepoConfigSpy.mockRestore();
+          }
         });
 
         test('fails before registration when safe.directory configuration fails', async () => {
