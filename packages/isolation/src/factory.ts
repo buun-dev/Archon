@@ -54,7 +54,8 @@ export function resetIsolationProvider(): void {
  * `IsolationProviderType`, which also names providers no config can request.
  */
 const CONFIGURABLE_PROVIDERS = ['worktree', 'container'] as const;
-type ConfigurableProvider = (typeof CONFIGURABLE_PROVIDERS)[number];
+/** One of {@link CONFIGURABLE_PROVIDERS}; the repo config type derives its field from it. */
+export type ConfigurableProvider = (typeof CONFIGURABLE_PROVIDERS)[number];
 
 /**
  * Refuse an `isolation.provider` value nothing implements (slice 4, #2206:

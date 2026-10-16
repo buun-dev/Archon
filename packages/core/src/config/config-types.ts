@@ -52,7 +52,7 @@ import type {
   ProviderDefaultsMap,
 } from '@archon/providers/types';
 import type { RawAliasesConfig, RawTiersConfig } from '@archon/workflows/model-validation';
-import type { RepoSandboxConfig, SandboxHostConfig } from '@archon/isolation';
+import type { ConfigurableProvider, RepoSandboxConfig, SandboxHostConfig } from '@archon/isolation';
 import {
   workflowRunContinuationConfigSchema,
   type WorkflowRunConfigLayer,
@@ -308,7 +308,7 @@ export interface RepoConfig {
    * Neither is validated at load time (the loader is fail-soft), so the
    * provider checks them where they become a decision.
    */
-  isolation?: RepoSandboxConfig & { provider?: 'worktree' | 'container' };
+  isolation?: RepoSandboxConfig & { provider?: ConfigurableProvider };
 
   /**
    * Per-project environment variables injected into Claude SDK subprocess env.

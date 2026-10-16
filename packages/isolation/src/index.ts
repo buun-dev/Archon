@@ -104,6 +104,7 @@ export {
   selectIsolationProvider,
   assertIsolationProviderRecognized,
   isContainerIsolationProvider,
+  type ConfigurableProvider,
 } from './factory';
 
 // --- Resolver ---
