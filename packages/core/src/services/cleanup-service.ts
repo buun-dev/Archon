@@ -158,10 +158,15 @@ export interface ContainerEnvSummary {
 }
 
 /**
- * Why the reaper left a container env alone this pass. `held-work` is the one an
- * operator acts on (push or discard the work in the sandbox worktree); `live-run`
- * and `age` resolve themselves; `platform` is policy: the env's creating platform
- * is unregistered or retains its workspaces.
+ * Why the reaper left a container env alone this pass.
+ * - `held-work`: the sandbox worktree holds unsaved work; it clears once the
+ *   operator pushes or discards that work.
+ * - `live-run`: a run still claims the env. It clears when a running, pending or
+ *   paused run ends; a folder container held by a FAILED run clears only when that
+ *   run is resumed or abandoned.
+ * - `age`: younger than the threshold; clears with time.
+ * - `platform`: policy; the env's creating platform is unregistered or retains its
+ *   workspaces.
  */
 export type ContainerSkipKind = 'live-run' | 'age' | 'held-work' | 'platform';
 
@@ -324,6 +329,24 @@ export async function listContainerEnvironments(): Promise<readonly ContainerEnv
   return summaries;
 }
 
+/**
+ * What a sandbox holds that exists nowhere else, and how the operator releases it,
+ * or null when it holds nothing. The teardown deletes the worktree and its
+ * `sandbox/<slug>` branch, so the automatic paths (the reaper, a closed
+ * conversation) keep such a sandbox; only abandon and cancel discard it.
+ */
+function heldWorkReason(inspection: SandboxInspection, workingPath: string): string | null {
+  if (!inspection.worktreeExists || (!inspection.dirty && !inspection.unpushed)) return null;
+  const work = [
+    ...(inspection.dirty ? ['uncommitted changes'] : []),
+    ...(inspection.unpushed ? ['unpushed commits'] : []),
+  ].join(' and ');
+  return (
+    `${work} in sandbox worktree ${workingPath}: push or discard that work there, ` +
+    'then re-run `archon isolation cleanup`'
+  );
+}
+
 function ageSkipReason(daysSinceCreated: number, daysStale: number): string {
   return `${Math.floor(daysSinceCreated)}d old (< ${daysStale}d threshold)`;
 }
@@ -482,16 +505,9 @@ async function sweepRepoSandbox(
     return;
   }
   // Work that exists only in the sandbox is held whatever the run's status, or with
-  // no run at all: the teardown deletes the worktree and its branch, so reaping
-  // would destroy the only copy. Only the operator can release it.
-  if (inspection.worktreeExists && (inspection.dirty || inspection.unpushed)) {
-    const work = [
-      ...(inspection.dirty ? ['uncommitted changes'] : []),
-      ...(inspection.unpushed ? ['unpushed commits'] : []),
-    ].join(' and ');
-    const held =
-      `${work} in sandbox worktree ${row.working_path}: push or discard that work there, ` +
-      'then re-run `archon isolation cleanup`';
+  // no run at all. Only the operator can release it.
+  const held = heldWorkReason(inspection, row.working_path);
+  if (held) {
     report.skipped.push({
       id: row.id,
       kind: 'held-work',
@@ -589,21 +605,46 @@ export async function onConversationClosed(
     return;
   }
 
+  // Every refusal below keeps the env and this conversation's reference, in one shape.
+  const retained = (why: string, cause?: unknown): Error =>
+    new Error(
+      `Conversation cleanup retained environment ${envId}: ${why}`,
+      cause === undefined ? undefined : { cause }
+    );
+
+  let isRepoSandbox = false;
+  if (env.provider === 'container') {
+    try {
+      isRepoSandbox = (await containerEnvKind(env, codebaseDb.getCodebase)) === 'repo';
+    } catch (err) {
+      throw retained((err as Error).message, err);
+    }
+  }
+
   // A repo sandbox is reclaimed by its own teardown; removeEnvironment handles
   // worktrees only and still refuses every other container env. The live-run lock
   // above is a database read, so it holds for a sandbox exactly as for a worktree.
-  if (
-    env.provider === 'container' &&
-    (await containerEnvKind(env, codebaseDb.getCodebase)) === 'repo'
-  ) {
+  if (isRepoSandbox) {
     if (env.status !== 'destroyed') {
+      // Closing an issue or PR is an automatic event, not an operator discard. As
+      // removeEnvironment(force: false) keeps a dirty worktree, this keeps work that
+      // exists only in the sandbox, and a check that cannot answer keeps it too.
+      const sandbox = repoSandboxProvider();
+      let inspection: SandboxInspection;
       try {
-        await reclaimRepoSandbox(env, repoSandboxProvider(), isolationEnvDb.createIsolationStore());
+        inspection = await sandbox.inspect(env.working_path);
       } catch (err) {
-        throw new Error(
-          `Conversation cleanup retained environment ${envId}: ${(err as Error).message}`,
-          { cause: err }
-        );
+        throw retained(`inspect failed: ${(err as Error).message}`, err);
+      }
+      const held = heldWorkReason(inspection, env.working_path);
+      if (held) {
+        getLog().warn({ envId }, 'conversation_cleanup_sandbox_held_work');
+        throw retained(held);
+      }
+      try {
+        await reclaimRepoSandbox(env, sandbox, isolationEnvDb.createIsolationStore());
+      } catch (err) {
+        throw retained((err as Error).message, err);
       }
     }
   } else {
@@ -612,9 +653,7 @@ export async function onConversationClosed(
       deleteRemoteBranch: options?.merged,
     });
     if (result.skippedReason && result.skippedReason !== 'already destroyed') {
-      throw new Error(
-        `Conversation cleanup retained environment ${envId}: ${result.skippedReason}`
-      );
+      throw retained(result.skippedReason);
     }
   }
 

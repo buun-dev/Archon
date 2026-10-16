@@ -218,8 +218,10 @@ export async function isolationCleanupCommand(daysStale = 7): Promise<void> {
       console.log(`  Reconciled: ${id.slice(0, 8)} (no stack, no worktree)`);
     }
     for (const s of containerReport.skipped) {
-      // Held work is the one skip an operator must act on; its reason says how to
-      // release it. The others resolve themselves or are platform policy.
+      // A held-work reason says how to release the work. A live-run skip clears
+      // when its run ends, or, for a folder container held by a failed run, only
+      // when that run is resumed or abandoned; an age skip clears with time; a
+      // platform skip is policy (see ContainerSkipKind).
       const label = s.kind === 'held-work' ? 'Held' : 'Skipped';
       console.log(`  ${label}: ${s.id.slice(0, 8)} — ${s.reason}`);
     }

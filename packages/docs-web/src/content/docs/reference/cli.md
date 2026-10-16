@@ -1415,9 +1415,22 @@ the sandbox's state from Docker and from git inside the distro, never from a hos
 A sandbox is marked destroyed only after a fresh check finds neither its stack nor its
 worktree. When the distro cannot be reached, a check cannot answer, or the teardown
 leaves something behind, the sandbox stays active and the output reports it as `Failed`
-with the reason; the next cleanup retries it. Abandoning or cancelling a repo container
-run reclaims its sandbox the same way, as does closing the issue or pull request whose
-conversation owns it.
+with the reason; the next cleanup retries it.
+
+Three other events tear a repo sandbox down the same way: `workflow abandon`,
+`workflow cancel`, and closing the issue or pull request whose conversation owns it.
+Each deletes the sandbox's worktree **and** its `sandbox/<slug>` branch, as cleanup's own
+teardown does. Abandon and cancel do so even when the branch has unpushed commits, which
+are then lost. This differs from `workflow abandon` on a worktree run, which keeps the
+branch.
+
+- Abandon and cancel are explicit discards: they do not check for unsaved work.
+- Closing the issue or pull request holds unsaved work, as `isolation cleanup` does. A
+  sandbox whose worktree has uncommitted changes or unpushed commits is kept, along with
+  the conversation's reference to it, and the close reports
+  `Conversation cleanup retained environment <id>: <work> in sandbox worktree <path>: …`.
+  If the check cannot answer, the sandbox is kept too. Only a sandbox with nothing
+  unsaved is torn down.
 
 Project deletion (`DELETE /api/codebases/{id}`) returns `409` while active container
 environments remain. The error lists their environment IDs and the cleanup command.

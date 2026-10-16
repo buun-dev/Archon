@@ -372,6 +372,14 @@ import {
 /** The repo sandbox's distro path, `<worktree-root>/<repo>/<slug>`. */
 const SANDBOX_PATH = '/home/u/archon/worktrees/repo/task-assist-1';
 
+/** The held-work reason: what is held, where, and how the operator releases it. */
+function heldReason(work: string): string {
+  return (
+    `${work} in sandbox worktree ${SANDBOX_PATH}: push or discard that work there, ` +
+    'then re-run `archon isolation cleanup`'
+  );
+}
+
 /** An isolation store whose reads and writes the test controls. */
 function makeStore(
   row: IsolationEnvironmentRow | null
@@ -732,11 +740,6 @@ describe('cleanupContainerEnvironments — repo sandboxes', () => {
       errors: [],
     });
   });
-
-  /** The held-work reason: what is held, where, and how the operator releases it. */
-  const heldReason = (work: string): string =>
-    `${work} in sandbox worktree ${SANDBOX_PATH}: push or discard that work there, ` +
-    'then re-run `archon isolation cleanup`';
 
   test.each([
     ['uncommitted changes', { dirty: true, unpushed: false }],
@@ -3803,6 +3806,10 @@ describe('onConversationClosed — repo container envs', () => {
   test('a closed conversation reclaims its repo container env', async () => {
     await onConversationClosed('github', 'owner/repo#300');
 
+    // The held-work check reads the sandbox before anything is torn down.
+    expect(mockSandboxInspect.mock.invocationCallOrder[0]).toBeLessThan(
+      mockSandboxDestroy.mock.invocationCallOrder[0] ?? 0
+    );
     expect(mockSandboxDestroy).toHaveBeenCalledWith(SANDBOX_PATH);
     expect(mockUpdateStatus).toHaveBeenCalledWith('env-sandbox', 'destroyed');
     expect(mockDestroy).not.toHaveBeenCalled();
@@ -3832,6 +3839,50 @@ describe('onConversationClosed — repo container envs', () => {
       'Conversation cleanup retained environment env-sandbox'
     );
     expect(mockUpdateStatus).not.toHaveBeenCalled();
+    expect(mockUpdateConversation).not.toHaveBeenCalled();
+  });
+
+  // Closing an issue or PR is an automatic event, not an operator discard: like
+  // removeEnvironment(force: false) for a worktree, it keeps work that exists only
+  // in the sandbox, and says what is held in the reaper's words.
+  test.each([
+    ['unpushed commits', { unpushed: true }],
+    ['uncommitted changes', { dirty: true }],
+  ])(
+    'a closed conversation whose sandbox holds %s retains it',
+    async (work, held: Partial<Isolation.SandboxInspection>) => {
+      mockSandboxInspect.mockImplementation(() => Promise.resolve({ ...LIVE_CLEAN, ...held }));
+
+      await expect(onConversationClosed('github', 'owner/repo#304')).rejects.toThrow(
+        `Conversation cleanup retained environment env-sandbox: ${heldReason(work)}`
+      );
+      expect(mockSandboxDestroy).not.toHaveBeenCalled();
+      expect(mockUpdateStatus).not.toHaveBeenCalled();
+      expect(mockUpdateConversation).not.toHaveBeenCalled();
+    }
+  );
+
+  test('a sandbox whose held-work check cannot answer is retained, not reclaimed blind', async () => {
+    mockSandboxInspect.mockImplementation(() =>
+      Promise.reject(new Error('docker compose ls did not answer with JSON'))
+    );
+
+    await expect(onConversationClosed('github', 'owner/repo#305')).rejects.toThrow(
+      'Conversation cleanup retained environment env-sandbox: inspect failed: docker compose ls did not answer with JSON'
+    );
+    expect(mockSandboxDestroy).not.toHaveBeenCalled();
+    expect(mockUpdateStatus).not.toHaveBeenCalled();
+    expect(mockUpdateConversation).not.toHaveBeenCalled();
+  });
+
+  test('a container env whose codebase is gone is refused in the retained-environment shape', async () => {
+    mockGetCodebase.mockImplementation(() => Promise.resolve(null));
+
+    await expect(onConversationClosed('github', 'owner/repo#306')).rejects.toThrow(
+      `Conversation cleanup retained environment env-sandbox: Cannot choose a teardown for container environment env-sandbox: its codebase ${env.codebase_id} is not registered.`
+    );
+    expect(mockSandboxDestroy).not.toHaveBeenCalled();
+    expect(mockDestroy).not.toHaveBeenCalled();
     expect(mockUpdateConversation).not.toHaveBeenCalled();
   });
 
