@@ -81,12 +81,13 @@ export async function isolationListCommand(): Promise<void> {
     console.log(`\nTotal: ${String(totalEnvironments)} worktree environment(s)`);
   }
 
-  // Container isolation environments (folder-project container backend). These are
-  // not worktrees — they're labeled Docker containers + upper volumes. A paused
-  // run's container shows here (awaiting approve/resume) and is never auto-pruned.
+  // Container isolation environments: a folder project's labeled Docker container
+  // and upper volume, or a repo's WSL sandbox (a distro worktree plus a compose
+  // stack). Neither is a host worktree. A paused run's container shows here
+  // (awaiting approve/resume) and is never auto-pruned.
   const containers = await listContainerEnvironments();
   if (containers.length > 0) {
-    console.log('\nContainer environments (folder projects):');
+    console.log('\nContainer environments:');
     for (const c of containers) {
       const runPart = c.runId ? `run ${c.runId.slice(0, 8)} (${c.runStatus})` : 'no run (orphan)';
       console.log(`  ${c.envId.slice(0, 8)} — ${c.codebaseName}`);
@@ -199,24 +200,38 @@ export async function isolationCleanupCommand(daysStale = 7): Promise<void> {
     `\nCleanup complete: ${String(cleaned)} cleaned, ${String(skipped)} skipped, ${String(failed)} failed`
   );
 
-  // Reap orphaned container environments (terminal / run-less, older than the
-  // threshold). Paused runs' containers are deliberately skipped (awaited state).
+  // Reap orphaned container environments, folder containers and repo sandboxes
+  // alike (terminal / run-less, older than the threshold). A running, pending or
+  // paused run's container is never touched (awaited state).
   const containerReport = await cleanupContainerEnvironments(daysStale);
   const containerTotal =
-    containerReport.removed.length + containerReport.skipped.length + containerReport.errors.length;
+    containerReport.removed.length +
+    containerReport.reconciled.length +
+    containerReport.skipped.length +
+    containerReport.errors.length;
   if (containerTotal > 0) {
     console.log('\nContainer environments:');
     for (const id of containerReport.removed) {
       console.log(`  Removed: ${id.slice(0, 8)}`);
     }
+    for (const id of containerReport.reconciled) {
+      console.log(`  Reconciled: ${id.slice(0, 8)} (no stack, no worktree)`);
+    }
     for (const s of containerReport.skipped) {
-      console.log(`  Skipped: ${s.id.slice(0, 8)} — ${s.reason}`);
+      // Held work is the one skip an operator must act on; the others resolve
+      // themselves or are platform policy.
+      console.log(
+        s.kind === 'held-work'
+          ? `  Held: ${s.id.slice(0, 8)} — ${s.reason} (commit and push it, or abandon the run to discard it)`
+          : `  Skipped: ${s.id.slice(0, 8)} — ${s.reason}`
+      );
     }
     for (const e of containerReport.errors) {
       console.error(`  Failed: ${e.id.slice(0, 8)} — ${e.error}`);
     }
     console.log(
       `Container cleanup: ${String(containerReport.removed.length)} removed, ` +
+        `${String(containerReport.reconciled.length)} reconciled, ` +
         `${String(containerReport.skipped.length)} skipped, ` +
         `${String(containerReport.errors.length)} failed`
     );
@@ -306,6 +321,20 @@ export async function isolationCompleteCommand(
     if (!env) {
       console.log(`  Not found: ${branch} (no active isolation environment)`);
       notFound++;
+      continue;
+    }
+
+    // A container env's working path is a WSL distro path or a folder root, not a
+    // host worktree: every check and removal below would answer about the wrong
+    // thing. Its teardown is the container cleanup's; --force does not change that.
+    if (env.provider === 'container') {
+      console.error(
+        `  Blocked: ${branch} — container environment; complete removes worktrees only.`
+      );
+      console.error(
+        '    Reclaim it with `archon isolation cleanup 0`; cancel or abandon a workflow run that still claims it first.'
+      );
+      failed++;
       continue;
     }
 

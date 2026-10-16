@@ -1,6 +1,7 @@
 // @archon-test-isolated
 import { clearPlatformPolicies, setPlatformPolicies } from '../platforms/registry';
 import { mock, describe, test, expect, beforeEach, afterEach, afterAll, spyOn } from 'bun:test';
+import type { Mock } from 'bun:test';
 import { createMockLogger } from '../test/mocks/logger';
 import { toBranchName } from '@archon/git';
 import type {
@@ -212,12 +213,59 @@ class MockContainerBackend {
   }
   destroy = mockContainerDestroy;
 }
+// The repo-kind sandbox provider. `inspect` is asked before a teardown (the reap's
+// evidence) and after it (the confirmation); resetSandbox() answers "live and
+// clean" before `destroy` has run and "gone" after it.
+const TORN_DOWN: Isolation.DestroyResult = {
+  worktreeRemoved: true,
+  branchDeleted: null,
+  remoteBranchDeleted: null,
+  directoryClean: true,
+  warnings: [],
+};
+const DISTRO_UNREACHABLE: Isolation.DestroyResult = {
+  worktreeRemoved: false,
+  branchDeleted: null,
+  remoteBranchDeleted: null,
+  directoryClean: false,
+  warnings: [
+    'WSL distro unreachable: probe timed out; the sandbox stack and worktree were not torn down',
+  ],
+};
+/** A live stack over a clean, pushed worktree: nothing for the reap to hold. */
+const LIVE_CLEAN: Isolation.SandboxInspection = {
+  stackExists: true,
+  worktreeExists: true,
+  dirty: false,
+  unpushed: false,
+};
+const GONE: Isolation.SandboxInspection = {
+  stackExists: false,
+  worktreeExists: false,
+  dirty: false,
+  unpushed: false,
+};
+const mockSandboxDestroy = mock<Isolation.ContainerProvider['destroy']>(() =>
+  Promise.resolve(TORN_DOWN)
+);
+const mockSandboxInspect = mock<Isolation.ContainerProvider['inspect']>(() =>
+  Promise.resolve(LIVE_CLEAN)
+);
+const mockSandboxDeps = mock((deps: Isolation.ContainerProviderDeps) => deps);
+class MockContainerProvider {
+  constructor(deps: Isolation.ContainerProviderDeps) {
+    mockSandboxDeps(deps);
+  }
+  destroy = mockSandboxDestroy;
+  inspect = mockSandboxInspect;
+}
 mock.module('@archon/isolation', () => ({
   getIsolationProvider: () => ({
     destroy: mockDestroy,
   }),
   getPrState: mockGetPrState,
   ContainerBackend: MockContainerBackend,
+  ContainerProvider: MockContainerProvider,
   // Loaded transitively via the orchestrator → child-isolation-resolver (PR-A).
   classifyIsolationError: (err: Error) => err.message,
 }));
@@ -253,7 +301,7 @@ mock.module('../db/isolation-environments', () => ({
   listByCodebaseWithAge: mockListByCodebaseWithAge,
   countActiveByCodebase: mockCountActiveByCodebase,
   listActiveContainerEnvironments: mockListActiveContainerEnvironments,
-  createIsolationStore: () => ({}),
+  createIsolationStore: () => ({ getById: mockGetById, updateStatus: mockUpdateStatus }),
 }));
 
 // Mock workflows DB (getRunByIsolationEnvId — the run id/status `isolation list`
@@ -296,8 +344,14 @@ mock.module('../db/codebases', () => ({
 // Mock config-loader (loadRepoConfig) - cleanup-service consults
 // .archon/config.yaml worktree.baseBranch before falling back to git detection.
 const mockLoadRepoConfig = mock<typeof ConfigLoader.loadRepoConfig>(() => Promise.resolve({}));
+// The repo sandbox provider reads the machine's `isolation.container` section.
+const SANDBOX_HOST: Isolation.SandboxHostConfig = { distro: 'Ubuntu-24.04' };
+const mockLoadGlobalConfig = mock(() =>
+  Promise.resolve({ isolation: { container: SANDBOX_HOST } })
+);
 mock.module('../config/config-loader', () => ({
   loadRepoConfig: mockLoadRepoConfig,
+  loadGlobalConfig: mockLoadGlobalConfig,
 }));
 
 import {
@@ -315,25 +369,64 @@ import {
   type RemoveEnvironmentResult,
 } from './cleanup-service';
 
+/** The repo sandbox's distro path, `<worktree-root>/<repo>/<slug>`. */
+const SANDBOX_PATH = '/home/u/archon/worktrees/repo/task-assist-1';
+
+/** An isolation store whose reads and writes the test controls. */
+function makeStore(
+  row: IsolationEnvironmentRow | null
+): IIsolationStore & { updateStatus: Mock<IIsolationStore['updateStatus']> } {
+  return {
+    getById: async () => row,
+    findActiveByWorkflow: async () => null,
+    create: async () => {
+      throw new Error('Unexpected create');
+    },
+    updateStatus: mock<IIsolationStore['updateStatus']>(async () => {}),
+    updateMetadata: async () => undefined,
+    countActiveByCodebase: async () => 0,
+  };
+}
+
+/** Reset the sandbox provider to "torn down cleanly": live and clean before, gone after. */
+function resetSandbox(): void {
+  mockSandboxDeps.mockClear();
+  mockSandboxDestroy.mockReset();
+  mockSandboxDestroy.mockImplementation(() => Promise.resolve(TORN_DOWN));
+  mockSandboxInspect.mockReset();
+  mockSandboxInspect.mockImplementation(() =>
+    Promise.resolve(mockSandboxDestroy.mock.calls.length > 0 ? GONE : LIVE_CLEAN)
+  );
+}
+
 describe('reclaimContainerEnv', () => {
+  const folderRow = makeContainerEnvironment({ working_path: '/projects/site' });
+  const repoRow = makeEnvironment({
+    id: 'env-repo',
+    provider: 'container',
+    working_path: SANDBOX_PATH,
+  });
+
+  beforeEach(() => {
+    resetSandbox();
+    mockContainerDestroy.mockReset();
+    mockContainerDestroy.mockImplementation(() => Promise.resolve());
+    mockGetCodebase.mockReset();
+    mockGetCodebase.mockImplementation(() => Promise.resolve(makeCodebase({ kind: 'folder' })));
+  });
+  afterEach(() => {
+    mockGetCodebase.mockReset();
+    mockGetCodebase.mockImplementation(() => Promise.resolve(null));
+  });
+
   test('uses the supplied isolation store and preserves destroy failures', async () => {
-    const store: IIsolationStore = {
-      getById: async () => null,
-      findActiveByWorkflow: async () => null,
-      create: async () => {
-        throw new Error('Unexpected create');
-      },
-      updateStatus: async () => {},
-      updateMetadata: async () => undefined,
-      countActiveByCodebase: async () => 0,
-    };
+    const store = makeStore(folderRow);
     await reclaimContainerEnv('supplied-env', store);
     expect(mockContainerOptions.mock.calls.at(-1)?.[0].store).toBe(store);
     expect(mockContainerDestroy).toHaveBeenLastCalledWith('supplied-env');
-    const unknownStore = {
-      ...store,
-      getById: async () => makeContainerEnvironment({ created_by_platform: 'removed-chat' }),
-    };
+    const unknownStore = makeStore(
+      makeContainerEnvironment({ created_by_platform: 'removed-chat' })
+    );
     const destroys = mockContainerDestroy.mock.calls.length;
     await expect(reclaimContainerEnv('supplied-env', unknownStore)).rejects.toThrow(
       "platform 'removed-chat' is not registered"
@@ -341,6 +434,118 @@ describe('reclaimContainerEnv', () => {
     expect(mockContainerDestroy.mock.calls.length).toBe(destroys);
     mockContainerDestroy.mockRejectedValueOnce(new Error('Docker unavailable'));
     await expect(reclaimContainerEnv('supplied-env', store)).rejects.toThrow('Docker unavailable');
+  });
+
+  test('a missing row is a no-op: nothing addresses its resources', async () => {
+    await reclaimContainerEnv('env-gone', makeStore(null));
+
+    expect(mockContainerDestroy).not.toHaveBeenCalled();
+    expect(mockSandboxDestroy).not.toHaveBeenCalled();
+  });
+
+  test('reclaims a repo-kind container row through the sandbox provider, never the folder backend', async () => {
+    mockGetCodebase.mockImplementation(() => Promise.resolve(makeCodebase({ kind: 'repo' })));
+    const store = makeStore(repoRow);
+
+    await reclaimContainerEnv('env-repo', store);
+
+    expect(mockSandboxDestroy).toHaveBeenCalledWith(SANDBOX_PATH);
+    // Confirmed AFTER the teardown, by a fresh probe.
+    expect(mockSandboxInspect).toHaveBeenCalledWith(SANDBOX_PATH);
+    expect(mockSandboxDestroy.mock.invocationCallOrder[0]).toBeLessThan(
+      mockSandboxInspect.mock.invocationCallOrder[0] ?? 0
+    );
+    expect(store.updateStatus).toHaveBeenCalledWith('env-repo', 'destroyed');
+    expect(mockContainerDestroy).not.toHaveBeenCalled();
+  });
+
+  test('reads the codebase through the supplied reader, so a file-backed host routes too', async () => {
+    const getCodebase = mock(() => Promise.resolve(makeCodebase({ kind: 'repo' })));
+    mockGetCodebase.mockImplementation(() => Promise.resolve(makeCodebase({ kind: 'folder' })));
+
+    await reclaimContainerEnv('env-repo', makeStore(repoRow), { getCodebase });
+
+    expect(getCodebase).toHaveBeenCalledWith(repoRow.codebase_id);
+    expect(mockSandboxDestroy).toHaveBeenCalledWith(SANDBOX_PATH);
+    expect(mockContainerDestroy).not.toHaveBeenCalled();
+  });
+
+  test('the sandbox provider reads the machine config, built once per reclaim', async () => {
+    mockGetCodebase.mockImplementation(() => Promise.resolve(makeCodebase({ kind: 'repo' })));
+
+    await reclaimContainerEnv('env-repo', makeStore(repoRow));
+
+    expect(mockSandboxDeps).toHaveBeenCalledTimes(1);
+    expect(await mockSandboxDeps.mock.calls[0]?.[0].loadHostConfig?.()).toEqual(SANDBOX_HOST);
+  });
+
+  test('refuses a row whose codebase is gone rather than guess its teardown', async () => {
+    mockGetCodebase.mockImplementation(() => Promise.resolve(null));
+    const store = makeStore(repoRow);
+
+    await expect(reclaimContainerEnv('env-repo', store)).rejects.toThrow(
+      `codebase ${repoRow.codebase_id} is not registered`
+    );
+    expect(mockSandboxDestroy).not.toHaveBeenCalled();
+    expect(mockContainerDestroy).not.toHaveBeenCalled();
+    expect(store.updateStatus).not.toHaveBeenCalled();
+  });
+
+  test('an already destroyed repo row needs no teardown', async () => {
+    mockGetCodebase.mockImplementation(() => Promise.resolve(makeCodebase({ kind: 'repo' })));
+    const store = makeStore({ ...repoRow, status: 'destroyed' });
+
+    await reclaimContainerEnv('env-repo', store);
+
+    expect(mockSandboxDestroy).not.toHaveBeenCalled();
+    expect(store.updateStatus).not.toHaveBeenCalled();
+  });
+
+  // T4-e: a row marked destroyed over a live sandbox is never found by cleanup
+  // again, and Task 8 refuses to resume it. Only a fresh probe that finds
+  // nothing left may mark the row destroyed.
+  describe('confirm before destroy', () => {
+    beforeEach(() => {
+      mockGetCodebase.mockImplementation(() => Promise.resolve(makeCodebase({ kind: 'repo' })));
+    });
+
+    test.each([
+      ['compose stack', { ...GONE, stackExists: true }],
+      ['worktree', { ...GONE, worktreeExists: true }],
+    ])(
+      'keeps the row active when its %s survives the teardown',
+      async (left, after: Isolation.SandboxInspection) => {
+        mockSandboxInspect.mockImplementation(() => Promise.resolve(after));
+        const store = makeStore(repoRow);
+
+        await expect(reclaimContainerEnv('env-repo', store)).rejects.toThrow(
+          `left its ${left} behind`
+        );
+        expect(store.updateStatus).not.toHaveBeenCalled();
+      }
+    );
+
+    test('keeps the row active when destroy reports the distro unreachable', async () => {
+      mockSandboxDestroy.mockImplementation(() => Promise.resolve(DISTRO_UNREACHABLE));
+      const store = makeStore(repoRow);
+
+      await expect(reclaimContainerEnv('env-repo', store)).rejects.toThrow(
+        'WSL distro unreachable'
+      );
+      expect(store.updateStatus).not.toHaveBeenCalled();
+    });
+
+    test('keeps the row active when the confirming inspect throws', async () => {
+      mockSandboxInspect.mockImplementation(() =>
+        Promise.reject(new Error('docker compose ls did not answer with JSON'))
+      );
+      const store = makeStore(repoRow);
+
+      await expect(reclaimContainerEnv('env-repo', store)).rejects.toThrow(
+        'could not confirm the teardown'
+      );
+      expect(store.updateStatus).not.toHaveBeenCalled();
+    });
   });
 });
 
@@ -357,6 +562,15 @@ describe('cleanupContainerEnvironments — H3 fail-closed on lookup error', () =
     mockGetLiveRunOwningEnv.mockImplementation(() => Promise.resolve(null));
     mockContainerDestroy.mockReset();
     mockContainerDestroy.mockImplementation(() => Promise.resolve());
+    resetSandbox();
+    // `oldRow` is a FOLDER project's container: the reaper reads the codebase kind
+    // to choose the teardown, so the kind is stated rather than left to a default.
+    mockGetCodebase.mockReset();
+    mockGetCodebase.mockImplementation(() => Promise.resolve(makeCodebase({ kind: 'folder' })));
+  });
+  afterEach(() => {
+    mockGetCodebase.mockReset();
+    mockGetCodebase.mockImplementation(() => Promise.resolve(null));
   });
 
   test('does NOT destroy when the run lookup throws — reports the error instead', async () => {
@@ -377,7 +591,9 @@ describe('cleanupContainerEnvironments — H3 fail-closed on lookup error', () =
     );
     const report = await cleanupContainerEnvironments(7);
     expect(mockContainerDestroy).not.toHaveBeenCalled();
-    expect(report.skipped).toHaveLength(1);
+    expect(report.skipped).toEqual([
+      { id: 'env-1', kind: 'live-run', reason: 'run run-1 is paused' },
+    ]);
   });
 
   // The reaper reads the same lock the worktree sweeps use, so a failed run's
@@ -389,8 +605,11 @@ describe('cleanupContainerEnvironments — H3 fail-closed on lookup error', () =
     );
     const report = await cleanupContainerEnvironments(7);
     expect(mockContainerDestroy).not.toHaveBeenCalled();
-    expect(report.skipped).toHaveLength(1);
-    expect(report.skipped[0]?.reason).toBe('run run-1 is failed');
+    expect(report.skipped).toEqual([
+      { id: 'env-1', kind: 'live-run', reason: 'run run-1 is failed' },
+    ]);
+    // A folder container has no distro worktree; the sandbox provider is never asked.
+    expect(mockSandboxInspect).not.toHaveBeenCalled();
   });
 
   test('reaps a container no run can claim, older than the threshold', async () => {
@@ -407,6 +626,7 @@ describe('cleanupContainerEnvironments — H3 fail-closed on lookup error', () =
 
     expect(await cleanupContainerEnvironments(7)).toEqual({
       removed: [],
+      reconciled: [],
       skipped: [],
       errors: [{ id: oldRow.id, error: 'status write failed' }],
     });
@@ -422,11 +642,275 @@ describe('cleanupContainerEnvironments — H3 fail-closed on lookup error', () =
 
     expect(report).toEqual({
       removed: [],
-      skipped: [{ id: oldRow.id, reason: "platform 'matrix-chat' retains workspaces" }],
+      reconciled: [],
+      skipped: [
+        { id: oldRow.id, kind: 'platform', reason: "platform 'matrix-chat' retains workspaces" },
+      ],
       errors: [],
     });
     expect(mockGetLiveRunOwningEnv).not.toHaveBeenCalled();
     expect(mockContainerDestroy).not.toHaveBeenCalled();
+  });
+});
+
+// A repo-kind row's estate is a git worktree in the WSL distro plus a compose
+// stack; the folder ContainerBackend would throw on its metadata and leave the
+// stack running. The reaper routes on the codebase kind, inspects the sandbox
+// where it lives, and marks a row destroyed only once a fresh probe finds
+// nothing left (T4-e).
+describe('cleanupContainerEnvironments — repo sandboxes', () => {
+  const row = (days: number, id = 'env-repo'): ReturnType<typeof makeContainerEnvironment> =>
+    makeContainerEnvironment({
+      id,
+      codebase_name: 'repo',
+      working_path: SANDBOX_PATH,
+      days_since_created: days,
+    });
+  const failedRun = { id: 'a355c282-run', status: 'failed' };
+
+  beforeEach(() => {
+    resetSandbox();
+    mockListActiveContainerEnvironments.mockReset();
+    mockGetLiveRunOwningEnv.mockReset();
+    mockGetLiveRunOwningEnv.mockImplementation(() => Promise.resolve(null));
+    mockContainerDestroy.mockReset();
+    mockContainerDestroy.mockImplementation(() => Promise.resolve());
+    mockUpdateStatus.mockReset();
+    mockUpdateStatus.mockImplementation(() => Promise.resolve());
+    mockGetCodebase.mockReset();
+    mockGetCodebase.mockImplementation(() => Promise.resolve(makeCodebase({ kind: 'repo' })));
+  });
+  afterEach(() => {
+    mockGetCodebase.mockReset();
+    mockGetCodebase.mockImplementation(() => Promise.resolve(null));
+  });
+
+  test('reaps an old repo sandbox no run can claim through the sandbox provider', async () => {
+    mockListActiveContainerEnvironments.mockResolvedValueOnce([row(30)]);
+
+    const report = await cleanupContainerEnvironments(7);
+
+    expect(mockSandboxDestroy).toHaveBeenCalledWith(SANDBOX_PATH);
+    expect(mockSandboxInspect).toHaveBeenCalledTimes(2);
+    expect(mockUpdateStatus).toHaveBeenCalledWith('env-repo', 'destroyed');
+    expect(mockContainerDestroy).not.toHaveBeenCalled();
+    expect(report).toEqual({ removed: ['env-repo'], reconciled: [], skipped: [], errors: [] });
+  });
+
+  test('a folder container row still goes to ContainerBackend.destroy', async () => {
+    mockListActiveContainerEnvironments.mockResolvedValueOnce([
+      makeContainerEnvironment({ id: 'env-folder', working_path: '/projects/site' }),
+    ]);
+    mockGetCodebase.mockImplementation(() => Promise.resolve(makeCodebase({ kind: 'folder' })));
+
+    const report = await cleanupContainerEnvironments(7);
+
+    expect(mockContainerDestroy).toHaveBeenCalledWith('env-folder');
+    expect(mockSandboxDestroy).not.toHaveBeenCalled();
+    expect(mockSandboxInspect).not.toHaveBeenCalled();
+    expect(mockSandboxDeps).not.toHaveBeenCalled();
+    expect(report.removed).toEqual(['env-folder']);
+  });
+
+  test('cleanup reconciles a repo row whose stack and worktree are both gone', async () => {
+    // At any age, with or without a failed run: there is nothing left to claim.
+    mockListActiveContainerEnvironments.mockResolvedValueOnce([row(1), row(1, 'env-repo-2')]);
+    mockGetLiveRunOwningEnv.mockImplementation(id =>
+      Promise.resolve(id === 'env-repo' ? failedRun : null)
+    );
+    mockSandboxInspect.mockImplementation(() => Promise.resolve(GONE));
+
+    const report = await cleanupContainerEnvironments(7);
+
+    expect(mockSandboxDestroy).not.toHaveBeenCalled();
+    expect(mockUpdateStatus).toHaveBeenCalledWith('env-repo', 'destroyed');
+    expect(mockUpdateStatus).toHaveBeenCalledWith('env-repo-2', 'destroyed');
+    expect(report).toEqual({
+      removed: [],
+      reconciled: ['env-repo', 'env-repo-2'],
+      skipped: [],
+      errors: [],
+    });
+  });
+
+  test.each([
+    ['uncommitted changes', { dirty: true, unpushed: false }],
+    ['unpushed commits', { dirty: false, unpushed: true }],
+    ['uncommitted changes, unpushed commits', { dirty: true, unpushed: true }],
+  ])(
+    'cleanup holds a repo sandbox with uncommitted or unpushed work (kind held-work): %s',
+    async (work, held) => {
+      mockListActiveContainerEnvironments.mockResolvedValueOnce([row(30)]);
+      mockGetLiveRunOwningEnv.mockImplementation(() => Promise.resolve(failedRun));
+      mockSandboxInspect.mockImplementation(() => Promise.resolve({ ...LIVE_CLEAN, ...held }));
+
+      const report = await cleanupContainerEnvironments(7);
+
+      expect(mockSandboxDestroy).not.toHaveBeenCalled();
+      expect(mockUpdateStatus).not.toHaveBeenCalled();
+      expect(report.skipped).toEqual([
+        { id: 'env-repo', kind: 'held-work', reason: `run a355c282 is failed: ${work}` },
+      ]);
+    }
+  );
+
+  test('releases a failed run’s sandbox past the threshold once its work is clean and pushed', async () => {
+    mockListActiveContainerEnvironments.mockResolvedValueOnce([row(30)]);
+    mockGetLiveRunOwningEnv.mockImplementation(() => Promise.resolve(failedRun));
+
+    const report = await cleanupContainerEnvironments(7);
+
+    expect(mockSandboxDestroy).toHaveBeenCalledWith(SANDBOX_PATH);
+    expect(mockUpdateStatus).toHaveBeenCalledWith('env-repo', 'destroyed');
+    expect(report.removed).toEqual(['env-repo']);
+    expect(report.skipped).toEqual([]);
+  });
+
+  test('releases a failed run’s sandbox whose worktree is gone but whose stack remains', async () => {
+    mockListActiveContainerEnvironments.mockResolvedValueOnce([row(30)]);
+    mockGetLiveRunOwningEnv.mockImplementation(() => Promise.resolve(failedRun));
+    mockSandboxInspect.mockImplementation(() =>
+      Promise.resolve(
+        mockSandboxDestroy.mock.calls.length > 0 ? GONE : { ...GONE, stackExists: true }
+      )
+    );
+
+    const report = await cleanupContainerEnvironments(7);
+
+    expect(mockSandboxDestroy).toHaveBeenCalledWith(SANDBOX_PATH);
+    expect(report.removed).toEqual(['env-repo']);
+  });
+
+  test('holds a sandbox younger than the threshold by age, naming a failed run', async () => {
+    mockListActiveContainerEnvironments.mockResolvedValueOnce([row(4), row(2, 'env-runless')]);
+    mockGetLiveRunOwningEnv.mockImplementation(id =>
+      Promise.resolve(id === 'env-repo' ? failedRun : null)
+    );
+
+    const report = await cleanupContainerEnvironments(7);
+
+    expect(mockSandboxDestroy).not.toHaveBeenCalled();
+    expect(report.skipped).toEqual([
+      { id: 'env-repo', kind: 'age', reason: 'run a355c282 is failed; 4d old (< 7d threshold)' },
+      { id: 'env-runless', kind: 'age', reason: '2d old (< 7d threshold)' },
+    ]);
+  });
+
+  test.each(['running', 'pending', 'paused'])(
+    'cleanup skips a repo sandbox with a live run (kind live-run): %s',
+    async status => {
+      mockListActiveContainerEnvironments.mockResolvedValueOnce([row(30)]);
+      mockGetLiveRunOwningEnv.mockImplementation(() =>
+        Promise.resolve({ id: 'run-live-1', status })
+      );
+
+      const report = await cleanupContainerEnvironments(7);
+
+      // A run being worked is never probed, let alone reconciled.
+      expect(mockSandboxInspect).not.toHaveBeenCalled();
+      expect(mockSandboxDestroy).not.toHaveBeenCalled();
+      expect(mockUpdateStatus).not.toHaveBeenCalled();
+      expect(report.skipped).toEqual([
+        { id: 'env-repo', kind: 'live-run', reason: `run run-live is ${status}` },
+      ]);
+    }
+  );
+
+  test('an inspection that throws holds the row and reports why', async () => {
+    mockListActiveContainerEnvironments.mockResolvedValueOnce([row(30)]);
+    mockSandboxInspect.mockImplementation(() => Promise.reject(new Error('distro unreachable')));
+
+    const report = await cleanupContainerEnvironments(7);
+
+    expect(mockSandboxDestroy).not.toHaveBeenCalled();
+    expect(mockUpdateStatus).not.toHaveBeenCalled();
+    expect(report.errors).toEqual([
+      { id: 'env-repo', error: 'inspect failed (NOT reaped): distro unreachable' },
+    ]);
+  });
+
+  test('a row whose codebase is gone is reported, not guessed at', async () => {
+    mockListActiveContainerEnvironments.mockResolvedValueOnce([row(30)]);
+    mockGetCodebase.mockImplementation(() => Promise.resolve(null));
+
+    const report = await cleanupContainerEnvironments(7);
+
+    expect(mockSandboxDestroy).not.toHaveBeenCalled();
+    expect(mockContainerDestroy).not.toHaveBeenCalled();
+    expect(mockUpdateStatus).not.toHaveBeenCalled();
+    expect(report.errors).toEqual([
+      {
+        id: 'env-repo',
+        error: expect.stringContaining('codebase codebase-123 is not registered'),
+      },
+    ]);
+  });
+
+  test('one sandbox provider serves the whole pass', async () => {
+    mockListActiveContainerEnvironments.mockResolvedValueOnce([row(30), row(30, 'env-repo-2')]);
+    mockSandboxInspect.mockImplementation(() => Promise.resolve(GONE));
+
+    await cleanupContainerEnvironments(7);
+
+    expect(mockSandboxDeps).toHaveBeenCalledTimes(1);
+    expect(await mockSandboxDeps.mock.calls[0]?.[0].loadHostConfig?.()).toEqual(SANDBOX_HOST);
+  });
+
+  // T4-e, on the reaper's side: the teardown is reported as a failure and the row
+  // stays active for the next pass.
+  describe('confirm before destroy', () => {
+    test.each([
+      ['compose stack', { ...GONE, stackExists: true }],
+      ['worktree', { ...GONE, worktreeExists: true }],
+    ])(
+      'keeps the row active when its %s survives the teardown',
+      async (left, after: Isolation.SandboxInspection) => {
+        mockListActiveContainerEnvironments.mockResolvedValueOnce([row(30)]);
+        mockSandboxInspect.mockImplementation(() =>
+          Promise.resolve(mockSandboxDestroy.mock.calls.length > 0 ? after : LIVE_CLEAN)
+        );
+
+        const report = await cleanupContainerEnvironments(7);
+
+        expect(mockSandboxDestroy).toHaveBeenCalledWith(SANDBOX_PATH);
+        expect(mockUpdateStatus).not.toHaveBeenCalled();
+        expect(report.removed).toEqual([]);
+        expect(report.errors).toEqual([
+          { id: 'env-repo', error: expect.stringContaining(`left its ${left} behind`) },
+        ]);
+      }
+    );
+
+    test('keeps the row active when destroy reports the distro unreachable', async () => {
+      mockListActiveContainerEnvironments.mockResolvedValueOnce([row(30)]);
+      mockSandboxDestroy.mockImplementation(() => Promise.resolve(DISTRO_UNREACHABLE));
+
+      const report = await cleanupContainerEnvironments(7);
+
+      expect(mockUpdateStatus).not.toHaveBeenCalled();
+      expect(report.removed).toEqual([]);
+      expect(report.errors).toEqual([
+        { id: 'env-repo', error: expect.stringContaining('WSL distro unreachable') },
+      ]);
+    });
+
+    test('keeps the row active when the confirming inspect throws', async () => {
+      mockListActiveContainerEnvironments.mockResolvedValueOnce([row(30)]);
+      mockSandboxInspect.mockImplementation(() =>
+        mockSandboxDestroy.mock.calls.length > 0
+          ? Promise.reject(new Error('docker compose ls did not answer with JSON'))
+          : Promise.resolve(LIVE_CLEAN)
+      );
+
+      const report = await cleanupContainerEnvironments(7);
+
+      expect(mockSandboxDestroy).toHaveBeenCalledWith(SANDBOX_PATH);
+      expect(mockUpdateStatus).not.toHaveBeenCalled();
+      expect(report.removed).toEqual([]);
+      expect(report.errors).toEqual([
+        { id: 'env-repo', error: expect.stringContaining('could not confirm the teardown') },
+      ]);
+    });
   });
 });
 
@@ -3231,6 +3715,95 @@ describe('onConversationClosed', () => {
   });
 });
 
+// removeEnvironment handles worktrees only, so a closed conversation that owns a
+// repo sandbox reclaims it through the sandbox teardown instead. The live-run
+// lock above is a database read, so it holds for a sandbox exactly as for a
+// worktree.
+describe('onConversationClosed — repo container envs', () => {
+  const env = makeEnvironment({
+    id: 'env-sandbox',
+    provider: 'container',
+    working_path: SANDBOX_PATH,
+  });
+
+  beforeEach(() => {
+    resetSandbox();
+    mockGetById.mockReset();
+    mockGetById.mockImplementation(() => Promise.resolve(env));
+    mockGetCodebase.mockReset();
+    mockGetCodebase.mockImplementation(() => Promise.resolve(makeCodebase({ kind: 'repo' })));
+    mockGetLiveRunOwningEnv.mockReset();
+    mockGetLiveRunOwningEnv.mockImplementation(() => Promise.resolve(null));
+    mockGetConversationByPlatformId.mockReset();
+    mockGetConversationByPlatformId.mockImplementation(() =>
+      Promise.resolve(
+        makeConversation({ id: 'conv-sandbox', isolation_env_id: env.id, cwd: SANDBOX_PATH })
+      )
+    );
+    mockGetActiveSession.mockReset();
+    mockGetActiveSession.mockImplementation(() => Promise.resolve(null));
+    mockUpdateConversation.mockClear();
+    mockUpdateStatus.mockReset();
+    mockUpdateStatus.mockImplementation(() => Promise.resolve());
+    mockDestroy.mockClear();
+    mockContainerDestroy.mockClear();
+  });
+  afterEach(() => {
+    mockGetById.mockReset();
+    mockGetById.mockImplementation(() => Promise.resolve(null));
+    mockGetCodebase.mockReset();
+    mockGetCodebase.mockImplementation(() => Promise.resolve(null));
+    mockGetConversationByPlatformId.mockReset();
+    mockGetConversationByPlatformId.mockImplementation(() => Promise.resolve(null));
+  });
+
+  test('a closed conversation reclaims its repo container env', async () => {
+    await onConversationClosed('github', 'owner/repo#300');
+
+    expect(mockSandboxDestroy).toHaveBeenCalledWith(SANDBOX_PATH);
+    expect(mockUpdateStatus).toHaveBeenCalledWith('env-sandbox', 'destroyed');
+    expect(mockDestroy).not.toHaveBeenCalled();
+    expect(mockContainerDestroy).not.toHaveBeenCalled();
+    expect(mockUpdateConversation).toHaveBeenCalledWith('conv-sandbox', {
+      isolation_env_id: null,
+      cwd: null,
+    });
+  });
+
+  test('a live run still blocks reclaiming a repo container env', async () => {
+    mockGetLiveRunOwningEnv.mockImplementation(() =>
+      Promise.resolve({ id: 'run-live', status: 'paused' })
+    );
+
+    await onConversationClosed('github', 'owner/repo#301');
+
+    expect(mockSandboxDestroy).not.toHaveBeenCalled();
+    expect(mockUpdateStatus).not.toHaveBeenCalled();
+    expect(mockUpdateConversation).not.toHaveBeenCalled();
+  });
+
+  test('an unconfirmed teardown retains the env and the conversation reference', async () => {
+    mockSandboxInspect.mockImplementation(() => Promise.resolve({ ...GONE, stackExists: true }));
+
+    await expect(onConversationClosed('github', 'owner/repo#302')).rejects.toThrow(
+      'Conversation cleanup retained environment env-sandbox'
+    );
+    expect(mockUpdateStatus).not.toHaveBeenCalled();
+    expect(mockUpdateConversation).not.toHaveBeenCalled();
+  });
+
+  test('a folder container env keeps the existing retained-environment refusal', async () => {
+    mockGetCodebase.mockImplementation(() => Promise.resolve(makeCodebase({ kind: 'folder' })));
+
+    await expect(onConversationClosed('github', 'owner/repo#303')).rejects.toThrow(
+      'Conversation cleanup retained environment env-sandbox: not a worktree environment'
+    );
+    expect(mockSandboxDestroy).not.toHaveBeenCalled();
+    expect(mockContainerDestroy).not.toHaveBeenCalled();
+    expect(mockUpdateConversation).not.toHaveBeenCalled();
+  });
+});
+
 describe('cleanupStaleWorktrees', () => {
   beforeEach(() => {
     setPlatformPolicies([...ageBasedPolicies, { id: 'retain-test', workspaceRetention: 'retain' }]);
@@ -3435,7 +4008,7 @@ describe('cleanup after a chat plugin is removed', () => {
       makeContainerEnvironment({ created_by_platform: platform, days_since_created: 100 }),
     ]);
     const report = await cleanupContainerEnvironments();
-    expect(report.skipped).toEqual([{ id: 'env-1', reason }]);
+    expect(report.skipped).toEqual([{ id: 'env-1', kind: 'platform', reason }]);
     expect(report.removed).toEqual([]);
     expect(mockContainerDestroy).not.toHaveBeenCalled();
   });

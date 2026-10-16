@@ -66,7 +66,7 @@ const mockCleanupMergedWorktrees = mock<typeof CleanupService.cleanupMergedWorkt
   })
 );
 const mockCleanupContainerEnvironments = mock<typeof CleanupService.cleanupContainerEnvironments>(
-  () => Promise.resolve({ removed: [], skipped: [], errors: [] })
+  () => Promise.resolve({ removed: [], reconciled: [], skipped: [], errors: [] })
 );
 const mockGetLiveRunBlocker = mock<typeof CleanupService.getLiveRunBlocker>(() =>
   Promise.resolve(null)
@@ -771,6 +771,36 @@ describe('isolationCompleteCommand', () => {
     expect(consoleLogSpy).toHaveBeenCalledWith('  Completed: feature-branch');
     expect(consoleLogSpy).toHaveBeenCalledWith('\nComplete: 1 completed, 0 failed, 0 not found');
   });
+
+  // A container row's working path is a distro path or a folder root, not a host
+  // worktree: the worktree checks below would answer about the wrong thing, and
+  // --force must not reach removal either.
+  it.each([false, true])(
+    'complete refuses a container environment and points to isolation cleanup (force: %s)',
+    async force => {
+      mockFindActiveByBranchName.mockResolvedValueOnce(
+        makeEnvironment({
+          provider: 'container',
+          branch_name: 'sandbox/task-assist-1',
+          working_path: '/home/u/archon/worktrees/repo/task-assist-1',
+        })
+      );
+
+      await isolationCompleteCommand(['sandbox/task-assist-1'], { force, deleteRemote: true });
+
+      expect(mockRemoveEnvironment).not.toHaveBeenCalled();
+      expect(mockExecFileAsync).not.toHaveBeenCalled();
+      expect(mockGetLiveRunBlocker).not.toHaveBeenCalled();
+      expect(consoleErrorSpy).toHaveBeenCalledWith(
+        '  Blocked: sandbox/task-assist-1 — container environment; complete removes worktrees only.'
+      );
+      expect(consoleErrorSpy).toHaveBeenCalledWith(
+        '    Reclaim it with `archon isolation cleanup 0`; cancel or abandon a workflow run that still claims it first.'
+      );
+      expect(consoleErrorSpy).not.toHaveBeenCalledWith('  Use --force to override.');
+      expect(consoleLogSpy).toHaveBeenCalledWith('\nComplete: 0 completed, 1 failed, 0 not found');
+    }
+  );
 });
 
 describe('isolationCleanupMergedCommand', () => {
@@ -1004,6 +1034,47 @@ describe('isolationCleanupCommand', () => {
     expect(consoleLogSpy).toHaveBeenCalledWith(
       '  Status: Skipped — failed run run-fail has 2 unpushed commit(s)'
     );
+  });
+
+  it('cleanup prints reconciled and held-work container rows', async () => {
+    mockCleanupContainerEnvironments.mockResolvedValueOnce({
+      removed: ['aa271d53-0000'],
+      reconciled: ['35c7d928-0000'],
+      skipped: [
+        { id: 'e1e1e1e1-0000', kind: 'held-work', reason: 'run r1 is failed: unpushed commits' },
+        { id: 'f0f0f0f0-0000', kind: 'age', reason: '2d old (< 7d threshold)' },
+      ],
+      errors: [{ id: 'e2e2e2e2-0000', error: 'inspect failed (NOT reaped): distro unreachable' }],
+    });
+
+    await isolationCleanupCommand(7);
+
+    expect(consoleLogSpy).toHaveBeenCalledWith('  Removed: aa271d53');
+    expect(consoleLogSpy).toHaveBeenCalledWith('  Reconciled: 35c7d928 (no stack, no worktree)');
+    expect(consoleLogSpy).toHaveBeenCalledWith(
+      '  Held: e1e1e1e1 — run r1 is failed: unpushed commits (commit and push it, or abandon the run to discard it)'
+    );
+    expect(consoleLogSpy).toHaveBeenCalledWith('  Skipped: f0f0f0f0 — 2d old (< 7d threshold)');
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
+      '  Failed: e2e2e2e2 — inspect failed (NOT reaped): distro unreachable'
+    );
+    expect(consoleLogSpy).toHaveBeenCalledWith(
+      'Container cleanup: 1 removed, 1 reconciled, 2 skipped, 1 failed'
+    );
+  });
+
+  it('prints the container section when the only result is a reconciled row', async () => {
+    mockCleanupContainerEnvironments.mockResolvedValueOnce({
+      removed: [],
+      reconciled: ['35c7d928-0000'],
+      skipped: [],
+      errors: [],
+    });
+
+    await isolationCleanupCommand(7);
+
+    expect(consoleLogSpy).toHaveBeenCalledWith('\nContainer environments:');
+    expect(consoleLogSpy).toHaveBeenCalledWith('  Reconciled: 35c7d928 (no stack, no worktree)');
   });
 
   it('keeps the environment and reports a failure when the lock check throws', async () => {

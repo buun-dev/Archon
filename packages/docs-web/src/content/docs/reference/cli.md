@@ -1395,6 +1395,27 @@ including when no stale worktrees exist. A missing host folder does not make a c
 destroyed. To clean eligible containers without waiting for the default age threshold,
 run `archon isolation cleanup 0`; containers owned by resumable runs remain protected.
 
+Container cleanup also reaps a repo project's sandbox: it composes the sandbox's stack
+down and removes its worktree and `sandbox/<slug>` branch inside the WSL distro. It reads
+the sandbox's state from Docker and from git inside the distro, never from a host path:
+
+- A sandbox whose stack and worktree are both gone is **reconciled**: its record is
+  marked destroyed at any age, since nothing is left to claim.
+- A running, pending or paused run's sandbox is never inspected or removed.
+- A failed run's sandbox is removed past the threshold once its worktree is gone, or
+  clean with every commit on a remote. A sandbox holding uncommitted changes or unpushed
+  commits is **held** and reported as `Held: <id> — run <id> is failed: <work>`. Push the
+  work, or `workflow abandon` the run to discard it.
+- A sandbox no run can claim is removed past the threshold, whatever its worktree holds,
+  as a folder project's container is.
+
+A sandbox is marked destroyed only after a fresh check finds neither its stack nor its
+worktree. When the distro cannot be reached, a check cannot answer, or the teardown
+leaves something behind, the sandbox stays active and the output reports it as `Failed`
+with the reason; the next cleanup retries it. Abandoning or cancelling a repo container
+run reclaims its sandbox the same way, as does closing the issue or pull request whose
+conversation owns it.
+
 Project deletion (`DELETE /api/codebases/{id}`) returns `409` while active container
 environments remain. The error lists their environment IDs and the cleanup command.
 Clean them up explicitly, then retry deletion.
@@ -1556,6 +1577,10 @@ branch's remote-tracking ref is missing, it verifies that any unique commits are
 to the configured base branch or detected remote default branch. With `--force`, these checks
 are skipped, so deletion can discard the only reachable copy of commits. Accepts multiple
 branch names in one call.
+
+`complete` removes worktrees only. It refuses a container environment, with or without
+`--force`, and points to `archon isolation cleanup 0`, which reclaims containers and repo
+sandboxes no run can still claim.
 
 ### `serve`
 

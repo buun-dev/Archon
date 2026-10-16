@@ -314,8 +314,11 @@ export async function createFileWorkflowHost(root: string): Promise<WorkflowHost
             );
           },
         }),
+      // The teardown is chosen by the codebase kind, read from this host's records.
       reclaimContainerEnv: async (id, isolation) =>
-        (await import('../services/cleanup-service')).reclaimContainerEnv(id, isolation),
+        (await import('../services/cleanup-service')).reclaimContainerEnv(id, isolation, {
+          getCodebase: codebaseId => records.codebases.getCodebase(codebaseId),
+        }),
     }),
   };
 }

@@ -22,8 +22,18 @@ import * as sessionDb from '../db/sessions';
 import { SessionNotFoundError } from '../db/sessions';
 import * as codebaseDb from '../db/codebases';
 import * as workflowDb from '../db/workflows';
-import { getIsolationProvider, getPrState, ContainerBackend } from '@archon/isolation';
-import type { WorktreeStatusBreakdown, PrLookup, ContainerBackendConfig } from '@archon/isolation';
+import {
+  getIsolationProvider,
+  getPrState,
+  ContainerBackend,
+  ContainerProvider,
+} from '@archon/isolation';
+import type {
+  WorktreeStatusBreakdown,
+  PrLookup,
+  ContainerBackendConfig,
+  SandboxInspection,
+} from '@archon/isolation';
 import {
   hasUncommittedChangesStrict,
   isWorktreeRegistered,
@@ -42,8 +52,8 @@ import {
 import type { RepoPath, BranchName, WorktreePath } from '@archon/git';
 import { createLogger } from '@archon/paths';
 import type { IsolationEnvironmentRow } from '@archon/isolation';
-import { ConversationNotFoundError } from '../types';
-import { loadRepoConfig } from '../config/config-loader';
+import { ConversationNotFoundError, type Codebase } from '../types';
+import { loadGlobalConfig, loadRepoConfig } from '../config/config-loader';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -120,7 +130,10 @@ export interface CleanupReport {
 }
 
 // ---------------------------------------------------------------------------
-// Container isolation environments (folder-project container backend, Phase C)
+// Container isolation environments. Folder and repo projects both record
+// `provider: 'container'`, but their estates differ: a folder project's overlay
+// container and volume (ContainerBackend), or a repo's WSL sandbox, a distro
+// worktree plus a compose stack (ContainerProvider). The codebase kind chooses.
 // ---------------------------------------------------------------------------
 
 /**
@@ -144,24 +157,135 @@ export interface ContainerEnvSummary {
   runStatus: string | null;
 }
 
+/**
+ * Why the reaper left a container env alone this pass. `held-work` is the one an
+ * operator acts on (push the work, or abandon the run); `live-run` and `age`
+ * resolve themselves; `platform` is policy: the env's creating platform is
+ * unregistered or retains its workspaces.
+ */
+export type ContainerSkipKind = 'live-run' | 'age' | 'held-work' | 'platform';
+
 export interface ContainerCleanupReport {
   removed: string[];
-  skipped: { id: string; reason: string }[];
+  /** Rows marked destroyed because neither their stack nor their worktree exists. */
+  reconciled: string[];
+  skipped: { id: string; kind: ContainerSkipKind; reason: string }[];
   errors: { id: string; error: string }[];
 }
 
 /**
- * Immediately reclaim (destroy) a single container isolation environment by id —
- * used when a container run is ABANDONED (M2), so its container + upper volume don't
- * linger until the scheduled reaper. Best-effort: throws on a genuine docker failure
- * (the caller surfaces it), a no-op if the row/container is already gone. The
- * placeholder config is unused by `destroy` (see CLEANUP_PLACEHOLDER_CONTAINER_CONFIG).
+ * The repo sandbox provider, addressed at the machine's configured distro. It
+ * caches its distro lookup, a failed one included, so each cleanup pass or
+ * reclaim builds its own: a long-lived instance would never see a distro that
+ * came back.
  */
-export async function reclaimContainerEnv(envId: string, store: IIsolationStore): Promise<void> {
+function repoSandboxProvider(): ContainerProvider {
+  return new ContainerProvider({
+    loadHostConfig: async () => (await loadGlobalConfig()).isolation?.container ?? null,
+  });
+}
+
+/**
+ * Which teardown a container env needs. Both kinds record `provider: 'container'`,
+ * so only the codebase kind tells them apart. A missing codebase is refused, not
+ * guessed: the folder backend throws on a sandbox row's metadata, and the sandbox
+ * teardown would find no stack for a folder row and mark it destroyed over a
+ * running container.
+ */
+async function containerEnvKind(
+  env: Pick<IsolationEnvironmentRow, 'id' | 'codebase_id'>,
+  getCodebase: typeof codebaseDb.getCodebase
+): Promise<Codebase['kind']> {
+  const codebase = await getCodebase(env.codebase_id);
+  if (!codebase) {
+    throw new Error(
+      `Cannot choose a teardown for container environment ${env.id}: its codebase ${env.codebase_id} is not registered.`
+    );
+  }
+  return codebase.kind;
+}
+
+/**
+ * Tear a repo sandbox down, then mark its row destroyed only once a fresh
+ * `inspect` finds neither its compose stack nor its worktree. `destroy` cannot
+ * prove that alone: an unreachable distro tears nothing down, and a reachable one
+ * only warns when a step fails. Throws, with the row still active, whenever the
+ * teardown is unconfirmed: a row marked destroyed over a live sandbox is never
+ * found by cleanup again, and its run can no longer resume.
+ */
+async function reclaimRepoSandbox(
+  env: Pick<IsolationEnvironmentRow, 'id' | 'working_path'>,
+  sandbox: ContainerProvider,
+  store: Pick<IIsolationStore, 'updateStatus'>
+): Promise<void> {
+  const subject = `repo sandbox ${env.id} at ${env.working_path}`;
+  const result = await sandbox.destroy(env.working_path);
+  if (!result.worktreeRemoved || !result.directoryClean) {
+    getLog().warn(
+      { envId: env.id, warnings: result.warnings },
+      'container_sandbox_teardown_not_run'
+    );
+    throw new Error(
+      `The ${subject} was not torn down; it remains active. ${result.warnings.join('; ')}`
+    );
+  }
+  let after: SandboxInspection;
+  try {
+    after = await sandbox.inspect(env.working_path);
+  } catch (err) {
+    getLog().warn({ err, envId: env.id }, 'container_sandbox_teardown_unconfirmed');
+    throw new Error(
+      `Tore down the ${subject} but could not confirm the teardown; it remains active: ${(err as Error).message}`,
+      { cause: err }
+    );
+  }
+  const left = [
+    ...(after.stackExists ? ['compose stack'] : []),
+    ...(after.worktreeExists ? ['worktree'] : []),
+  ];
+  if (left.length > 0) {
+    getLog().warn({ envId: env.id, left }, 'container_sandbox_teardown_incomplete');
+    throw new Error(
+      `The teardown of the ${subject} left its ${left.join(' and ')} behind; it remains active.`
+    );
+  }
+  await store.updateStatus(env.id, 'destroyed');
+  getLog().info({ envId: env.id }, 'container_sandbox_reclaimed');
+}
+
+/**
+ * Immediately reclaim (destroy) one container isolation environment by id, so an
+ * abandoned or cancelled container run's resources don't wait for the reaper. A
+ * missing row is a no-op. Throws when the teardown fails or cannot be confirmed;
+ * the caller surfaces it.
+ *
+ * Routes on the codebase kind (see containerEnvKind). A folder env goes through
+ * ContainerBackend, which throws on a genuine docker failure (the placeholder
+ * config is unused by `destroy`). A repo sandbox is torn down by its provider and
+ * marked destroyed only after a fresh inspection (see reclaimRepoSandbox). The
+ * codebase reader is injectable so a file-backed host reads its own records.
+ */
+export async function reclaimContainerEnv(
+  envId: string,
+  store: IIsolationStore,
+  readers: { getCodebase: typeof codebaseDb.getCodebase } = {
+    getCodebase: codebaseDb.getCodebase,
+  }
+): Promise<void> {
   const env = await store.getById(envId);
-  if (env) {
-    const reason = unknownPlatformReason(env.created_by_platform);
-    if (reason) throw new Error(reason);
+  if (!env) {
+    // Without the row nothing addresses the resources; ContainerBackend.destroy
+    // no-ops the same way.
+    getLog().warn({ envId }, 'container_reclaim_row_missing');
+    return;
+  }
+  const reason = unknownPlatformReason(env.created_by_platform);
+  if (reason) throw new Error(reason);
+  if ((await containerEnvKind(env, readers.getCodebase)) === 'repo') {
+    // Already confirmed gone: no teardown to repeat, no distro round trip.
+    if (env.status === 'destroyed') return;
+    await reclaimRepoSandbox(env, repoSandboxProvider(), store);
+    return;
   }
   const backend = new ContainerBackend({
     store,
@@ -200,37 +324,55 @@ export async function listContainerEnvironments(): Promise<readonly ContainerEnv
   return summaries;
 }
 
+function ageSkipReason(daysSinceCreated: number, daysStale: number): string {
+  return `${Math.floor(daysSinceCreated)}d old (< ${daysStale}d threshold)`;
+}
+
 /**
- * Reap orphaned container isolation environments: remove the container + upper
- * volume of finished-and-unresumable (completed/cancelled) or run-less container
- * envs older than `daysStale`. A container a run can still claim — running, pending,
- * paused, or failed-but-resumable — is NEVER touched: it is awaited state, not
- * garbage (No-Autonomous-Lifecycle-Mutation Across Process Boundaries), and is
- * surfaced by `isolation list` with its age instead. All pruning is label-scoped
- * (via the tracking row), never a bare `docker prune`.
+ * Reap orphaned container isolation environments: tear down finished-and-unresumable
+ * (completed/cancelled) or run-less container envs older than `daysStale`. A
+ * container a running, pending or paused run can claim is NEVER touched: it is
+ * awaited state, not garbage (No-Autonomous-Lifecycle-Mutation Across Process
+ * Boundaries), and is surfaced by `isolation list` with its age instead. All
+ * pruning is label-scoped (via the tracking row), never a bare `docker prune`.
+ *
+ * A failed run is terminal but resumable, and the two kinds treat it differently.
+ * A folder container keeps it: its overlay volume is the failed run's only copy.
+ * A repo sandbox is read where its estate lives (compose's listing, git inside the
+ * distro), never from a host stat:
+ * - a row whose stack AND worktree are both gone is reconciled to `destroyed` at
+ *   any age, failed run or not: nothing is left to claim;
+ * - a failed run's sandbox is released past the threshold once its worktree is
+ *   gone, or clean with every commit on a remote: its branch then holds all the
+ *   run could resume from. Uncommitted or unpushed work holds it (`held-work`).
+ * A probe that cannot answer holds the row and reports why.
  */
 export async function cleanupContainerEnvironments(
   daysStale = STALE_THRESHOLD_DAYS
 ): Promise<ContainerCleanupReport> {
   getRegisteredPlatformPolicies();
-  const report: ContainerCleanupReport = { removed: [], skipped: [], errors: [] };
+  const report: ContainerCleanupReport = { removed: [], reconciled: [], skipped: [], errors: [] };
   const rows = await isolationEnvDb.listActiveContainerEnvironments();
   if (rows.length === 0) return report;
 
+  const store = isolationEnvDb.createIsolationStore();
   const backend = new ContainerBackend({
-    store: isolationEnvDb.createIsolationStore(),
+    store,
     config: CLEANUP_PLACEHOLDER_CONTAINER_CONFIG,
   });
+  // One sandbox provider for the whole pass, built for the first repo row.
+  let sandbox: ContainerProvider | undefined;
 
   for (const row of rows) {
     const reason = unknownPlatformReason(row.created_by_platform);
     if (reason) {
-      report.skipped.push({ id: row.id, reason });
+      report.skipped.push({ id: row.id, kind: 'platform', reason });
       continue;
     }
     if (retainsWorkspace(row.created_by_platform)) {
       report.skipped.push({
         id: row.id,
+        kind: 'platform',
         reason: `platform '${row.created_by_platform}' retains workspaces`,
       });
       continue;
@@ -253,21 +395,44 @@ export async function cleanupContainerEnvironments(
       getLog().warn({ err, envId: row.id }, 'container_env_reap_lookup_failed');
       continue;
     }
+    // A running, pending or paused run is being worked: never probed, never reaped.
+    // Only a failed run's lock can be released, and only for a repo sandbox.
+    if (liveRun && !isolationEnvDb.isSettleableRunStatus(liveRun.runStatus)) {
+      report.skipped.push({ id: row.id, kind: 'live-run', reason: liveRun.display });
+      continue;
+    }
+    let kind: Codebase['kind'];
+    try {
+      kind = await containerEnvKind(row, codebaseDb.getCodebase);
+    } catch (err) {
+      report.errors.push({
+        id: row.id,
+        error: `codebase lookup failed (NOT reaped): ${(err as Error).message}`,
+      });
+      getLog().warn({ err, envId: row.id }, 'container_env_kind_lookup_failed');
+      continue;
+    }
+    if (kind === 'repo') {
+      sandbox ??= repoSandboxProvider();
+      await sweepRepoSandbox(row, liveRun, daysStale, sandbox, store, report);
+      continue;
+    }
     if (liveRun) {
-      report.skipped.push({ id: row.id, reason: liveRun.display });
+      report.skipped.push({ id: row.id, kind: 'live-run', reason: liveRun.display });
       continue;
     }
     if (row.days_since_created < daysStale) {
       report.skipped.push({
         id: row.id,
-        reason: `${Math.floor(row.days_since_created)}d old (< ${daysStale}d threshold)`,
+        kind: 'age',
+        reason: ageSkipReason(row.days_since_created, daysStale),
       });
       continue;
     }
     try {
       await backend.destroy(row.id);
       report.removed.push(row.id);
-      // No runId: the reap only happens when no run can still claim this env.
+      // No runId: a folder container is reaped only when no run can still claim it.
       getLog().info({ envId: row.id }, 'container_env_reaped');
     } catch (err) {
       report.errors.push({ id: row.id, error: (err as Error).message });
@@ -275,6 +440,70 @@ export async function cleanupContainerEnvironments(
     }
   }
   return report;
+}
+
+/**
+ * One repo sandbox's turn in the reaper (see cleanupContainerEnvironments).
+ * `failedRun` is the failed run that still claims the env, or null when none does;
+ * a running, pending or paused run never reaches here.
+ */
+async function sweepRepoSandbox(
+  row: Pick<IsolationEnvironmentRow, 'id' | 'working_path'> & { days_since_created: number },
+  failedRun: LiveRunBlocker | null,
+  daysStale: number,
+  sandbox: ContainerProvider,
+  store: Pick<IIsolationStore, 'updateStatus'>,
+  report: ContainerCleanupReport
+): Promise<void> {
+  let inspection: SandboxInspection;
+  try {
+    inspection = await sandbox.inspect(row.working_path);
+  } catch (err) {
+    report.errors.push({
+      id: row.id,
+      error: `inspect failed (NOT reaped): ${(err as Error).message}`,
+    });
+    getLog().warn({ err, envId: row.id }, 'container_env_inspect_failed');
+    return;
+  }
+  if (!inspection.stackExists && !inspection.worktreeExists) {
+    try {
+      await store.updateStatus(row.id, 'destroyed');
+    } catch (err) {
+      report.errors.push({ id: row.id, error: `reconcile failed: ${(err as Error).message}` });
+      getLog().warn({ err, envId: row.id }, 'container_env_reconcile_failed');
+      return;
+    }
+    report.reconciled.push(row.id);
+    getLog().info({ envId: row.id, runId: failedRun?.runId }, 'container_env_ghost_reconciled');
+    return;
+  }
+  if (failedRun && inspection.worktreeExists && (inspection.dirty || inspection.unpushed)) {
+    const work = [
+      ...(inspection.dirty ? ['uncommitted changes'] : []),
+      ...(inspection.unpushed ? ['unpushed commits'] : []),
+    ].join(', ');
+    report.skipped.push({ id: row.id, kind: 'held-work', reason: `${failedRun.display}: ${work}` });
+    return;
+  }
+  if (row.days_since_created < daysStale) {
+    const age = ageSkipReason(row.days_since_created, daysStale);
+    report.skipped.push({
+      id: row.id,
+      kind: 'age',
+      reason: failedRun ? `${failedRun.display}; ${age}` : age,
+    });
+    return;
+  }
+  try {
+    await reclaimRepoSandbox(row, sandbox, store);
+    report.removed.push(row.id);
+    // runId only when a failed run's sandbox was released; otherwise no run claimed it.
+    getLog().info({ envId: row.id, runId: failedRun?.runId }, 'container_env_reaped');
+  } catch (err) {
+    report.errors.push({ id: row.id, error: (err as Error).message });
+    getLog().warn({ err, envId: row.id }, 'container_env_reap_failed');
+  }
 }
 
 /**
@@ -347,12 +576,33 @@ export async function onConversationClosed(
     return;
   }
 
-  const result = await removeEnvironment(envId, {
-    force: false,
-    deleteRemoteBranch: options?.merged,
-  });
-  if (result.skippedReason && result.skippedReason !== 'already destroyed') {
-    throw new Error(`Conversation cleanup retained environment ${envId}: ${result.skippedReason}`);
+  // A repo sandbox is reclaimed by its own teardown; removeEnvironment handles
+  // worktrees only and still refuses every other container env. The live-run lock
+  // above is a database read, so it holds for a sandbox exactly as for a worktree.
+  if (
+    env.provider === 'container' &&
+    (await containerEnvKind(env, codebaseDb.getCodebase)) === 'repo'
+  ) {
+    if (env.status !== 'destroyed') {
+      try {
+        await reclaimRepoSandbox(env, repoSandboxProvider(), isolationEnvDb.createIsolationStore());
+      } catch (err) {
+        throw new Error(
+          `Conversation cleanup retained environment ${envId}: ${(err as Error).message}`,
+          { cause: err }
+        );
+      }
+    }
+  } else {
+    const result = await removeEnvironment(envId, {
+      force: false,
+      deleteRemoteBranch: options?.merged,
+    });
+    if (result.skippedReason && result.skippedReason !== 'already destroyed') {
+      throw new Error(
+        `Conversation cleanup retained environment ${envId}: ${result.skippedReason}`
+      );
+    }
   }
 
   // Clear this conversation's reference (best-effort - conversation may be deleted).
