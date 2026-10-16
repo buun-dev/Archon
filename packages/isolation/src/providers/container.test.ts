@@ -8,7 +8,8 @@ const mockWarn = mock<(...args: unknown[]) => void>(() => undefined);
 // Silence the provider's and the lifecycle's loggers, keeping every other
 // @archon/paths export real (the provider resolves real project and script paths).
 const realPaths = { ...(await import('@archon/paths')) };
-const { getProjectRoot, toNodeVisiblePath } = realPaths;
+const { getProjectRoot, getProjectStoragePaths, resolveProjectStorageKey, toNodeVisiblePath } =
+  realPaths;
 mock.module('@archon/paths', () => ({
   ...realPaths,
   createLogger: () => ({
@@ -500,6 +501,32 @@ describe('ContainerProvider.create — the spec the lifecycle receives', () => {
     // preload points ARCHON_HOME at a temp dir, so no literal `~/.archon` here.)
     expect(up.env.ARCHON_META_DIR).toBe(toNodeVisiblePath(getProjectRoot('owner', 'marphob-page')));
     expect(up.env.ARCHON_META_DIR).toMatch(/\/workspaces\/owner\/marphob-page$/);
+  });
+
+  // The engine roots the run's artifacts, logs and state at
+  // getProjectStoragePaths(resolveProjectStorageKey(codebase, cwd)).root; the mount must
+  // be that root, or a node writes where the engine never reads. Including when no
+  // owner/repo or _local identity can be derived (the engine then keys on the run's cwd).
+  test.each([
+    ['an owner/repo name', 'owner/marphob-page', '/repo/marphob-page'],
+    ['a bare local name', 'marphob-page', '/repo/marphob-page'],
+    ['no derivable identity', 'not an owner/repo', '/'],
+  ])('mounts the storage root the engine computes for %s', async (_case, name, repoPath) => {
+    const runners = makeRunners();
+    const provider = new ContainerProvider({ ...runners, loadConfig: async () => null });
+
+    const env = await provider.create({
+      ...BASE_REQ,
+      codebaseName: name,
+      canonicalRepoPath: repoPath,
+      workflowType: 'task',
+      identifier: 'meta',
+    } as IsolationRequest);
+
+    const engineRoot = getProjectStoragePaths(
+      resolveProjectStorageKey({ kind: 'repo', name, default_cwd: repoPath }, env.workingPath)
+    ).root;
+    expect(runners.composeUp()?.env.ARCHON_META_DIR).toBe(toNodeVisiblePath(engineRoot));
   });
 
   test("the repo's provision command is the one command run in the container", async () => {

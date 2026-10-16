@@ -38,8 +38,8 @@ import { execFileAsync, toBranchName, getDefaultBranch, toRepoPath } from '@arch
 import {
   createLogger,
   getHomeScriptsPath,
-  getProjectRoot,
-  resolveRepoProjectIdentity,
+  getProjectStoragePaths,
+  resolveProjectStorageKey,
   toNodeVisiblePath,
 } from '@archon/paths';
 import type { ExecutionContext } from '@archon/provider-contract';
@@ -475,7 +475,7 @@ export class ContainerProvider implements IContainerIsolationProvider {
       composeOverlay: repoSandbox.compose ? `${workingPath}/${repoSandbox.compose}` : undefined,
       provision: repoSandbox.provision,
       scriptsDir: toNodeVisiblePath(getHomeScriptsPath()),
-      metaDir: toNodeVisiblePath(projectRootFor(request)),
+      metaDir: toNodeVisiblePath(projectRootFor(request, workingPath)),
       // The machine's identity for the worktree. A run whose initiating user is
       // known authors its commits through `GIT_AUTHOR_*` in the run env (#3746).
       gitIdentity: host.gitIdentity,
@@ -823,14 +823,17 @@ function pick<K extends string>(source: NodeJS.ProcessEnv, keys: K[]): Partial<R
 }
 
 /**
- * The run's project dir — `~/.archon/workspaces/<owner>/<repo>` — as the engine
- * resolves it for artifacts and logs. Mounted at its own (distro-visible) path so
- * `$ARTIFACTS_DIR` means one thing on both sides.
+ * The run's project storage root — artifacts, logs, state and frozen source all live
+ * under it — derived through the engine's own owner (`resolveProjectStorageKey`, then
+ * `getProjectStoragePaths`) for this repo-kind codebase and the run's working path, so
+ * the mount is exactly where the engine reads and writes, fallbacks included. Mounted at
+ * its own (distro-visible) path so `$ARTIFACTS_DIR` means one thing on both sides.
  */
-function projectRootFor(request: IsolationRequest): string {
-  const identity = resolveRepoProjectIdentity(
-    request.codebaseName ?? '',
-    request.canonicalRepoPath
-  ) ?? { owner: '_local', repo: basename(request.canonicalRepoPath) };
-  return getProjectRoot(identity.owner, identity.repo);
+function projectRootFor(request: IsolationRequest, workingPath: string): string {
+  const codebase = {
+    kind: 'repo',
+    name: request.codebaseName ?? '',
+    default_cwd: request.canonicalRepoPath,
+  };
+  return getProjectStoragePaths(resolveProjectStorageKey(codebase, workingPath)).root;
 }
