@@ -587,8 +587,13 @@ export interface TemplateReferences {
  * template: a substituted value is inserted verbatim and never read as template syntax.
  *
  * Callers pass host paths. The path-valued variables ($ARTIFACTS_DIR, $STATE_DIR,
- * $ADOPTED_RUN_DIR, $TYPED_ARTIFACTS_FILE) are delivered through `toNodePath`, in the
- * form the run's nodes can open.
+ * $ADOPTED_RUN_DIR, $TYPED_ARTIFACTS_FILE, $DOCS_DIR) are delivered through `toNodePath`,
+ * in the form the current run's nodes can open. A `workflow:` node's `input:` and `with:`
+ * values and a workflow fan-out's `fan_out.items` are substituted here as well, but no
+ * node of this run receives them: they become a child run's input, and the child binds
+ * its own form. That is safe only because `executeWorkflowNode` refuses `workflow:`
+ * sub-runs in a `'wsl'` run before substituting any of them. A composed fan-out's
+ * `fan_out.items` feed instance nodes of this same run, so this run's form is correct there.
  *
  * When issueContext is undefined, context variables are replaced with empty string
  * to avoid sending literal "$CONTEXT" to the AI.
@@ -680,8 +685,10 @@ export function substituteWorkflowVariables(
       }
       return baseBranch;
     }),
-    // Defensive: ensure docsDir always has a value (callers should resolve, but guard here)
-    variable('DOCS_DIR', () => docsDir || 'docs/'),
+    // Defensive: ensure docsDir always has a value (callers should resolve, but guard here).
+    // Usually relative, which `toNodePath` leaves alone; a configured absolute path is a
+    // host directory like the ones above.
+    variable('DOCS_DIR', () => toNodePath(docsDir || 'docs/')),
   ];
 
   // When shellSafe is true, user-controlled variables stay literal — they are passed via

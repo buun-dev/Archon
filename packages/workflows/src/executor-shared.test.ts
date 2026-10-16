@@ -194,7 +194,10 @@ describe('substituteWorkflowVariables', () => {
   });
 
   describe("run paths in the node's form", () => {
-    const pathTemplate = '$ARTIFACTS_DIR $STATE_DIR $ADOPTED_RUN_DIR $TYPED_ARTIFACTS_FILE';
+    // `docsPath` is normally relative, which the real converter leaves alone, but an
+    // absolute one names a host directory like the others.
+    const pathTemplate =
+      '$ARTIFACTS_DIR $STATE_DIR $ADOPTED_RUN_DIR $TYPED_ARTIFACTS_FILE $DOCS_DIR';
     const substitutePaths = (): string =>
       substituteWorkflowVariables(
         pathTemplate,
@@ -202,7 +205,7 @@ describe('substituteWorkflowVariables', () => {
         'msg',
         '/host/artifacts',
         'main',
-        'docs/',
+        '/host/docs',
         undefined,
         undefined,
         undefined,
@@ -220,12 +223,14 @@ describe('substituteWorkflowVariables', () => {
         async () => substitutePaths()
       );
       expect(prompt).toBe(
-        '/node/host/artifacts /node/host/state /node/host/adopted /node/host/typed.json'
+        '/node/host/artifacts /node/host/state /node/host/adopted /node/host/typed.json /node/host/docs'
       );
     });
 
     it('delivers each path unchanged when unbound', () => {
-      expect(substitutePaths()).toBe('/host/artifacts /host/state /host/adopted /host/typed.json');
+      expect(substitutePaths()).toBe(
+        '/host/artifacts /host/state /host/adopted /host/typed.json /host/docs'
+      );
     });
   });
 

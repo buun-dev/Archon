@@ -174,6 +174,7 @@ import {
 } from './model-validation';
 import { captureWorkflowSource, capturedSourceRoots } from './workflow-source';
 import { CONTAINER_MARKER_PROBE } from './checkout-observation';
+import { runWithNodePaths, type NodePathBinding } from './node-path';
 
 function composeScope(
   nodeId = 'fan',
@@ -847,6 +848,16 @@ function nodeDockerCalls(
     ([command, args]) => command === 'docker' && args.at(-1) !== CONTAINER_MARKER_PROBE
   );
 }
+
+/**
+ * A `'wsl'` binding whose output is recognizable: every delivered path gains a `/node`
+ * prefix and forward slashes. This file's `@archon/paths` mock has no `toNodeVisiblePath`,
+ * so `nodePathBindingFor('wsl')` has no converter here.
+ */
+const WSL_MARKER_BINDING: NodePathBinding = {
+  visibility: 'wsl',
+  toNode: hostPath => '/node' + hostPath.replace(/\\/g, '/'),
+};
 
 /**
  * Options for a direct `executeDagWorkflow` call, built from only what a test varies. The
@@ -24492,6 +24503,53 @@ describe('executeDagWorkflow -- persist_session', () => {
     expect(mockSendQueryDag.mock.calls.length).toBe(1);
   });
 
+  it('cold-resume recovery pointer names the node form', async () => {
+    const scopeDir = join(testDir, 'scope-artifacts');
+    await writeNodeArtifact(
+      scopeDir,
+      {
+        nodeId: 'planner',
+        outputType: 'plan',
+        runId: 'prior-run',
+        producedAt: '2026-05-01T00:00:00Z',
+      },
+      'the prior plan'
+    );
+    const store = createMockStore();
+    armColdResume(store);
+    const platform = createMockPlatform();
+
+    await runWithNodePaths(WSL_MARKER_BINDING, () =>
+      executeDagWorkflow(
+        dagOptions({
+          deps: createMockDeps(store),
+          platform,
+          cwd: testDir,
+          workflow: {
+            name: 'persist-test',
+            nodes: [
+              {
+                id: 'planner',
+                kind: 'agent',
+                source: { kind: 'command', name: 'my-cmd' },
+                persist_session: true,
+              },
+            ],
+          },
+          workflowRun: makeWorkflowRun(),
+          scopeArtifactsDir: scopeDir,
+        })
+      )
+    );
+
+    const hostPointer = join(scopeDir, 'nodes', 'planner.md');
+    const warning = deliveredMessages(platform).find(message =>
+      message.startsWith('⚠️ Node `planner`: could not resume the prior session')
+    );
+    expect(warning).toContain(`- plan (\`planner\`): ${WSL_MARKER_BINDING.toNode(hostPointer)}`);
+    expect(warning).not.toContain(hostPointer);
+  });
+
   it('cold resume with scope artifacts only from the CURRENT run → plain warning, no pointer', async () => {
     const scopeDir = join(testDir, 'scope-artifacts');
     // Only this run's own mirror exists — it recovers nothing.
@@ -44284,5 +44342,293 @@ describe('executeDagWorkflow -- run budget (#2814)', () => {
       )
     ).toHaveLength(0);
     expect(store.getDagResumeSnapshot).not.toHaveBeenCalled();
+  });
+});
+
+describe("executeDagWorkflow -- a repo-kind container run's nodes receive node-form paths", () => {
+  const CONTAINER = { kind: 'container' as const, containerId: 'c1', execUser: '1000' };
+  /** Larger than the inline threshold, so a bash reference to it spills to a file. */
+  const OVERSIZED = 'x'.repeat(40_000);
+  let cwd: string;
+  let runRoot: string;
+
+  beforeEach(async () => {
+    // The run's directories live apart from the checkout, so any mention of `runRoot` in
+    // a `docker exec` argv comes from a delivered run path.
+    cwd = await mkdtemp(join(tmpdir(), 'dag-node-paths-cwd-'));
+    runRoot = await mkdtemp(join(tmpdir(), 'dag-node-paths-run-'));
+    await mkdir(join(cwd, '.archon', 'scripts'), { recursive: true });
+    await writeFile(join(cwd, '.archon', 'scripts', 'report.ts'), 'console.log("report")');
+  });
+
+  afterEach(async () => {
+    await removeTempTree(cwd);
+    await removeTempTree(runRoot);
+  });
+
+  const artifactsDir = (): string => join(runRoot, 'artifacts');
+  const stateDir = (): string => join(runRoot, 'state');
+  const logDir = (): string => join(runRoot, 'logs');
+  const docsDir = (): string => join(runRoot, 'docs');
+  const spillPath = (nodeId: string): string =>
+    join(artifactsDir(), '.archon', 'node-output-spills', `${nodeId}.nodeoutput`);
+  const scriptPath = (): string => join(cwd, '.archon', 'scripts', 'report.ts');
+
+  /**
+   * One DAG that makes every dynamic delivery: substituted and environment run paths, a
+   * named script's argv, an oversized `$node.output`, and an oversized `$LOOP_PREV`. The
+   * fake container records each `docker exec` argv and answers each node by its body.
+   */
+  async function runPathsDag(): Promise<{ calls: string[][]; store: MockWorkflowStore }> {
+    const calls: string[][] = [];
+    let loopPasses = 0;
+    const dockerSpy = spyOn(git, 'execFileAsync').mockImplementation(async (_command, args) => {
+      calls.push(args);
+      const body = args.at(-1) ?? '';
+      if (body === CONTAINER_MARKER_PROBE) return { stdout: 'none\n', stderr: '' };
+      if (body.includes('PRODUCE')) return { stdout: OVERSIZED, stderr: '' };
+      if (body.includes('LOOP_BODY')) {
+        loopPasses++;
+        return { stdout: loopPasses === 1 ? OVERSIZED : 'DONE', stderr: '' };
+      }
+      return { stdout: 'ok', stderr: '' };
+    });
+    const store = createMockStore();
+    try {
+      await executeDagWorkflow(
+        dagOptions({
+          deps: createMockDeps(store),
+          cwd,
+          workflow: {
+            name: 'node-paths',
+            nodes: [
+              {
+                id: 'paths',
+                kind: 'exec',
+                runtime: 'sh',
+                script:
+                  'echo $ARTIFACTS_DIR $STATE_DIR $DOCS_DIR; cat "$LOG_DIR/x" "$TYPED_ARTIFACTS_FILE"',
+              },
+              { id: 'report', kind: 'exec', runtime: 'bun', script: 'report' },
+              { id: 'producer', kind: 'exec', runtime: 'sh', script: 'echo PRODUCE' },
+              {
+                id: 'consumer',
+                kind: 'exec',
+                runtime: 'sh',
+                script: 'value=$producer.output; echo "${#value}"',
+                depends_on: ['producer'],
+              },
+              {
+                id: 'draft',
+                kind: 'loop_group',
+                loop_group: {
+                  until: 'DONE',
+                  max_iterations: 2,
+                  fresh_context: false,
+                  nodes: [
+                    {
+                      id: 'work',
+                      kind: 'exec',
+                      runtime: 'sh',
+                      script: 'previous=$LOOP_PREV.work.output; echo LOOP_BODY "${#previous}"',
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+          workflowRun: makeWorkflowRun('node-paths-run'),
+          artifactsDir: artifactsDir(),
+          stateDir: stateDir(),
+          logDir: logDir(),
+          // `docsPath` is usually relative; an absolute one is a host directory like the rest.
+          docsDir: docsDir(),
+          execContext: CONTAINER,
+        })
+      );
+    } finally {
+      dockerSpy.mockRestore();
+    }
+    return { calls, store };
+  }
+
+  const completedSteps = (store: MockWorkflowStore): string[] =>
+    persistedEvents(store)
+      .filter(event => event.event_type === 'node_completed')
+      .map(event => event.step_name ?? '');
+
+  /** The node dispatches whose body (the argv's last element) contains `marker`. */
+  const dispatches = (calls: string[][], marker: string): string[][] =>
+    calls.filter(args => (args.at(-1) ?? '').includes(marker));
+
+  /** The named script's dispatch: `bun --no-env-file run <path>`. */
+  const scriptDispatch = (calls: string[][]): string[] | undefined =>
+    calls.find(args => args.at(-2) === 'run');
+
+  /** The `-e KEY=VALUE` environment one `docker exec` delivered. */
+  const deliveredEnv = (args: string[]): Record<string, string> => {
+    const env: Record<string, string> = {};
+    args.forEach((arg, i) => {
+      if (arg !== '-e') return;
+      const pair = args[i + 1];
+      const split = pair.indexOf('=');
+      env[pair.slice(0, split)] = pair.slice(split + 1);
+    });
+    return env;
+  };
+
+  it('container run: every path a node receives is node form', async () => {
+    const node = WSL_MARKER_BINDING.toNode;
+    const { calls, store } = await runWithNodePaths(WSL_MARKER_BINDING, runPathsDag);
+
+    expect(completedSteps(store)).toEqual(
+      expect.arrayContaining(['paths', 'report', 'producer', 'consumer', 'draft'])
+    );
+
+    // Conformance: every mention of a run directory in any recorded argv element or env
+    // value is the node form; none is the host form the engine holds.
+    const hostRoot = runRoot.replace(/\\/g, '/');
+    const hostFormMentions = calls.flat().filter(element => {
+      const mentions = element.replace(/\\/g, '/').split(hostRoot).length - 1;
+      const nodeFormMentions = element.split(`/node${hostRoot}`).length - 1;
+      return mentions !== nodeFormMentions;
+    });
+    expect(hostFormMentions).toEqual([]);
+
+    // Substituted and environment run paths.
+    const [pathsCall] = dispatches(calls, '$LOG_DIR/x');
+    const env = deliveredEnv(pathsCall);
+    expect(env.ARTIFACTS_DIR).toBe(node(artifactsDir()));
+    expect(env.STATE_DIR).toBe(node(stateDir()));
+    expect(env.LOG_DIR).toBe(node(logDir()));
+    expect(env.TYPED_ARTIFACTS_FILE.startsWith(`${node(artifactsDir())}/`)).toBe(true);
+    expect(pathsCall.at(-1)).toBe(
+      `echo ${node(artifactsDir())} ${node(stateDir())} ${node(docsDir())}; ` +
+        `cat "$LOG_DIR/x" "${env.TYPED_ARTIFACTS_FILE}"`
+    );
+    // The engine wrote the listing through the host name the node form maps from.
+    expect(existsSync(env.TYPED_ARTIFACTS_FILE.slice('/node'.length))).toBe(true);
+
+    // A named script runs from its node-form path; discovery still read it on the host.
+    expect(scriptDispatch(calls)?.slice(-3)).toEqual(['--no-env-file', 'run', node(scriptPath())]);
+
+    // An oversized `$node.output` reaches the node as a node-form spill reference.
+    const [consumerCall] = dispatches(calls, 'value=');
+    expect(consumerCall.at(-1)).toBe(
+      `value=$(cat '${node(spillPath('producer'))}'); echo "\${#value}"`
+    );
+    expect(existsSync(spillPath('producer'))).toBe(true);
+
+    // So does an oversized `$LOOP_PREV`, on the second pass.
+    const loopCalls = dispatches(calls, 'LOOP_BODY');
+    expect(loopCalls).toHaveLength(2);
+    expect(loopCalls[1].at(-1)).toBe(
+      `previous=$(cat '${node(spillPath('work'))}'); echo LOOP_BODY "\${#previous}"`
+    );
+    expect(existsSync(spillPath('work'))).toBe(true);
+  });
+
+  it('the same DAG on a host run delivers host paths', async () => {
+    const { calls, store } = await runPathsDag();
+
+    expect(completedSteps(store)).toEqual(
+      expect.arrayContaining(['paths', 'report', 'producer', 'consumer', 'draft'])
+    );
+    expect(
+      calls.flat().filter(element => element.includes(WSL_MARKER_BINDING.toNode(runRoot)))
+    ).toEqual([]);
+    const [pathsCall] = dispatches(calls, '$LOG_DIR/x');
+    const env = deliveredEnv(pathsCall);
+    expect(env.ARTIFACTS_DIR).toBe(artifactsDir());
+    expect(env.STATE_DIR).toBe(stateDir());
+    expect(env.LOG_DIR).toBe(logDir());
+    expect(pathsCall.at(-1)).toBe(
+      `echo ${artifactsDir()} ${stateDir()} ${docsDir()}; ` +
+        `cat "$LOG_DIR/x" "${env.TYPED_ARTIFACTS_FILE}"`
+    );
+    expect(scriptDispatch(calls)?.at(-1)).toBe(scriptPath().replace(/\\/g, '/'));
+    const [consumerCall] = dispatches(calls, 'value=');
+    expect(consumerCall.at(-1)).toBe(`value=$(cat '${spillPath('producer')}'); echo "\${#value}"`);
+  });
+
+  for (const shape of ['single', 'fan-out'] as const) {
+    it(`a workflow: node inside a wsl run fails before dispatching a child (${shape})`, async () => {
+      const dockerSpy = stubMissingContainer();
+      const store = createMockStore();
+      const runChildWorkflow = mock<RunChildWorkflowFn>(async () => ({
+        childRunId: 'child',
+        status: 'completed',
+        output: 'done',
+      }));
+      const sub: DagNode =
+        shape === 'single'
+          ? { id: 'sub', kind: 'workflow', workflow: 'child-workflow' }
+          : {
+              id: 'sub',
+              kind: 'workflow',
+              workflow: 'child-workflow',
+              fan_out: { items: '["a","b"]', max_parallel: 1, join: 'all_done' },
+            };
+
+      try {
+        await runWithNodePaths(WSL_MARKER_BINDING, () =>
+          executeDagWorkflow(
+            dagOptions({
+              deps: createMockDeps(store),
+              cwd,
+              runChildWorkflow,
+              workflow: { name: 'wsl-subrun', nodes: [sub] },
+              workflowRun: makeWorkflowRun('wsl-subrun'),
+              execContext: CONTAINER,
+            })
+          )
+        );
+      } finally {
+        dockerSpy.mockRestore();
+      }
+
+      const failed = persistedEvents(store).find(
+        event => event.event_type === 'node_failed' && event.step_name === 'sub'
+      );
+      expect(failed?.data?.failure_kind).toBe('config');
+      expect(failed?.data?.error).toContain(
+        'workflow: sub-runs are not supported in a repo-kind container run'
+      );
+      expect(runChildWorkflow).not.toHaveBeenCalled();
+      expect(store.findChildRuns).not.toHaveBeenCalled();
+      expect(store.createWorkflowRun).not.toHaveBeenCalled();
+    });
+  }
+
+  // A folder container run binds host visibility, so it keeps dispatching children.
+  it('a workflow: node in a folder container run still dispatches its child', async () => {
+    const dockerSpy = stubMissingContainer();
+    const store = createMockStore();
+    const runChildWorkflow = mock<RunChildWorkflowFn>(async () => ({
+      childRunId: 'child',
+      status: 'completed',
+      output: 'done',
+    }));
+
+    try {
+      await executeDagWorkflow(
+        dagOptions({
+          deps: createMockDeps(store),
+          cwd,
+          runChildWorkflow,
+          workflow: {
+            name: 'folder-subrun',
+            nodes: [{ id: 'sub', kind: 'workflow', workflow: 'child-workflow' }],
+          },
+          workflowRun: makeWorkflowRun('folder-subrun'),
+          execContext: CONTAINER,
+        })
+      );
+    } finally {
+      dockerSpy.mockRestore();
+    }
+
+    expect(runChildWorkflow).toHaveBeenCalledTimes(1);
+    expect(completedSteps(store)).toContain('sub');
   });
 });

@@ -163,6 +163,7 @@ import {
   buildExecNodeEnvironment,
   type ExecNodeEnvironmentContext,
 } from './exec-environment';
+import { currentNodeVisibility, toNodePath } from './node-path';
 import { planGraph, resolvedBodyNodes } from './graph-plan';
 import {
   FAN_OUT_CANCEL_REASONS,
@@ -1472,6 +1473,9 @@ function writeSpillFile(dir: string, filename: string, value: string): string | 
  * Shell-quote a value for bash, or write it under the run artifact directory's
  * engine-owned spill child and return a $(cat ...) reference when the value exceeds
  * the inline size threshold.
+ *
+ * The engine writes the spill through the host path; the node that runs the
+ * `$(cat ...)` opens it through `toNodePath`.
  */
 function shellQuoteOrFile(
   value: string,
@@ -1483,7 +1487,7 @@ function shellQuoteOrFile(
     const spillDir = joinPath(artifactsDir, RUN_ARTIFACTS_ENGINE_SUBDIR, 'node-output-spills');
     const filename = field ? `${nodeId}.${field}.nodeoutput` : `${nodeId}.nodeoutput`;
     const filePath = writeSpillFile(spillDir, filename, value);
-    if (filePath) return `$(cat ${shellQuote(filePath)})`;
+    if (filePath) return `$(cat ${shellQuote(toNodePath(filePath))})`;
     return shellQuote(value); // fallback: inline (pre-file-spill behavior)
   }
   return shellQuote(value);
@@ -3913,14 +3917,16 @@ async function executeScriptNode(
       );
     }
 
-    // Use scriptDef.runtime (canonical source) instead of re-deriving from extension
+    // Use scriptDef.runtime (canonical source) instead of re-deriving from extension.
+    // Discovery read the script on the host; the node runs it from its own form of that path.
+    const scriptPath = toNodePath(scriptDef.path);
     if (scriptDef.runtime === 'uv') {
       cmd = 'uv';
       const withFlags = nodeDeps.flatMap(dep => ['--with', dep]);
-      args = ['run', ...withFlags, scriptDef.path];
+      args = ['run', ...withFlags, scriptPath];
     } else {
       cmd = 'bun';
-      args = ['--no-env-file', 'run', scriptDef.path];
+      args = ['--no-env-file', 'run', scriptPath];
     }
   }
 
@@ -7664,6 +7670,20 @@ async function executeWorkflowNode(
     );
   }
 
+  // A child run starts without this run's execution context, so in a repo-kind container
+  // run it would execute on the host against a working path that exists only inside the
+  // container. Refuse before resolving the child's input or looking up a child row; the
+  // fan-out branch below is reached only past this check. A folder container run binds
+  // host visibility and dispatches children as before.
+  if (currentNodeVisibility() === 'wsl') {
+    return failResult(
+      `Node '${node.id}': workflow: sub-runs are not supported in a repo-kind container run. ` +
+        "A child run would execute on the host, outside this run's container. Run the " +
+        "workflow without container isolation, or move the child's nodes into this workflow.",
+      'config'
+    );
+  }
+
   // Dynamic fan-out (slice 2, PR-C): a `fan_out:` node expands into N governed child
   // runs over a data-driven item list, joined into one node outcome. This is a
   // distinct execution path from the slice-1 single-child node below — branch here so
@@ -9313,11 +9333,12 @@ interface PersistScope {
 /**
  * Build the by-reference recovery suffix for a cold-resume warning (#1846): list
  * the typed artifacts that PRIOR invocations of this workflow+scope left in the
- * stable scope dir, as absolute file paths — never pasted content. Entries
- * produced by the current run are excluded (they can't recover anything the
- * fresh session doesn't already have). Returns `''` when there is nothing to
- * point at, or when the scope dir can't be read — recovery is best-effort and
- * must never turn a successful (if cold) node into a failure.
+ * stable scope dir, as absolute file paths in the run's node form (`toNodePath`) —
+ * never pasted content. Entries produced by the current run are excluded (they
+ * can't recover anything the fresh session doesn't already have). Returns `''`
+ * when there is nothing to point at, or when the scope dir can't be read —
+ * recovery is best-effort and must never turn a successful (if cold) node into a
+ * failure.
  */
 async function buildColdResumeRecoveryPointer(
   scopeArtifactsDir: string,
@@ -9341,7 +9362,7 @@ async function buildColdResumeRecoveryPointer(
     if (priorArtifacts.length === 0) return '';
     const lines = priorArtifacts.map(
       entry =>
-        `- ${entry.outputType} (\`${entry.nodeId}\`): ${joinPath(scopeArtifactsDir, entry.path)}`
+        `- ${entry.outputType} (\`${entry.nodeId}\`): ${toNodePath(joinPath(scopeArtifactsDir, entry.path))}`
     );
     return `\nArtifacts from the previous invocation are available for recovery (read on demand):\n${lines.join('\n')}`;
   } catch (err) {
