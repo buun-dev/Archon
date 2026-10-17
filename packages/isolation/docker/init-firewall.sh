@@ -67,18 +67,19 @@ command -v dnsmasq >/dev/null 2>&1 \
 [ -n "$UPSTREAM" ] \
   || { echo "FATAL: no upstream DNS resolver found in /etc/resolv.conf" >&2; exit 4; }
 
-HOSTS_SLASH="$(IFS=/; printf '%s' "${HOSTS[*]}")"
 # One self-contained config; deliberately NOT the distro's /etc/dnsmasq.conf,
 # so a base-image change cannot quietly alter resolver behaviour here.
-#   server=/a/b/UP  forwards each listed name and its subdomains
+#   server=/a/UP    forwards a listed name and its subdomains
 #   server=//UP     forwards dotless names (compose services, container names)
 #   address=/#/     answers every other name NXDOMAIN
-#   ipset=/a/b/set  covers the same names, so what resolves is what gets allowed
+#   ipset=/a/set    covers the same names, so what resolves is what gets allowed
+# One line per host, both from HOSTS: dnsmasq rejects a config line over about
+# 1 KiB, which one joined line per directive would hit on a long allowlist.
 { printf 'no-resolv\nno-hosts\nlisten-address=127.0.0.1\nbind-interfaces\nport=53\n'
-  printf 'server=/%s/%s\n' "$HOSTS_SLASH" "$UPSTREAM"
+  for host in "${HOSTS[@]}"; do printf 'server=/%s/%s\n' "$host" "$UPSTREAM"; done
   printf 'server=//%s\n' "$UPSTREAM"
   printf 'address=/#/\n'
-  printf 'ipset=/%s/archon-allow\n' "$HOSTS_SLASH"
+  for host in "${HOSTS[@]}"; do printf 'ipset=/%s/archon-allow\n' "$host"; done
 } > /etc/archon-dnsmasq.conf
 
 # A re-run in a running container must not race the old dnsmasq for port 53.
@@ -140,7 +141,7 @@ iptables -A OUTPUT -j REJECT --reject-with icmp-port-unreachable
 # it also proves the resolver path works. A host that cannot resolve is fatal —
 # a typo must not silently become an open hole.
 for host in "${HOSTS[@]}"; do
-  ips=$(getent ahostsv4 "$host" | awk '{print $1}' | sort -u)
+  ips=$(getent ahostsv4 "$host" | awk '{print $1}' | sort -u) || ips=""
   [ -z "$ips" ] && { echo "FATAL: cannot resolve $host" >&2; exit 3; }
   for ip in $ips; do ipset add archon-allow "$ip" -exist; done
 done
