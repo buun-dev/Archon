@@ -1208,15 +1208,12 @@ describe('isolationReapCommand', () => {
 describe('isolationRemoveCommand', () => {
   let consoleLogSpy: ReturnType<typeof spyOn>;
   let consoleErrorSpy: ReturnType<typeof spyOn>;
-  let savedExitCode: typeof process.exitCode;
   const FULL1 = 'aa271d53-1111-2222-3333-444444444444';
   const FULL2 = 'bb271d53-1111-2222-3333-444444444444';
 
   beforeEach(() => {
     consoleLogSpy = spyOn(console, 'log').mockImplementation(() => {});
     consoleErrorSpy = spyOn(console, 'error').mockImplementation(() => {});
-    savedExitCode = process.exitCode;
-    process.exitCode = 0;
     mockRemoveContainerEnv.mockReset();
     mockRemoveContainerEnv.mockResolvedValue({ kind: 'removed' });
     mockResolveContainerEnvId.mockReset();
@@ -1226,20 +1223,19 @@ describe('isolationRemoveCommand', () => {
   afterEach(() => {
     consoleLogSpy.mockRestore();
     consoleErrorSpy.mockRestore();
-    process.exitCode = savedExitCode;
   });
 
   it('remove prints Removed and leaves exit status 0', async () => {
     mockResolveContainerEnvId.mockResolvedValueOnce(FULL1);
 
-    await isolationRemoveCommand(['aa27'], {});
+    const status = await isolationRemoveCommand(['aa27'], {});
 
     expect(mockRemoveContainerEnv).toHaveBeenCalledWith(FULL1, mockStore, { force: false });
     expect(consoleLogSpy).toHaveBeenCalledWith('  Removed: aa271d53');
     expect(consoleLogSpy).toHaveBeenCalledWith(
       'Container remove: 1 removed, 0 reconciled, 0 skipped, 0 failed'
     );
-    expect(process.exitCode).toBe(0);
+    expect(status).toBe(0);
   });
 
   it('remove reports a held sandbox as Held with its reason and exits 1', async () => {
@@ -1250,12 +1246,12 @@ describe('isolationRemoveCommand', () => {
       reason: 'unpushed commits in sandbox worktree /w: push or discard that work there',
     });
 
-    await isolationRemoveCommand(['aa27'], {});
+    const status = await isolationRemoveCommand(['aa27'], {});
 
     expect(consoleLogSpy).toHaveBeenCalledWith(
       '  Held: aa271d53 — unpushed commits in sandbox worktree /w: push or discard that work there'
     );
-    expect(process.exitCode).toBe(1);
+    expect(status).toBe(1);
   });
 
   it('--force is passed through to removeContainerEnv', async () => {
@@ -1270,7 +1266,7 @@ describe('isolationRemoveCommand', () => {
       new Error("No active container environment matches 'zzzz' (see archon isolation list)")
     );
 
-    await isolationRemoveCommand(['aa27', 'zzzz'], { json: true });
+    const status = await isolationRemoveCommand(['aa27', 'zzzz'], { json: true });
 
     expect(consoleLogSpy).toHaveBeenCalledTimes(1);
     expect(consoleErrorSpy).not.toHaveBeenCalled();
@@ -1285,20 +1281,20 @@ describe('isolationRemoveCommand', () => {
         },
       ],
     });
-    expect(process.exitCode).toBe(1);
+    expect(status).toBe(1);
   });
 
   it('each id is handled independently', async () => {
     mockResolveContainerEnvId.mockRejectedValueOnce(new Error('no match'));
     mockResolveContainerEnvId.mockResolvedValueOnce(FULL2);
 
-    await isolationRemoveCommand(['zzzz', 'bb27'], {});
+    const status = await isolationRemoveCommand(['zzzz', 'bb27'], {});
 
     expect(mockRemoveContainerEnv).toHaveBeenCalledTimes(1);
     expect(mockRemoveContainerEnv).toHaveBeenCalledWith(FULL2, mockStore, { force: false });
     expect(consoleErrorSpy).toHaveBeenCalledWith('  Failed: zzzz — no match');
     expect(consoleLogSpy).toHaveBeenCalledWith('  Removed: bb271d53');
-    expect(process.exitCode).toBe(1);
+    expect(status).toBe(1);
   });
 
   it('a removal error is reported against the full id and later ids still run', async () => {
@@ -1306,7 +1302,7 @@ describe('isolationRemoveCommand', () => {
     mockResolveContainerEnvId.mockResolvedValueOnce(FULL2);
     mockRemoveContainerEnv.mockRejectedValueOnce(new Error('teardown not confirmed'));
 
-    await isolationRemoveCommand(['aa27', 'bb27'], { json: true });
+    const status = await isolationRemoveCommand(['aa27', 'bb27'], { json: true });
 
     expect(JSON.parse(String(consoleLogSpy.mock.calls[0]?.[0]))).toEqual({
       removed: [FULL2],
@@ -1314,7 +1310,7 @@ describe('isolationRemoveCommand', () => {
       skipped: [],
       errors: [{ id: FULL1, error: 'teardown not confirmed' }],
     });
-    expect(process.exitCode).toBe(1);
+    expect(status).toBe(1);
   });
 });
 

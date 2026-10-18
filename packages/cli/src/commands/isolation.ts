@@ -240,12 +240,14 @@ export async function isolationReapCommand(
  * Remove repo sandboxes by id (or unique id prefix), each independently. Held work
  * is kept unless `force`; a live run's sandbox is never removed. `--json` prints one
  * document, `{ removed, reconciled, skipped: [{ id, kind, reason }], errors: [{ id,
- * error }] }`, and nothing else on stdout. Exit status is 1 when any id was not removed.
+ * error }] }`, and nothing else on stdout. Returns the exit status: 1 when any id was
+ * not removed (skipped or failed), else 0. It leaves `process.exitCode` alone, which
+ * the caller's `process.exit` would override.
  */
 export async function isolationRemoveCommand(
   ids: string[],
   options: { force?: boolean; json?: boolean }
-): Promise<void> {
+): Promise<number> {
   const report: ContainerCleanupReport = { removed: [], reconciled: [], skipped: [], errors: [] };
   const store = isolationDb.createIsolationStore();
   for (const input of ids) {
@@ -264,12 +266,12 @@ export async function isolationRemoveCommand(
       report.errors.push({ id, error: err.message });
     }
   }
-  if (report.removed.length < ids.length) process.exitCode = 1;
   if (options.json) {
     console.log(JSON.stringify(report, null, 2));
-    return;
+  } else {
+    printContainerReport(report, 'Container remove');
   }
-  printContainerReport(report, 'Container remove');
+  return report.removed.length < ids.length ? 1 : 0;
 }
 
 /** The `isolation reap` threshold: 7 when omitted; undefined when not a non-negative number. */

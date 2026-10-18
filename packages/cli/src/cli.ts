@@ -1356,8 +1356,10 @@ async function main(): Promise<number> {
                 'Usage: archon isolation remove <env-id> [env-id ...] [--force] [--json]'
               );
             }
-            await isolationRemoveCommand(ids, { force: Boolean(values.force), json: jsonFlag });
-            break;
+            return await isolationRemoveCommand(ids, {
+              force: Boolean(values.force),
+              json: jsonFlag,
+            });
           }
 
           case 'cleanup': {
