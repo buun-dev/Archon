@@ -217,8 +217,8 @@ export class SandboxLifecycle {
   /**
    * Cut a fresh worktree, bring the stack up, provision it, then firewall it.
    *
-   * A sandbox is never reused. A slug can repeat (a long workflow name truncates the
-   * run's timestamp out of it), and a worktree or compose project already at this slug
+   * A sandbox is never reused. A slug can still repeat (the same identifier, or a hash
+   * collision on a long one), and a worktree or compose project already at this slug
    * belongs to another run: provisioning into it would mix the two runs' work, and this
    * call's rollback would then tear the other run down. So both are refused before
    * anything is fetched or cut.
