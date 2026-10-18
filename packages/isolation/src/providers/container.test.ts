@@ -123,6 +123,37 @@ describe('ContainerProvider.create', () => {
     expect(env.metadata).toEqual({ request });
   });
 
+  describe('task slug', () => {
+    const slugOf = async (identifier: string): Promise<string> => {
+      const provider = new ContainerProvider({ ...makeRunners(), loadConfig: async () => null });
+      const env = await provider.create({
+        ...BASE_REQ,
+        workflowType: 'task',
+        identifier,
+      } as IsolationRequest);
+      return env.workingPath.split('/').pop() ?? '';
+    };
+
+    test("a task identifier up to 50 slug chars keeps today's slug", async () => {
+      const id = `${'a'.repeat(36)}-1792254853290`;
+      expect(await slugOf(id)).toBe(`task-${'a'.repeat(36)}-1792254853290`);
+    });
+
+    test('a longer identifier keeps a unique hash suffix within 50 chars', async () => {
+      const first = await slugOf(`${'a'.repeat(37)}-1792254853290`);
+      const second = await slugOf(`${'a'.repeat(37)}-1792254853291`);
+      expect(first).not.toBe(second);
+      for (const slug of [first, second]) {
+        expect(slug).toMatch(/^task-a{37}-179-[0-9a-f]{8}$/);
+        expect(slug.length).toBeLessThanOrEqual(55);
+      }
+    });
+
+    test('a 60-char name keeps the first 41 slug chars', async () => {
+      expect(await slugOf(`${'b'.repeat(60)}-1792254853290`)).toMatch(/^task-b{41}-[0-9a-f]{8}$/);
+    });
+  });
+
   test('resolves the container id via `docker compose -p <project> ps -q agent`', async () => {
     const runners = makeRunners('cid-xyz');
     const provider = new ContainerProvider({ ...runners, loadConfig: async () => null });
@@ -345,8 +376,7 @@ describe('ContainerProvider.create — a failed provision leaves nothing behind'
 });
 
 /**
- * A slug is not guaranteed unique: a long workflow name truncates the run's timestamp
- * out of it, and an issue or thread slug repeats by design. A second run must never
+ * A slug is not guaranteed unique: an issue or thread slug repeats by design. A second run must never
  * provision into, or later tear down, another run's sandbox.
  */
 describe("ContainerProvider.create — refuses another run's sandbox", () => {
@@ -366,7 +396,7 @@ describe("ContainerProvider.create — refuses another run's sandbox", () => {
 
     const p = provider.create(REQ);
     await expect(p).rejects.toThrow(new RegExp(`worktree ${WORKTREE} already exists`));
-    await expect(p).rejects.toThrow(/archon isolation cleanup/);
+    await expect(p).rejects.toThrow(/archon isolation remove <env-id>/);
     const scripts = runners.calls.wsl.map(c => c.script).join('\n');
     expect(scripts).not.toContain('fetch');
     expect(scripts).not.toContain('worktree add');

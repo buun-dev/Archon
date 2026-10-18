@@ -361,10 +361,10 @@ export class SandboxLifecycle {
   private async assertSlugFree(spec: SandboxUpSpec): Promise<void> {
     const taken = (what: string): Error =>
       new Error(
-        `Sandbox up refused: ${what} already exists. Another run's sandbox has the slug ` +
-          `'${spec.slug}' (a long workflow name truncates the run's timestamp out of the slug), ` +
-          'and a sandbox is never reused. Reclaim that sandbox (`archon isolation cleanup`, or ' +
-          'abandon its run), then run this again.'
+        `Sandbox up refused: ${what} already exists: another sandbox holds the slug ` +
+          `'${spec.slug}', and a sandbox is never reused. Find it with archon isolation list ` +
+          `(path ${spec.worktree}) and remove it with archon isolation remove <env-id>, ` +
+          'then run this again.'
       );
     const { stdout } = await this.run(
       spec,

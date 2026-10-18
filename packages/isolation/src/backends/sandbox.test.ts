@@ -152,7 +152,11 @@ describe('SandboxLifecycle.up', () => {
     const { calls, wsl, docker, onLine } = makeRunners({ worktreeExists: true });
     const lifecycle = new SandboxLifecycle({ wsl, docker, onLine });
 
-    await expect(lifecycle.up(SPEC)).rejects.toThrow(`worktree ${SPEC.worktree} already exists`);
+    const refusal = lifecycle.up(SPEC);
+    await expect(refusal).rejects.toThrow(`worktree ${SPEC.worktree} already exists`);
+    await expect(refusal).rejects.toThrow('archon isolation list');
+    await expect(refusal).rejects.toThrow('archon isolation remove <env-id>');
+    await expect(refusal).rejects.not.toThrow('isolation cleanup');
 
     const scripts = calls.wsl.map(c => c.script).join('\n');
     expect(scripts).not.toContain('fetch');

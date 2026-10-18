@@ -771,7 +771,10 @@ export class ContainerProvider implements IContainerIsolationProvider {
    * Slug = the WorktreeProvider branch name with the `archon/` org-prefix stripped
    * and any remaining `/` flattened to `-`, so it is one filesystem-safe path
    * segment + compose-project suffix. Mirrors the worktree branch-name rule so
-   * ledger linkage stays consistent across providers.
+   * ledger linkage stays consistent across providers. A `task` slug that would
+   * exceed 50 characters is truncated and keeps a hash of the full identifier, so
+   * two identifiers that differ only in the cut-off tail (the CLI appends
+   * `Date.now()`) never share a slug.
    */
   private slugFor(request: IsolationRequest): string {
     return this.generateBranchName(request)
@@ -795,7 +798,7 @@ export class ContainerProvider implements IContainerIsolationProvider {
       case 'thread':
         return `archon/thread-${this.shortHash(request.identifier)}`;
       case 'task':
-        return `archon/task-${this.slugify(request.identifier)}`;
+        return `archon/task-${this.taskSlug(request.identifier)}`;
     }
   }
 
@@ -803,14 +806,23 @@ export class ContainerProvider implements IContainerIsolationProvider {
     return createHash('sha256').update(input).digest('hex').substring(0, 8);
   }
 
+  private taskSlug(identifier: string): string {
+    const slug = this.slugify(identifier);
+    if (slug.length <= TASK_SLUG_MAX) return slug;
+    const head = slug.substring(0, TASK_SLUG_MAX - 9).replace(/-$/, '');
+    return `${head}-${this.shortHash(identifier)}`;
+  }
+
   private slugify(input: string): string {
     return input
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, '-')
-      .replace(/^-|-$/g, '')
-      .substring(0, 50);
+      .replace(/^-|-$/g, '');
   }
 }
+
+/** Longest task slug, hash suffix included. */
+const TASK_SLUG_MAX = 50;
 
 /** The named keys that are set, and nothing else — the lifecycle sees no other secret. */
 function pick<K extends string>(source: NodeJS.ProcessEnv, keys: K[]): Partial<Record<K, string>> {
