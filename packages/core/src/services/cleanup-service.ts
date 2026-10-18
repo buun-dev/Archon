@@ -315,6 +315,98 @@ export async function reclaimContainerEnv(
   return { kind: 'reclaimed' };
 }
 
+/**
+ * What {@link removeContainerEnv} did with the one sandbox it was given.
+ * - `removed`: torn down, and its row marked destroyed after a fresh inspect.
+ * - `skipped`: kept, with the reason: its platform is unregistered (`platform`), a
+ *   run can still claim it (`live-run`), or it holds unsaved work and `force` was
+ *   not given (`held-work`; its stack is stopped).
+ */
+export type ContainerRemoveOutcome =
+  | { kind: 'removed' }
+  | { kind: 'skipped'; skip: ContainerSkipKind; reason: string };
+
+/**
+ * `archon isolation remove`: tear down exactly one active repo sandbox, by full id.
+ * Throws, touching nothing, for a row that is missing, not active, a worktree (its
+ * verb is `archon complete`) or a folder-project container (its run's abandon or
+ * cancel, or the reaper, owns it). A run that can still claim the sandbox always
+ * wins, `force` included, and a run lookup that cannot answer throws. Without
+ * `force`, held work keeps the sandbox exactly as reclaimContainerEnv keeps it;
+ * with `force` the hold is skipped and the work discarded. Either way the row is
+ * marked destroyed only once a fresh inspect confirms the teardown, and an
+ * unconfirmed teardown throws with the row still active (see reclaimRepoSandbox).
+ */
+export async function removeContainerEnv(
+  envId: string,
+  store: IIsolationStore,
+  options: { force?: boolean } = {},
+  readers: { getCodebase: typeof codebaseDb.getCodebase } = {
+    getCodebase: codebaseDb.getCodebase,
+  }
+): Promise<ContainerRemoveOutcome> {
+  const env = await store.getById(envId);
+  if (!env) throw new Error(`No isolation environment ${envId}`);
+  if (env.status !== 'active') {
+    throw new Error(`Isolation environment ${envId} is ${env.status}, not active`);
+  }
+  if (env.provider !== 'container') {
+    throw new Error(
+      `Isolation environment ${envId} is a ${env.provider}, not a repo sandbox` +
+        (env.provider === 'worktree' ? `; remove it with archon complete ${env.branch_name}` : '')
+    );
+  }
+  if ((await containerEnvKind(env, readers.getCodebase)) !== 'repo') {
+    throw new Error(
+      `Isolation environment ${envId} is a folder-project container, not a repo sandbox; ` +
+        'abandon or cancel its run, or archon isolation cleanup'
+    );
+  }
+  const platform = unknownPlatformReason(env.created_by_platform);
+  if (platform) return { kind: 'skipped', skip: 'platform', reason: platform };
+  const liveRun = await getLiveRunBlocker(envId);
+  if (liveRun) {
+    return {
+      kind: 'skipped',
+      skip: 'live-run',
+      reason: `${liveRun.display}; abandon or cancel it first (archon workflow abandon ${liveRun.runId})`,
+    };
+  }
+  const sandbox = repoSandboxProvider();
+  if (options.force) {
+    await reclaimRepoSandbox(env, sandbox, store);
+    return { kind: 'removed' };
+  }
+  const outcome = await reclaimRepoSandboxUnlessHeld(env, sandbox, store);
+  return outcome.kind === 'held'
+    ? { kind: 'skipped', skip: 'held-work', reason: outcome.reason }
+    : { kind: 'removed' };
+}
+
+/**
+ * The full id of the one active container environment whose id starts with
+ * `input`. Throws when none does (an empty `input` matches none), or when several
+ * do: an ambiguous prefix is never resolved by picking one.
+ */
+export async function resolveContainerEnvId(input: string): Promise<string> {
+  const rows = await isolationEnvDb.listActiveContainerEnvironments();
+  // An empty prefix would match every row, and so remove the only one there is.
+  const matches = input === '' ? [] : rows.filter(row => row.id.startsWith(input));
+  const [only, ...rest] = matches;
+  if (!only) {
+    throw new Error(
+      `No active container environment matches '${input}' (see archon isolation list)`
+    );
+  }
+  if (rest.length > 0) {
+    const candidates = matches.map(row => row.id.slice(0, 8)).join(', ');
+    throw new Error(
+      `'${input}' matches several container environments: ${candidates} — give more of the id`
+    );
+  }
+  return only.id;
+}
+
 /** The repo half of {@link reclaimContainerEnv}: keep held work, else reclaim. */
 async function reclaimRepoSandboxUnlessHeld(
   env: Pick<IsolationEnvironmentRow, 'id' | 'working_path'>,
@@ -336,7 +428,7 @@ async function reclaimRepoSandboxUnlessHeld(
       { cause: err }
     );
   }
-  const held = heldWorkReason(inspection, env.working_path);
+  const held = heldWorkReason(inspection, env.working_path, env.id);
   if (!held) {
     await reclaimRepoSandbox(env, sandbox, store);
     return { kind: 'reclaimed' };
@@ -391,10 +483,16 @@ export async function listContainerEnvironments(): Promise<readonly ContainerEnv
  * What a sandbox holds that exists nowhere else, and how the operator releases it,
  * or null when it holds nothing. The teardown deletes the worktree and its
  * `sandbox/<slug>` branch, so every path that could tear one down keeps such a
- * sandbox: the reaper, a closed conversation, and abandon, cancel and `/reset`
- * through reclaimContainerEnv.
+ * sandbox: the reaper, a closed conversation, abandon, cancel and `/reset` through
+ * reclaimContainerEnv, and `archon isolation remove` without `--force`. Each of them
+ * shares this wording, which names the one command that releases exactly this
+ * sandbox (by its 8-character id prefix) once the work is saved, or discards it.
  */
-function heldWorkReason(inspection: SandboxInspection, workingPath: string): string | null {
+function heldWorkReason(
+  inspection: SandboxInspection,
+  workingPath: string,
+  envId: string
+): string | null {
   if (!inspection.worktreeExists || (!inspection.dirty && !inspection.unpushed)) return null;
   const work = [
     ...(inspection.dirty ? ['uncommitted changes'] : []),
@@ -402,7 +500,7 @@ function heldWorkReason(inspection: SandboxInspection, workingPath: string): str
   ].join(' and ');
   return (
     `${work} in sandbox worktree ${workingPath}: push or discard that work there, ` +
-    'then re-run `archon isolation cleanup`'
+    `then run archon isolation remove ${envId.slice(0, 8)} (add --force to discard it)`
   );
 }
 
@@ -565,7 +663,7 @@ async function sweepRepoSandbox(
   }
   // Work that exists only in the sandbox is held whatever the run's status, or with
   // no run at all. Only the operator can release it.
-  const held = heldWorkReason(inspection, row.working_path);
+  const held = heldWorkReason(inspection, row.working_path, row.id);
   if (held) {
     report.skipped.push({
       id: row.id,
@@ -695,7 +793,7 @@ export async function onConversationClosed(
       } catch (err) {
         throw retained(`inspect failed: ${(err as Error).message}`, err);
       }
-      const held = heldWorkReason(inspection, env.working_path);
+      const held = heldWorkReason(inspection, env.working_path, envId);
       if (held) {
         getLog().warn({ envId }, 'conversation_cleanup_sandbox_held_work');
         throw retained(held);

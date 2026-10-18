@@ -1048,7 +1048,7 @@ describe('isolationCleanupCommand', () => {
           kind: 'held-work',
           reason:
             'unpushed commits in sandbox worktree /home/u/archon/worktrees/repo/task-x: push or ' +
-            'discard that work there, then re-run `archon isolation cleanup`',
+            'discard that work there, then run archon isolation remove e1e1e1e1 (add --force to discard it)',
         },
         { id: 'f0f0f0f0-0000', kind: 'age', reason: '2d old (< 7d threshold)' },
       ],
@@ -1063,7 +1063,7 @@ describe('isolationCleanupCommand', () => {
     // would be wrong for a run-less or completed sandbox (there is no run to abandon).
     expect(consoleLogSpy).toHaveBeenCalledWith(
       '  Held: e1e1e1e1 — unpushed commits in sandbox worktree /home/u/archon/worktrees/repo/task-x: ' +
-        'push or discard that work there, then re-run `archon isolation cleanup`'
+        'push or discard that work there, then run archon isolation remove e1e1e1e1 (add --force to discard it)'
     );
     expect(consoleLogSpy).toHaveBeenCalledWith('  Skipped: f0f0f0f0 — 2d old (< 7d threshold)');
     expect(consoleErrorSpy).toHaveBeenCalledWith(
@@ -1116,7 +1116,7 @@ describe('isolationReapCommand', () => {
         kind: 'held-work',
         reason:
           'unpushed commits in sandbox worktree /home/u/archon/worktrees/repo/task-x: push or ' +
-          'discard that work there, then re-run `archon isolation cleanup`',
+          'discard that work there, then run archon isolation remove e1e1e1e1 (add --force to discard it)',
       },
       { id: 'f0f0f0f0-0000', kind: 'age', reason: '2d old (< 7d threshold)' },
     ],
@@ -1172,7 +1172,7 @@ describe('isolationReapCommand', () => {
     expect(consoleLogSpy).toHaveBeenCalledWith('  Reconciled: 35c7d928 (no stack, no worktree)');
     expect(consoleLogSpy).toHaveBeenCalledWith(
       '  Held: e1e1e1e1 — unpushed commits in sandbox worktree /home/u/archon/worktrees/repo/task-x: ' +
-        'push or discard that work there, then re-run `archon isolation cleanup`'
+        'push or discard that work there, then run archon isolation remove e1e1e1e1 (add --force to discard it)'
     );
     expect(consoleLogSpy).toHaveBeenCalledWith('  Skipped: f0f0f0f0 — 2d old (< 7d threshold)');
     expect(consoleErrorSpy).toHaveBeenCalledWith(

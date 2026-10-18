@@ -77,7 +77,7 @@ const mockReclaimContainerEnv = mock<WorkflowOperationsDeps['reclaimContainerEnv
 /** What a sandbox holding unsaved work reports, as `heldWorkReason` words it. */
 const HELD_REASON =
   'unpushed commits in sandbox worktree /home/u/archon/worktrees/repo/task-x: push or ' +
-  'discard that work there, then re-run `archon isolation cleanup`';
+  'discard that work there, then run archon isolation remove env-9 (add --force to discard it)';
 
 import { DetachedRunOwnerUnavailableError } from '../services/run-owner-stop';
 /** What the stop path reports when nothing listens at the run's endpoint. */

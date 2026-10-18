@@ -367,6 +367,8 @@ import {
   onConversationClosed,
   cleanupContainerEnvironments,
   reclaimContainerEnv,
+  removeContainerEnv,
+  resolveContainerEnvId,
   SESSION_RETENTION_DAYS,
   type RemoveEnvironmentResult,
 } from './cleanup-service';
@@ -375,10 +377,10 @@ import {
 const SANDBOX_PATH = '/home/u/archon/worktrees/repo/task-assist-1';
 
 /** The held-work reason: what is held, where, and how the operator releases it. */
-function heldReason(work: string): string {
+function heldReason(work: string, envId = 'env-repo'): string {
   return (
     `${work} in sandbox worktree ${SANDBOX_PATH}: push or discard that work there, ` +
-    'then re-run `archon isolation cleanup`'
+    `then run archon isolation remove ${envId.slice(0, 8)} (add --force to discard it)`
   );
 }
 
@@ -643,6 +645,218 @@ describe('reclaimContainerEnv', () => {
       );
       expect(store.updateStatus).not.toHaveBeenCalled();
     });
+  });
+});
+
+// `archon isolation remove`: an operator tears down exactly one repo sandbox by id.
+describe('removeContainerEnv', () => {
+  const ENV_ID = 'a1b2c3d4-0000-4000-8000-000000000001';
+  const repoRow = makeEnvironment({
+    id: ENV_ID,
+    provider: 'container',
+    working_path: SANDBOX_PATH,
+  });
+  const UNPUSHED: Isolation.SandboxInspection = { ...LIVE_CLEAN, unpushed: true };
+
+  beforeEach(() => {
+    resetSandbox();
+    mockContainerDestroy.mockReset();
+    mockContainerDestroy.mockImplementation(() => Promise.resolve());
+    mockContainerOptions.mockClear();
+    mockGetLiveRunOwningEnv.mockReset();
+    mockGetLiveRunOwningEnv.mockImplementation(() => Promise.resolve(null));
+    mockGetCodebase.mockReset();
+    mockGetCodebase.mockImplementation(() => Promise.resolve(makeCodebase({ kind: 'repo' })));
+  });
+  afterEach(() => {
+    mockGetCodebase.mockReset();
+    mockGetCodebase.mockImplementation(() => Promise.resolve(null));
+  });
+
+  test('removes a clean repo sandbox and marks it destroyed after confirming', async () => {
+    const store = makeStore(repoRow);
+
+    expect(await removeContainerEnv(ENV_ID, store)).toEqual({ kind: 'removed' });
+
+    expect(mockSandboxDestroy).toHaveBeenCalledTimes(1);
+    expect(mockSandboxDestroy).toHaveBeenCalledWith(SANDBOX_PATH);
+    expect(mockSandboxInspect).toHaveBeenCalledTimes(2);
+    expect(store.updateStatus).toHaveBeenCalledWith(ENV_ID, 'destroyed');
+    expect(mockSandboxInspect.mock.invocationCallOrder[1]).toBeLessThan(
+      store.updateStatus.mock.invocationCallOrder[0] ?? 0
+    );
+    expect(mockContainerDestroy).not.toHaveBeenCalled();
+  });
+
+  test('holds a sandbox with unpushed work without force', async () => {
+    mockSandboxInspect.mockImplementation(() => Promise.resolve(UNPUSHED));
+    const store = makeStore(repoRow);
+
+    const outcome = await removeContainerEnv(ENV_ID, store);
+
+    expect(outcome).toEqual({
+      kind: 'skipped',
+      skip: 'held-work',
+      reason: heldReason('unpushed commits', ENV_ID),
+    });
+    const reason = outcome.kind === 'skipped' ? outcome.reason : '';
+    expect(reason).toContain(`archon isolation remove ${ENV_ID.slice(0, 8)}`);
+    expect(reason).toContain('--force');
+    expect(mockSandboxStop).toHaveBeenCalledWith(SANDBOX_PATH);
+    expect(mockSandboxDestroy).not.toHaveBeenCalled();
+    expect(store.updateStatus).not.toHaveBeenCalled();
+  });
+
+  test('force removes a sandbox with unpushed work', async () => {
+    mockSandboxInspect.mockImplementation(() =>
+      Promise.resolve(mockSandboxDestroy.mock.calls.length > 0 ? GONE : UNPUSHED)
+    );
+    const store = makeStore(repoRow);
+
+    expect(await removeContainerEnv(ENV_ID, store, { force: true })).toEqual({
+      kind: 'removed',
+    });
+
+    expect(mockSandboxDestroy).toHaveBeenCalledWith(SANDBOX_PATH);
+    expect(store.updateStatus).toHaveBeenCalledWith(ENV_ID, 'destroyed');
+  });
+
+  test('force never overrides a live run', async () => {
+    const runId = 'run-paused-0000-4000';
+    mockGetLiveRunOwningEnv.mockImplementation(() =>
+      Promise.resolve({ id: runId, status: 'paused' })
+    );
+    const store = makeStore(repoRow);
+
+    const outcome = await removeContainerEnv(ENV_ID, store, { force: true });
+
+    expect(outcome).toEqual({
+      kind: 'skipped',
+      skip: 'live-run',
+      reason: `run ${runId.slice(0, 8)} is paused; abandon or cancel it first (archon workflow abandon ${runId})`,
+    });
+    expect(mockSandboxDestroy).not.toHaveBeenCalled();
+    expect(mockSandboxStop).not.toHaveBeenCalled();
+    expect(mockSandboxInspect).not.toHaveBeenCalled();
+    expect(store.updateStatus).not.toHaveBeenCalled();
+  });
+
+  test('a live-run lookup failure throws and removes nothing', async () => {
+    mockGetLiveRunOwningEnv.mockImplementation(() => Promise.reject(new Error('DB down')));
+    const store = makeStore(repoRow);
+
+    await expect(removeContainerEnv(ENV_ID, store, { force: true })).rejects.toThrow('DB down');
+
+    expect(mockSandboxDestroy).not.toHaveBeenCalled();
+    expect(mockSandboxStop).not.toHaveBeenCalled();
+    expect(store.updateStatus).not.toHaveBeenCalled();
+  });
+
+  test('force with an unconfirmed teardown throws and keeps the row active', async () => {
+    mockSandboxDestroy.mockImplementation(() =>
+      Promise.resolve({ ...TORN_DOWN, worktreeRemoved: false })
+    );
+    const store = makeStore(repoRow);
+
+    await expect(removeContainerEnv(ENV_ID, store, { force: true })).rejects.toThrow(
+      'remains active'
+    );
+
+    expect(store.updateStatus).not.toHaveBeenCalled();
+  });
+
+  test('refuses a folder container row without touching ContainerBackend', async () => {
+    mockGetCodebase.mockImplementation(() => Promise.resolve(makeCodebase({ kind: 'folder' })));
+    const store = makeStore(makeContainerEnvironment({ id: ENV_ID }));
+
+    await expect(removeContainerEnv(ENV_ID, store)).rejects.toThrow(
+      'abandon or cancel its run, or archon isolation cleanup'
+    );
+
+    expect(mockContainerOptions).not.toHaveBeenCalled();
+    expect(mockContainerDestroy).not.toHaveBeenCalled();
+    expect(mockSandboxDestroy).not.toHaveBeenCalled();
+    expect(store.updateStatus).not.toHaveBeenCalled();
+  });
+
+  test('refuses a worktree row naming archon complete', async () => {
+    const store = makeStore(makeEnvironment({ id: ENV_ID, branch_name: 'feature-x' }));
+
+    await expect(removeContainerEnv(ENV_ID, store)).rejects.toThrow('archon complete feature-x');
+
+    expect(mockSandboxDestroy).not.toHaveBeenCalled();
+    expect(store.updateStatus).not.toHaveBeenCalled();
+  });
+
+  test('refuses a destroyed row', async () => {
+    const store = makeStore({ ...repoRow, status: 'destroyed' });
+
+    await expect(removeContainerEnv(ENV_ID, store)).rejects.toThrow('is destroyed, not active');
+
+    expect(mockSandboxDestroy).not.toHaveBeenCalled();
+    expect(store.updateStatus).not.toHaveBeenCalled();
+  });
+
+  test('refuses a missing row', async () => {
+    await expect(removeContainerEnv(ENV_ID, makeStore(null))).rejects.toThrow(
+      `No isolation environment ${ENV_ID}`
+    );
+    expect(mockSandboxDestroy).not.toHaveBeenCalled();
+  });
+
+  test('a row from an unregistered platform is skipped as platform', async () => {
+    const store = makeStore({ ...repoRow, created_by_platform: 'removed-chat' });
+
+    const outcome = await removeContainerEnv(ENV_ID, store, { force: true });
+
+    expect(outcome.kind === 'skipped' ? outcome.skip : outcome.kind).toBe('platform');
+    expect(outcome.kind === 'skipped' ? outcome.reason : '').toContain(
+      "platform 'removed-chat' is not registered"
+    );
+    expect(mockSandboxDestroy).not.toHaveBeenCalled();
+  });
+});
+
+describe('resolveContainerEnvId', () => {
+  const rows = [
+    makeContainerEnvironment({ id: 'a1b2c3d4-0000-4000-8000-000000000001' }),
+    makeContainerEnvironment({ id: 'a1b2ffff-0000-4000-8000-000000000002' }),
+    makeContainerEnvironment({ id: 'b7e8f9a0-0000-4000-8000-000000000003' }),
+  ];
+
+  beforeEach(() => {
+    mockListActiveContainerEnvironments.mockReset();
+    mockListActiveContainerEnvironments.mockImplementation(() => Promise.resolve(rows));
+  });
+  afterEach(() => {
+    mockListActiveContainerEnvironments.mockReset();
+    mockListActiveContainerEnvironments.mockImplementation(() => Promise.resolve([]));
+  });
+
+  test('resolves a unique prefix to the full id', async () => {
+    expect(await resolveContainerEnvId('a1b2c3')).toBe('a1b2c3d4-0000-4000-8000-000000000001');
+    expect(await resolveContainerEnvId('b7e8f9a0-0000-4000-8000-000000000003')).toBe(
+      'b7e8f9a0-0000-4000-8000-000000000003'
+    );
+  });
+
+  test('an ambiguous prefix is refused with every candidate named', async () => {
+    await expect(resolveContainerEnvId('a1b2')).rejects.toThrow(
+      "'a1b2' matches several container environments: a1b2c3d4, a1b2ffff — give more of the id"
+    );
+  });
+
+  test('an unknown prefix is refused pointing at isolation list', async () => {
+    await expect(resolveContainerEnvId('ffff')).rejects.toThrow(
+      "No active container environment matches 'ffff' (see archon isolation list)"
+    );
+  });
+
+  test('an empty prefix matches nothing, even with a single row', async () => {
+    mockListActiveContainerEnvironments.mockImplementation(() => Promise.resolve(rows.slice(0, 1)));
+    await expect(resolveContainerEnvId('')).rejects.toThrow(
+      "No active container environment matches ''"
+    );
   });
 });
 
@@ -3943,7 +4157,7 @@ describe('onConversationClosed — repo container envs', () => {
       mockSandboxInspect.mockImplementation(() => Promise.resolve({ ...LIVE_CLEAN, ...held }));
 
       await expect(onConversationClosed('github', 'owner/repo#304')).rejects.toThrow(
-        `Conversation cleanup retained environment env-sandbox: ${heldReason(work)}`
+        `Conversation cleanup retained environment env-sandbox: ${heldReason(work, 'env-sandbox')}`
       );
       expect(mockSandboxDestroy).not.toHaveBeenCalled();
       expect(mockUpdateStatus).not.toHaveBeenCalled();
