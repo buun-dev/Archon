@@ -1327,6 +1327,7 @@ async function main(): Promise<number> {
           isolationCleanupCommand,
           isolationCleanupMergedCommand,
           isolationReapCommand,
+          isolationRemoveCommand,
           parseReapDays,
         } = await loadRoute(() => import('./commands/isolation'), { database: true });
         switch (subcommand) {
@@ -1347,6 +1348,18 @@ async function main(): Promise<number> {
             break;
           }
 
+          case 'remove': {
+            const ids = positionals.slice(2);
+            if (ids.length === 0) {
+              return await fail(
+                jsonFlag,
+                'Usage: archon isolation remove <env-id> [env-id ...] [--force] [--json]'
+              );
+            }
+            await isolationRemoveCommand(ids, { force: Boolean(values.force), json: jsonFlag });
+            break;
+          }
+
           case 'cleanup': {
             if (values.merged) {
               await isolationCleanupMergedCommand({
@@ -1364,7 +1377,7 @@ async function main(): Promise<number> {
               subcommand === undefined
                 ? 'Missing isolation subcommand'
                 : `Unknown isolation subcommand: ${subcommand}`;
-            return await fail(jsonFlag, `${problem}\nAvailable: list, cleanup, reap`);
+            return await fail(jsonFlag, `${problem}\nAvailable: list, cleanup, reap, remove`);
           }
         }
         break;

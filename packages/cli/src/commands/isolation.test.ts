@@ -15,6 +15,7 @@ import {
   isolationCleanupCommand,
   isolationCleanupMergedCommand,
   isolationReapCommand,
+  isolationRemoveCommand,
   parseReapDays,
 } from './isolation';
 
@@ -40,6 +41,9 @@ const mockFindStaleEnvironments = mock<typeof IsolationDb.findStaleEnvironments>
 );
 const mockUpdateStatus = mock<typeof IsolationDb.updateStatus>(() => Promise.resolve());
 
+const mockStore = { updateStatus: mockUpdateStatus } as unknown as Isolation.IIsolationStore;
+const mockCreateIsolationStore = mock<typeof IsolationDb.createIsolationStore>(() => mockStore);
+
 mock.module('@archon/core/db/isolation-environments', () => ({
   findActiveByBranchName: mockFindActiveByBranchName,
   findActiveByWorkflow: mock(() => Promise.resolve(null)),
@@ -48,6 +52,7 @@ mock.module('@archon/core/db/isolation-environments', () => ({
   findStaleEnvironments: mockFindStaleEnvironments,
   create: mock(() => Promise.resolve({ id: 'iso-123' })),
   updateStatus: mockUpdateStatus,
+  createIsolationStore: mockCreateIsolationStore,
 }));
 
 const mockLoadRepoConfig = mock<typeof Core.loadRepoConfig>(() => Promise.resolve({}));
@@ -69,6 +74,12 @@ const mockCleanupMergedWorktrees = mock<typeof CleanupService.cleanupMergedWorkt
 );
 const mockCleanupContainerEnvironments = mock<typeof CleanupService.cleanupContainerEnvironments>(
   () => Promise.resolve({ removed: [], reconciled: [], skipped: [], errors: [] })
+);
+const mockRemoveContainerEnv = mock<typeof CleanupService.removeContainerEnv>(() =>
+  Promise.resolve({ kind: 'removed' })
+);
+const mockResolveContainerEnvId = mock<typeof CleanupService.resolveContainerEnvId>(id =>
+  Promise.resolve(id)
 );
 const mockGetLiveRunBlocker = mock<typeof CleanupService.getLiveRunBlocker>(() =>
   Promise.resolve(null)
@@ -93,6 +104,8 @@ mock.module('@archon/core/services/cleanup-service', () => ({
   cleanupMergedWorktrees: mockCleanupMergedWorktrees,
   cleanupContainerEnvironments: mockCleanupContainerEnvironments,
   getLiveRunBlocker: mockGetLiveRunBlocker,
+  removeContainerEnv: mockRemoveContainerEnv,
+  resolveContainerEnvId: mockResolveContainerEnvId,
 }));
 
 const mockListEnvironments = mock<typeof IsolationOperations.listEnvironments>(() =>
@@ -778,7 +791,7 @@ describe('isolationCompleteCommand', () => {
   // worktree: the worktree checks below would answer about the wrong thing, and
   // --force must not reach removal either.
   it.each([false, true])(
-    'complete refuses a container environment and points to isolation cleanup (force: %s)',
+    'complete refuses a container environment and points to isolation remove (force: %s)',
     async force => {
       mockFindActiveByBranchName.mockResolvedValueOnce(
         makeEnvironment({
@@ -797,7 +810,7 @@ describe('isolationCompleteCommand', () => {
         '  Blocked: sandbox/task-assist-1 — container environment; complete removes worktrees only.'
       );
       expect(consoleErrorSpy).toHaveBeenCalledWith(
-        '    Reclaim it with `archon isolation cleanup 0`; cancel or abandon a workflow run that still claims it first.'
+        '    Remove it with archon isolation remove env-123; cancel or abandon a workflow run that still claims it first.'
       );
       expect(consoleErrorSpy).not.toHaveBeenCalledWith('  Use --force to override.');
       expect(consoleLogSpy).toHaveBeenCalledWith('\nComplete: 0 completed, 1 failed, 0 not found');
@@ -1189,6 +1202,119 @@ describe('isolationReapCommand', () => {
     expect(consoleLogSpy).toHaveBeenCalledWith(
       'Container reap: 0 removed, 0 reconciled, 0 skipped, 0 failed'
     );
+  });
+});
+
+describe('isolationRemoveCommand', () => {
+  let consoleLogSpy: ReturnType<typeof spyOn>;
+  let consoleErrorSpy: ReturnType<typeof spyOn>;
+  let savedExitCode: typeof process.exitCode;
+  const FULL1 = 'aa271d53-1111-2222-3333-444444444444';
+  const FULL2 = 'bb271d53-1111-2222-3333-444444444444';
+
+  beforeEach(() => {
+    consoleLogSpy = spyOn(console, 'log').mockImplementation(() => {});
+    consoleErrorSpy = spyOn(console, 'error').mockImplementation(() => {});
+    savedExitCode = process.exitCode;
+    process.exitCode = 0;
+    mockRemoveContainerEnv.mockReset();
+    mockRemoveContainerEnv.mockResolvedValue({ kind: 'removed' });
+    mockResolveContainerEnvId.mockReset();
+    mockResolveContainerEnvId.mockImplementation(id => Promise.resolve(id));
+  });
+
+  afterEach(() => {
+    consoleLogSpy.mockRestore();
+    consoleErrorSpy.mockRestore();
+    process.exitCode = savedExitCode;
+  });
+
+  it('remove prints Removed and leaves exit status 0', async () => {
+    mockResolveContainerEnvId.mockResolvedValueOnce(FULL1);
+
+    await isolationRemoveCommand(['aa27'], {});
+
+    expect(mockRemoveContainerEnv).toHaveBeenCalledWith(FULL1, mockStore, { force: false });
+    expect(consoleLogSpy).toHaveBeenCalledWith('  Removed: aa271d53');
+    expect(consoleLogSpy).toHaveBeenCalledWith(
+      'Container remove: 1 removed, 0 reconciled, 0 skipped, 0 failed'
+    );
+    expect(process.exitCode).toBe(0);
+  });
+
+  it('remove reports a held sandbox as Held with its reason and exits 1', async () => {
+    mockResolveContainerEnvId.mockResolvedValueOnce(FULL1);
+    mockRemoveContainerEnv.mockResolvedValueOnce({
+      kind: 'skipped',
+      skip: 'held-work',
+      reason: 'unpushed commits in sandbox worktree /w: push or discard that work there',
+    });
+
+    await isolationRemoveCommand(['aa27'], {});
+
+    expect(consoleLogSpy).toHaveBeenCalledWith(
+      '  Held: aa271d53 — unpushed commits in sandbox worktree /w: push or discard that work there'
+    );
+    expect(process.exitCode).toBe(1);
+  });
+
+  it('--force is passed through to removeContainerEnv', async () => {
+    await isolationRemoveCommand(['aa27'], { force: true });
+
+    expect(mockRemoveContainerEnv).toHaveBeenCalledWith('aa27', mockStore, { force: true });
+  });
+
+  it('--json prints one document and exits 1 when an id is not removed', async () => {
+    mockResolveContainerEnvId.mockResolvedValueOnce(FULL1);
+    mockResolveContainerEnvId.mockRejectedValueOnce(
+      new Error("No active container environment matches 'zzzz' (see archon isolation list)")
+    );
+
+    await isolationRemoveCommand(['aa27', 'zzzz'], { json: true });
+
+    expect(consoleLogSpy).toHaveBeenCalledTimes(1);
+    expect(consoleErrorSpy).not.toHaveBeenCalled();
+    expect(JSON.parse(String(consoleLogSpy.mock.calls[0]?.[0]))).toEqual({
+      removed: [FULL1],
+      reconciled: [],
+      skipped: [],
+      errors: [
+        {
+          id: 'zzzz',
+          error: "No active container environment matches 'zzzz' (see archon isolation list)",
+        },
+      ],
+    });
+    expect(process.exitCode).toBe(1);
+  });
+
+  it('each id is handled independently', async () => {
+    mockResolveContainerEnvId.mockRejectedValueOnce(new Error('no match'));
+    mockResolveContainerEnvId.mockResolvedValueOnce(FULL2);
+
+    await isolationRemoveCommand(['zzzz', 'bb27'], {});
+
+    expect(mockRemoveContainerEnv).toHaveBeenCalledTimes(1);
+    expect(mockRemoveContainerEnv).toHaveBeenCalledWith(FULL2, mockStore, { force: false });
+    expect(consoleErrorSpy).toHaveBeenCalledWith('  Failed: zzzz — no match');
+    expect(consoleLogSpy).toHaveBeenCalledWith('  Removed: bb271d53');
+    expect(process.exitCode).toBe(1);
+  });
+
+  it('a removal error is reported against the full id and later ids still run', async () => {
+    mockResolveContainerEnvId.mockResolvedValueOnce(FULL1);
+    mockResolveContainerEnvId.mockResolvedValueOnce(FULL2);
+    mockRemoveContainerEnv.mockRejectedValueOnce(new Error('teardown not confirmed'));
+
+    await isolationRemoveCommand(['aa27', 'bb27'], { json: true });
+
+    expect(JSON.parse(String(consoleLogSpy.mock.calls[0]?.[0]))).toEqual({
+      removed: [FULL2],
+      reconciled: [],
+      skipped: [],
+      errors: [{ id: FULL1, error: 'teardown not confirmed' }],
+    });
+    expect(process.exitCode).toBe(1);
   });
 });
 

@@ -26,6 +26,8 @@ import {
   getCleanupRunLock,
   listContainerEnvironments,
   cleanupContainerEnvironments,
+  removeContainerEnv,
+  resolveContainerEnvId,
   type ContainerCleanupReport,
   type RemoveEnvironmentResult,
 } from '@archon/core/services/cleanup-service';
@@ -234,6 +236,42 @@ export async function isolationReapCommand(
   printContainerReport(report, 'Container reap');
 }
 
+/**
+ * Remove repo sandboxes by id (or unique id prefix), each independently. Held work
+ * is kept unless `force`; a live run's sandbox is never removed. `--json` prints one
+ * document, `{ removed, reconciled, skipped: [{ id, kind, reason }], errors: [{ id,
+ * error }] }`, and nothing else on stdout. Exit status is 1 when any id was not removed.
+ */
+export async function isolationRemoveCommand(
+  ids: string[],
+  options: { force?: boolean; json?: boolean }
+): Promise<void> {
+  const report: ContainerCleanupReport = { removed: [], reconciled: [], skipped: [], errors: [] };
+  const store = isolationDb.createIsolationStore();
+  for (const input of ids) {
+    let id = input;
+    try {
+      id = await resolveContainerEnvId(input);
+      const outcome = await removeContainerEnv(id, store, { force: Boolean(options.force) });
+      if (outcome.kind === 'removed') {
+        report.removed.push(id);
+      } else {
+        report.skipped.push({ id, kind: outcome.skip, reason: outcome.reason });
+      }
+    } catch (error) {
+      const err = error as Error;
+      getLog().error({ err, id }, 'isolation.remove_failed');
+      report.errors.push({ id, error: err.message });
+    }
+  }
+  if (report.removed.length < ids.length) process.exitCode = 1;
+  if (options.json) {
+    console.log(JSON.stringify(report, null, 2));
+    return;
+  }
+  printContainerReport(report, 'Container remove');
+}
+
 /** The `isolation reap` threshold: 7 when omitted; undefined when not a non-negative number. */
 export function parseReapDays(raw: string | undefined): number | undefined {
   if (raw === undefined) return 7;
@@ -362,7 +400,7 @@ export async function isolationCompleteCommand(
         `  Blocked: ${branch} — container environment; complete removes worktrees only.`
       );
       console.error(
-        '    Reclaim it with `archon isolation cleanup 0`; cancel or abandon a workflow run that still claims it first.'
+        `    Remove it with archon isolation remove ${env.id.slice(0, 8)}; cancel or abandon a workflow run that still claims it first.`
       );
       failed++;
       continue;

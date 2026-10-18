@@ -364,6 +364,16 @@ const commandHelp: HelpEntry[] = [
     ],
   },
   {
+    command: 'isolation',
+    subcommand: 'remove',
+    spec: 'isolation remove <env-id> [...]',
+    description: 'Remove repo sandboxes by id or id prefix; held work is kept unless --force',
+    scopedFlags: [
+      { spec: '--force', description: 'Discard uncommitted or unpushed work in the sandbox' },
+      { spec: '--json', description: 'Print the report as one JSON document, for schedulers' },
+    ],
+  },
+  {
     command: 'complete',
     spec: 'complete <branch> [...]',
     description: 'Complete branch lifecycle (remove worktree + branches)',

@@ -1397,6 +1397,8 @@ cleanup removes eligible containers and their volumes through the container back
 including when no stale worktrees exist. A missing host folder does not make a container
 destroyed. To clean eligible containers without waiting for the default age threshold,
 run `archon isolation cleanup 0`; containers owned by resumable runs remain protected.
+`cleanup 0` sweeps every unheld container; to remove one repo sandbox, use
+[`isolation remove`](#isolation-remove-env-id).
 
 Container cleanup also reaps a repo project's sandbox: it composes the sandbox's stack
 down and removes its worktree and `sandbox/<slug>` branch inside the WSL distro. It reads
@@ -1410,7 +1412,8 @@ the sandbox's state from Docker and from git inside the distro, never from a hos
   run and a sandbox with no run at all. Removal would delete the worktree and its branch,
   the only copy of that work. The output reports it as
   `Held: <id> — <work> in sandbox worktree <path>: push or discard that work there, then
-  re-run archon isolation cleanup`. No Archon command discards that work for you.
+  run archon isolation remove <id8> (add --force to discard it)`. `isolation remove --force`
+  is the one command that discards that work.
 - Any other sandbox is removed past the threshold once its worktree is gone, or clean
   with every commit on a remote, a failed run's sandbox included.
 
@@ -1558,6 +1561,35 @@ nothing else on stdout:
 per environment and a `Container reap: <n> removed, <n> reconciled, <n> skipped, <n> failed`
 summary. A failed environment does not change the exit code; read `errors`.
 
+### `isolation remove <env-id>…`
+
+Remove one or more repo sandboxes by id. Each `<env-id>` is a full environment id or a
+unique prefix of one (see `archon isolation list`); an ambiguous or unknown prefix is
+reported and nothing is removed for it. Each id is handled independently.
+
+```bash
+archon isolation remove aa271d53
+archon isolation remove aa271d53 bb271d53 --json
+archon isolation remove aa271d53 --force
+```
+
+It composes the sandbox's stack down, then removes its worktree and `sandbox/<slug>`
+branch inside the WSL distro. The record is marked destroyed only after a fresh inspect
+confirms nothing is left; otherwise the id is reported as `Failed` and stays active.
+
+- A sandbox whose worktree holds uncommitted changes or unpushed commits is **held**: its
+  stack is stopped, everything else is kept, and the output says how to release it.
+  `--force` discards that work.
+- A sandbox claimed by a running, pending, paused or failed-but-resumable run is never
+  removed, with or without `--force`. Abandon or cancel the run first.
+- Worktree environments and folder-project containers are refused: use `archon complete`
+  or `archon isolation cleanup` for those.
+
+With `--json` it prints one document and nothing else on stdout, shaped like the
+[`isolation reap`](#isolation-reap-days) report without `daysStale` (`reconciled` is always
+empty). The exit code is 1 when any id was not removed (held, skipped or failed), 0
+otherwise.
+
 ### `validate workflows [name]`
 
 Validate workflow YAML definitions and their referenced resources (command files, MCP configs, skill directories).
@@ -1633,8 +1665,8 @@ are skipped, so deletion can discard the only reachable copy of commits. Accepts
 branch names in one call.
 
 `complete` removes worktrees only. It refuses a container environment, with or without
-`--force`, and points to `archon isolation cleanup 0`, which reclaims containers and repo
-sandboxes no run can still claim.
+`--force`, and points to `archon isolation remove <id8>`, which removes one repo sandbox
+(cancel or abandon a workflow run that still claims it first).
 
 ### `serve`
 
