@@ -2,20 +2,25 @@
 # init-firewall.sh — default-deny egress with a hostname allowlist.
 # Runs as root inside the agent container (needs NET_ADMIN). Fail-closed.
 # Exit codes: 2 allowlist missing or empty; 3 an allowlisted host does not
-# resolve; 4 unsupported environment (no dnsmasq, empty upstream, more than one
-# connected network).
+# resolve; 4 unsupported environment (no dnsmasq, dnsmasq fails to start, empty
+# upstream, more than one connected network, an IPv6 address). Any other failure
+# exits with the failing tool's own status. Every failure leaves egress closed.
 set -euo pipefail
+
+# Close egress first and never open it: everything before the rules is local and
+# the allowlist resolves after them, so any failure leaves egress closed.
+iptables -P OUTPUT DROP
 
 ALLOWLIST="${1:-/etc/archon/allowlist.txt}"
 [ -f "$ALLOWLIST" ] || { echo "FATAL: allowlist not found: $ALLOWLIST" >&2; exit 2; }
 
-# Close egress before touching anything, and never open it again. A re-run on
-# an already-firewalled container (resume, or a second invocation) would
-# otherwise be open for the whole script, and a run that fails part-way would
-# leave it open. Nothing before the rules needs the network: ipset and dnsmasq
-# startup are local, and the allowlist is resolved after the rules.
-iptables -P OUTPUT DROP
 iptables -F OUTPUT
+# The rules below are IPv4 only; an IPv6 address would give the agent an
+# unfiltered path out.
+if [ -r /proc/net/if_inet6 ] && awk '$6 != "lo" {f=1} END {exit !f}' /proc/net/if_inet6; then
+  echo "FATAL: the agent has an IPv6 address; the sandbox firewall filters IPv4 only" >&2
+  exit 4
+fi
 # Drop rules referencing the set (the flush above) BEFORE destroying it, so a
 # re-invocation doesn't die under set -e.
 ipset destroy archon-allow 2>/dev/null || true
@@ -41,10 +46,10 @@ done < "$ALLOWLIST"
 #
 # dnsmasq closes the gap by adding each resolved IP to the ipset AS IT ANSWERS
 # THE QUERY, so an address is allowed at the instant the process is about to use
-# it. It also closes the DNS side channel: a name outside this file does not
-# resolve at all (NXDOMAIN), so DNS cannot carry data out. Only allowlisted
-# names, their subdomains, and dotless names (compose service and container
-# names) are forwarded.
+# it. Dotted names outside this file are answered NXDOMAIN locally, so they do
+# not reach any upstream; dotless names (compose service and container names)
+# still go to Docker's resolver, which is how `db` resolves. That narrows DNS as
+# a way out but does not close it: an unlisted dotless name is still forwarded.
 #
 # The upstream is the resolver the container STARTED with. Docker restores
 # /etc/resolv.conf on every container restart, so the file is not needed for
@@ -72,10 +77,11 @@ command -v dnsmasq >/dev/null 2>&1 \
 #   server=/a/UP    forwards a listed name and its subdomains
 #   server=//UP     forwards dotless names (compose services, container names)
 #   address=/#/     answers every other name NXDOMAIN
+#   user=dnsmasq    the uid the OUTPUT rules admit to the upstream (default: nobody)
 #   ipset=/a/set    covers the same names, so what resolves is what gets allowed
 # One line per host, both from HOSTS: dnsmasq rejects a config line over about
 # 1 KiB, which one joined line per directive would hit on a long allowlist.
-{ printf 'no-resolv\nno-hosts\nlisten-address=127.0.0.1\nbind-interfaces\nport=53\n'
+{ printf 'no-resolv\nno-hosts\nuser=dnsmasq\nlisten-address=127.0.0.1\nbind-interfaces\nport=53\n'
   for host in "${HOSTS[@]}"; do printf 'server=/%s/%s\n' "$host" "$UPSTREAM"; done
   printf 'server=//%s\n' "$UPSTREAM"
   printf 'address=/#/\n'
@@ -120,14 +126,17 @@ if [ ${#SUBNETS[@]} -gt 1 ]; then
 fi
 SUBNET="${SUBNETS[0]:-}"
 
-iptables -A OUTPUT -o lo -j ACCEPT
+# Only dnsmasq may talk to the upstream, enforced by uid. On a compose network
+# the upstream is Docker's 127.0.0.11, which is on `lo`, so a plain `lo` ACCEPT
+# would let any process query it directly and bypass the allowlist. dockerd
+# forwards from the host namespace (`ExtServers: [host(…)]`), so no DNS packet
+# leaves the container. Docker's nat rule rewrites the destination port to a
+# high port before this table sees the packet, so the rules cannot match on port
+# 53. The same rules admit an off-box upstream (an agent on the default bridge).
 iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-# DNS only to the upstream. On a compose network that is Docker's 127.0.0.11,
-# reached over `lo`; dockerd forwards it from the host namespace
-# (`ExtServers: [host(…)]`), so no DNS packet leaves the container. This rule is
-# what admits an off-box upstream (an agent on the default bridge).
-iptables -A OUTPUT -d "$UPSTREAM" -p udp --dport 53 -j ACCEPT
-iptables -A OUTPUT -d "$UPSTREAM" -p tcp --dport 53 -j ACCEPT
+iptables -A OUTPUT -d "$UPSTREAM" -m owner --uid-owner dnsmasq -j ACCEPT
+iptables -A OUTPUT -d "$UPSTREAM" -j REJECT --reject-with icmp-port-unreachable
+iptables -A OUTPUT -o lo -j ACCEPT
 if [ -n "$GATEWAY" ]; then
   iptables -A OUTPUT -d "$GATEWAY" -j REJECT --reject-with icmp-port-unreachable
 fi
