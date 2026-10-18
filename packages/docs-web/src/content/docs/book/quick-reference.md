@@ -39,6 +39,7 @@ This chapter collects every CLI command, variable, and YAML option in one place.
 | `archon isolation cleanup <days>` | Remove eligible worktrees, containers, and container volumes older than N days |
 | `archon isolation cleanup --merged` | Remove worktrees whose branches merged into the base branch |
 | `archon isolation cleanup --merged --include-closed` | Also remove worktrees with closed (abandoned) PRs |
+| `archon isolation remove <env-id>…` | Remove one or more repo sandboxes by id; `--force` discards held work |
 
 Age-based container cleanup runs even when no worktree qualifies. Live or resumable runs
 and platform retention policies protect their workspaces.

@@ -1063,7 +1063,7 @@ describe('cleanupContainerEnvironments — repo sandboxes', () => {
         {
           id: 'env-repo',
           kind: 'held-work',
-          reason: `run a355c282 is failed; ${heldReason(work)}`,
+          reason: `run a355c282 is failed; abandon it (archon workflow abandon a355c282-run), then ${heldReason(work)}`,
         },
       ]);
     }

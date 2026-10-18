@@ -668,7 +668,11 @@ async function sweepRepoSandbox(
     report.skipped.push({
       id: row.id,
       kind: 'held-work',
-      reason: failedRun ? `${failedRun.display}; ${held}` : held,
+      // `remove` refuses a failed-but-resumable run's sandbox even with --force, so the
+      // run is abandoned first; the held text itself is unchanged.
+      reason: failedRun
+        ? `${failedRun.display}; abandon it (archon workflow abandon ${failedRun.runId}), then ${held}`
+        : held,
     });
     return;
   }

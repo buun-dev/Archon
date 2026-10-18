@@ -1432,9 +1432,9 @@ only a sandbox with nothing unsaved is deleted.
 - On abandon, cancel and `/reset` the run is still cancelled. The sandbox's stack is
   stopped to free its memory, and the command prints a warning:
   `Kept the sandbox of run <run-id> (environment <id>): <work> in sandbox worktree <path>:
-  push or discard that work there, then re-run archon isolation cleanup. Its stack is
-  stopped; the run is cancelled.` Once the work is pushed or discarded,
-  `archon isolation cleanup` removes the sandbox.
+  push or discard that work there, then run archon isolation remove <id8> (add --force
+  to discard it)`. Its stack is stopped; the run is cancelled. Once the work is pushed,
+  `archon isolation remove <id8>` removes the sandbox; `--force` discards the work.
 - Closing the issue or pull request also keeps the conversation's reference to the
   sandbox, and reports
   `Conversation cleanup retained environment <id>: <work> in sandbox worktree <path>: …`.
@@ -1582,8 +1582,11 @@ confirms nothing is left; otherwise the id is reported as `Failed` and stays act
   `--force` discards that work.
 - A sandbox claimed by a running, pending, paused or failed-but-resumable run is never
   removed, with or without `--force`. Abandon or cancel the run first.
-- Worktree environments and folder-project containers are refused: use `archon complete`
-  or `archon isolation cleanup` for those.
+- Only active container environments resolve. A folder-project container is refused with
+  a message naming its owning verb (abandon or cancel its run, or `archon isolation
+  cleanup`). Worktree environments are not addressed by `remove`: use
+  `archon complete <branch>`. A worktree id or an already-destroyed id is reported as
+  `No active container environment matches …`.
 
 With `--json` it prints one document and nothing else on stdout, shaped like the
 [`isolation reap`](#isolation-reap-days) report without `daysStale` (`reconciled` is always

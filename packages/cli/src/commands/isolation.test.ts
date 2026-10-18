@@ -41,7 +41,20 @@ const mockFindStaleEnvironments = mock<typeof IsolationDb.findStaleEnvironments>
 );
 const mockUpdateStatus = mock<typeof IsolationDb.updateStatus>(() => Promise.resolve());
 
-const mockStore = { updateStatus: mockUpdateStatus } as unknown as Isolation.IIsolationStore;
+const mockStore: Isolation.IIsolationStore = {
+  getById: mock<Isolation.IIsolationStore['getById']>(() => Promise.resolve(null)),
+  findActiveByWorkflow: mock<Isolation.IIsolationStore['findActiveByWorkflow']>(() =>
+    Promise.resolve(null)
+  ),
+  create: mock<Isolation.IIsolationStore['create']>(() =>
+    Promise.reject(new Error('Unexpected create'))
+  ),
+  updateMetadata: mock<Isolation.IIsolationStore['updateMetadata']>(() => Promise.resolve()),
+  updateStatus: mockUpdateStatus,
+  countActiveByCodebase: mock<Isolation.IIsolationStore['countActiveByCodebase']>(() =>
+    Promise.resolve(0)
+  ),
+};
 const mockCreateIsolationStore = mock<typeof IsolationDb.createIsolationStore>(() => mockStore);
 
 mock.module('@archon/core/db/isolation-environments', () => ({

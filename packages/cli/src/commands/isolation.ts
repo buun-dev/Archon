@@ -261,9 +261,11 @@ export async function isolationRemoveCommand(
         report.skipped.push({ id, kind: outcome.skip, reason: outcome.reason });
       }
     } catch (error) {
-      const err = error as Error;
-      getLog().error({ err, id }, 'isolation.remove_failed');
-      report.errors.push({ id, error: err.message });
+      const message = error instanceof Error ? error.message : String(error);
+      // Debug only: the human `Failed:` line carries the reason, and teardown failures
+      // are already logged inside core.
+      getLog().debug({ err: error, id }, 'isolation.remove_failed');
+      report.errors.push({ id, error: message });
     }
   }
   if (options.json) {
